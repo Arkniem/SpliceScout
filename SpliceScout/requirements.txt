@@ -1,0 +1,6 @@
+# Python dependencies for the GEO RNA-seq pipeline + web UI.
+# launch.bat installs these automatically on first run.
+anthropic        # Anthropic (Claude) API
+openai           # OpenAI (ChatGPT) API — also drives Gemini via its OpenAI-compatible endpoint
+openpyxl         # Excel workbook for the deep-dive run table
+paramiko         # optional: SSH password auth for the autonomous cluster upload (key/agent works without it)
