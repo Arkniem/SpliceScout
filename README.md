@@ -125,13 +125,11 @@ One `classify()` interface drives all three providers (`llm_providers.py`):
 | Provider | Default model | API key (env) |
 |---|---|---|
 | Anthropic (Claude) | `claude-haiku-4-5` | `ANTHROPIC_API_KEY` |
-| OpenAI (ChatGPT) | `gpt-4.1-mini` | `OPENAI_API_KEY` |
-| Google Gemini | `gemini-2.5-flash` | `GEMINI_API_KEY` |
+| OpenAI (ChatGPT) | `gpt-5.4-nano` | `OPENAI_API_KEY` |
+| Google Gemini | `gemma-4-31b-it` | `GEMINI_API_KEY` |
 
 The model box is editable — type any model your account can access. Paste the key in the UI (held in
-memory only, never written to `config.json`), set the env var, or tick **Skip AI cleaning**. Haiku is
-the cheap default; use `--model claude-sonnet-4-6` (or another strong model) if drug-name quality
-needs it.
+memory only, never written to `config.json`), set the env var, or tick **Skip AI cleaning**
 
 ---
 
