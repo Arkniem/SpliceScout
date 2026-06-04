@@ -238,6 +238,6 @@ runs/                output (one folder per query run)
   canonical drug names / recovered cell lines.
 - **Small caps give noisy picks.** A cap below ~10 studies can select a junk "cell line"; use 25+.
 - **Large queries cost time and tokens.** Extraction fetches SRA metadata per study (rate-limited),
-  so an NCBI API key helps; Haiku keeps AI cost low.
+  so an NCBI API key helps; Using Gemma keeps AI cost low.
 - **One run at a time.** The server runs a single pipeline; resume with `--run-dir ... --resume`.
 - **Excel lock (Windows):** if a target CSV/XLSX is open in Excel, SpliceScout writes a `*_v2` copy.
