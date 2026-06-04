@@ -24,15 +24,15 @@ PROVIDERS = ("anthropic", "openai", "gemini")
 PROVIDER_LABEL = {"anthropic": "Anthropic (Claude)", "openai": "OpenAI (ChatGPT)",
                   "gemini": "Google Gemini"}
 KEY_ENV = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY", "gemini": "GEMINI_API_KEY"}
-DEFAULT_MODEL = {"anthropic": "claude-haiku-4-5", "openai": "gpt-4.1-mini",
-                 "gemini": "gemini-2.5-flash"}
+DEFAULT_MODEL = {"anthropic": "claude-haiku-4-5", "openai": "gpt-5.4-nano",
+                 "gemini": "gemma-4-31b-it"}
 # suggested models per provider (the UI model box is EDITABLE — these are just autocomplete hints;
 # type any exact model id your account has access to). First entry is the per-provider default.
 MODELS = {
     "anthropic": ["claude-haiku-4-5", "claude-sonnet-4-6"],
-    "openai": ["gpt-4.1-mini", "gpt-4.1", "gpt-4o", "gpt-4o-mini"],
-    "gemini": ["gemini-2.5-flash", "gemini-3.5-flash", "gemini-2.5-pro",
-               "gemma-3-27b-it", "gemma-4-31b-it"],
+    "openai": ["gpt-5.4-nano", "gpt-4.1-mini", "gpt-4.1", "gpt-4o", "gpt-4o-mini"],
+    "gemini": ["gemma-4-31b-it", "gemini-2.5-flash", "gemini-3.5-flash", "gemini-2.5-pro",
+               "gemma-3-27b-it"],
 }
 
 

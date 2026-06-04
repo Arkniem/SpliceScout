@@ -70,15 +70,40 @@ if errorlevel 1 (
   %PY% -m pip install paramiko >nul 2>&1
 )
 
-REM ---- 4) Launch the web UI (opens your browser) ----
-echo Starting the web UI - a browser window will open shortly.
-echo Keep this window open while you work; close it (or press Ctrl+C) to stop.
-echo.
-%PY% server.py
-
-if errorlevel 1 (
-  echo.
-  echo The server exited with an error - see the messages above.
+REM ---- 3b) Vendored Plotly for the Plots tab (download once if missing) ----
+if not exist "%~dp0vendor\plotly.min.js" (
+  echo Downloading the Plotly charting library ^(first run only, for the Plots tab^)...
+  if not exist "%~dp0vendor" mkdir "%~dp0vendor"
+  powershell -NoProfile -ExecutionPolicy Bypass -Command "try{ [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://cdn.plot.ly/plotly-2.35.2.min.js' -OutFile '%~dp0vendor\plotly.min.js' }catch{ Write-Host 'Plotly download failed - the Plots tab will need internet once.' }"
 )
-echo.
-pause
+
+REM ---- 3c) Optional: tray libraries (pystray + Pillow) for the system-tray launcher ----
+%PY% -c "import pystray, PIL" >nul 2>&1
+if errorlevel 1 (
+  echo Installing tray support ^(pystray, Pillow^) for the system-tray icon...
+  %PY% -m pip install pystray Pillow >nul 2>&1
+)
+
+REM ---- 4) Launch: prefer the system tray (no console window); fall back to a console window ----
+set "PYW=pythonw"
+if /I "%PY%"=="py" set "PYW=pyw"
+%PY% -c "import pystray, PIL" >nul 2>&1
+if errorlevel 1 (
+  echo Starting the web UI in this window ^(tray libraries unavailable^).
+  echo Keep this window open while you work; close it ^(or press Ctrl+C^) to stop.
+  echo TIP: run launch_Win.bat again for ANOTHER instance ^(its own port + JOB_TAG sra1/sra2/...^).
+  echo.
+  %PY% server.py
+  if errorlevel 1 (
+    echo.
+    echo The server exited with an error - see the messages above.
+  )
+  echo.
+  pause
+) else (
+  echo Starting SpliceScout in the system tray - look for the blue "S" icon near the clock.
+  echo Right-click it for Open / Quit. You can close this window. Run launch_Win.bat again for
+  echo another concurrent instance ^(its own port + JOB_TAG sra1/sra2/...^).
+  start "SpliceScout" %PYW% "%~dp0tray.py"
+  timeout /t 4 >nul
+)

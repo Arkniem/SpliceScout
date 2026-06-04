@@ -43,7 +43,15 @@ python server.py --port 9000 --no-open
 
 Requires **Python 3**. Dependencies (`requirements.txt`): `anthropic`, `openai` (also drives Gemini),
 `openpyxl` (Excel workbook), `paramiko` (optional — only for SSH *password* auth on the autonomous
-cluster upload; key/agent auth works without it).
+cluster upload; key/agent auth works without it). The launchers also fetch the vendored **Plotly**
+library (`vendor/plotly.min.js`, for the Plots tab) on first run if it's missing.
+
+### Running concurrent projects (multiple instances)
+**Launch a launch file again — or run `python server.py` again — to start another instance.** Each
+instance grabs its own free port (8765, 8766, 8767, …) and opens its own browser tab, so you can run
+several projects at the same time. Each one is also assigned a cluster **`JOB_TAG`** of `sra1`,
+`sra2`, `sra3`, … (shown as a badge in its UI header) so concurrent cluster downloads never collide.
+Closing an instance frees its number for the next launch to reuse.
 
 ---
 
@@ -85,6 +93,25 @@ Outputs land in `runs/<query-slug>_<timestamp>/`:
 
 The cell-line tables carry a **three-way drug-treated** split: **Drug Treated / Not Drug Treated /
 Undetermined**.
+
+---
+
+## In the browser UI
+
+The web UI's **Run** tab shows a live stepper while the pipeline runs. Two things to know:
+
+- **Click any step** (the ⓘ next to its name) to open a panel explaining exactly what that stage does,
+  with its inputs and outputs.
+- A **Plots** tab appears once the deep dive has matched the cell line (after the *match cell-line names*
+  step). It uses Plotly (vendored locally — works offline) and shows **only the picked cell line's runs**
+  (sourced from the filtered run table, so no other cell lines leak in):
+  - a **study list** (the picked line's studies) — click a study to chart it;
+  - **read depth** and **spot length (avg read length)** per run, each a horizontal IQR box-with-dots;
+  - a **custom plot** builder — pick X / Y / color variables and a chart type (box-with-dots, violin,
+    scatter, bar, histogram, **heatmap**, **2D density**). Variables are the run table's fields: read
+    depth, spot length, bases, drug, drug-treated, dose, instrument, platform, …
+
+A **Project README** link sits at the bottom of every page.
 
 ---
 
@@ -162,6 +189,17 @@ Each run is **isolated** in its own per-cell-line subfolder under `PIPELINE_ROOT
 `/data/mylab/sra/A549`), so runs never mix. The bundle ships **per-study** `by_study/<GSE>/` lists
 (never a single combined list) so each study is downloaded and converted independently.
 
+The cluster **`JOB_TAG`** (which namespaces this project's LSF job names) is set automatically per
+running instance — `sra1`, `sra2`, `sra3`, … — so two projects downloading at the same time on the
+same cluster account don't clash. You can still override it in *Advanced cluster settings*.
+
+**Cleanup on success.** When the cluster pipeline finishes, it deletes the transient clutter (job
+logs, generated `.lsf` scripts, leftover `.sra`/temp files, empty folders, and — by default — even its
+own scripts), leaving a clean **data-only** folder. It always keeps the `.fastq.gz` outputs,
+`SraAccList.txt`, the `PIPELINE_COMPLETE.txt` report, and `watchdog.log`. This runs only on success
+(never when stalled, so logs survive for debugging) and is controlled by `CLEANUP_ON_COMPLETE` /
+`CLEANUP_SCRIPTS_ON_COMPLETE` in `config.sh`.
+
 **If an autonomous upload fails, you don't re-run the pipeline.** SpliceScout reads the ssh/scp/remote
 log and explains the cause (DNS, connection refused, timeout, auth, host-key, bad key file, wrong
 submit host [e.g. `bsub: command not found`], no write permission on `PIPELINE_ROOT`, missing
@@ -174,6 +212,15 @@ Re-trigger the upload for an already-finished run without redoing anything:
 ```bash
 python pipeline.py --run-dir runs/<existing> --cluster-retry
 ```
+
+**Check cluster progress on demand** — from the results banner after a launch, *and* from a **Check
+cluster status** button at the top of the form (it appears whenever cluster settings are saved, so you
+can check **even after closing and relaunching** the server). It SSHes to the submit host and finds the
+running pipeline by **discovering its folder from this instance's live `sraN_*` LSF jobs** (so it works
+with no active run / a fresh server), then reports, per study, how many runs are **downloaded** (`.sra`
+fetched — including SRA-toolkit's per-accession subfolders) and **converted** (`.fastq.gz`) — so a study
+still downloading no longer reads as 0 — plus overall percent, active-job count, and an ETA. Hit
+**Refresh** any time.
 
 > The cluster scripts in `cluster_template/` are vendored from your own LSF pipeline; see
 > [`cluster_template/README.md`](cluster_template/README.md) for what runs on the cluster.

@@ -16,6 +16,7 @@ Stdlib only (http.server) plus the existing pipeline modules — no web framewor
 Runs ONE pipeline at a time; the UI blocks starting a second run while one is active.
 """
 import argparse
+import atexit
 import io
 import json
 import os
@@ -33,12 +34,135 @@ from pipeline_paths import Paths
 from progress import RunReporter
 import pipeline
 import llm_providers
+import cluster_deploy
+import plot_data
+import stage_docs
+
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 # ---- shared state: exactly one active run at a time ----
 _LOCK = threading.Lock()
 _REPORTER = None     # current/last RunReporter
 _WORKER = None       # current worker thread
 _RUN_DIR = None      # current/last run dir (download root)
+
+# ---- per-instance identity: each launched server claims sra1 / sra2 / sra3 ... ----
+# So you can run several instances at once (concurrent projects) and their cluster JOB_TAGs
+# never collide. The slot is the lowest free number among LIVE instances (a closed/dead
+# instance frees its number), claimed atomically in a cross-process lock directory.
+_INSTANCE_SLOT = 1
+_INSTANCE_TAG = "sra1"
+_INSTANCE_LOCK_PATH = None
+
+
+def _instances_dir():
+    return os.path.join(os.path.expanduser("~"), ".geo_pipeline_instances")
+
+
+def _pid_alive(pid):
+    """True if a process with this PID is currently running (cross-platform, no extra deps)."""
+    try:
+        pid = int(pid)
+    except Exception:
+        return False
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            k = ctypes.windll.kernel32
+            h = k.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+            if not h:
+                return False
+            code = ctypes.c_ulong()
+            k.GetExitCodeProcess(h, ctypes.byref(code))
+            k.CloseHandle(h)
+            return code.value == 259                # STILL_ACTIVE
+        except Exception:
+            return True                             # uncertain -> don't steal the slot
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return True
+
+
+def _claim_instance_slot():
+    """Claim the lowest free sraN slot among actively-running instances. Returns (n, lock_path)."""
+    regdir = _instances_dir()
+    try:
+        os.makedirs(regdir, exist_ok=True)
+    except Exception:
+        return 1, None
+    for n in range(1, 1000):
+        path = os.path.join(regdir, f"sra{n}.lock")
+        if os.path.exists(path):
+            alive = True
+            try:
+                alive = _pid_alive(json.load(open(path, encoding="utf-8")).get("pid"))
+            except Exception:
+                alive = False
+            if alive:
+                continue                 # slot held by a live instance
+            try:
+                os.remove(path)          # stale (instance died) -> reclaim it
+            except Exception:
+                continue
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)   # atomic claim (race-safe)
+        except FileExistsError:
+            continue                     # another instance grabbed it a moment ago
+        except Exception:
+            return n, None
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"pid": os.getpid(), "slot": n}, f)
+        except Exception:
+            pass
+        return n, path
+    return 1, None
+
+
+def _release_instance_slot():
+    if _INSTANCE_LOCK_PATH:
+        try:
+            os.remove(_INSTANCE_LOCK_PATH)
+        except Exception:
+            pass
+
+
+def _port_in_use(host, port):
+    """True if something is already listening on host:port. Probe by CONNECT, not by bind —
+    HTTPServer sets allow_reuse_address, and on Windows that lets two sockets share a port, so a
+    failed bind can't detect an in-use port; a successful connect always can."""
+    import socket
+    h = "127.0.0.1" if host in ("0.0.0.0", "") else host
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(0.3)
+    try:
+        s.connect((h, port))
+        return True            # someone is listening here
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def _bind_server(host, start_port, tries=64):
+    """Bind the first free port at/after start_port, so every launch gets its own instance."""
+    last = None
+    for port in range(start_port, start_port + tries):
+        if _port_in_use(host, port):
+            continue
+        try:
+            return ThreadingHTTPServer((host, port), Handler), port
+        except OSError as e:
+            last = e          # lost a race for this port -> try the next
+    raise last or OSError("no free port found")
 
 
 class _Tee(io.TextIOBase):
@@ -143,6 +267,7 @@ def _start_run(body):
                     "ssh_host", "ssh_user", "ssh_port", "ssh_key"]
             cluster_cfg = {k: str(cluster_in.get(k)).strip()
                            for k in keys if str(cluster_in.get(k) or "").strip()}
+            cluster_cfg.setdefault("JOB_TAG", _INSTANCE_TAG)   # auto per-instance tag if left blank
             pw = body.get("ssh_password") or ""      # secret -> memory for the run; saved only if remembered
             if pw:
                 secrets["ssh_password"] = pw
@@ -150,7 +275,8 @@ def _start_run(body):
         _save_settings(body)   # remember these inputs locally for the next launch
 
         slug = re.sub(r"[^a-z0-9]+", "-", query.lower())[:40].strip("-") or "run"
-        run_dir = os.path.join("runs", f"{slug}_{datetime.now():%Y%m%d-%H%M%S}")
+        # tag the run dir with this instance so concurrent instances never share a run folder
+        run_dir = os.path.join("runs", f"{slug}_{datetime.now():%Y%m%d-%H%M%S}_{_INSTANCE_TAG}")
         P = Paths(run_dir).ensure_dirs()
         cfg = pipeline.RunConfig(query=query, cap=cap, ncbi_key=ncbi_key, model=model,
                                  provider=provider, concurrency=concurrency, run_dir=P.run_dir,
@@ -256,6 +382,33 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _send_static(self, relpath, ctype):
+        """Serve a file from the project dir (vendored assets) — separate from run-dir downloads."""
+        path = os.path.join(HERE, relpath)
+        if not os.path.isfile(path):
+            return self._send_json(404, {"error": "not found"})
+        with open(path, "rb") as f:
+            data = f.read()
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "max-age=86400")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _send_readme(self):
+        """Render README.md as a minimal dark page (preformatted; no markdown deps)."""
+        try:
+            md = open(os.path.join(HERE, "README.md"), encoding="utf-8").read()
+        except Exception:
+            md = "README.md not found."
+        html = ("<!DOCTYPE html><html><head><meta charset='utf-8'><title>SpliceScout — README</title>"
+                "<style>body{background:#0f1420;color:#e7ecf5;font:14px/1.6 ui-monospace,Consolas,"
+                "monospace;max-width:920px;margin:0 auto;padding:32px 22px}a{color:#5b8cff}"
+                "pre{white-space:pre-wrap;word-wrap:break-word}</style></head><body><pre>"
+                + _html_attr(md) + "</pre></body></html>")
+        self._send_html(html)
+
     # -- routes --
     def do_GET(self):
         route = urlparse(self.path)
@@ -268,6 +421,16 @@ class Handler(BaseHTTPRequestHandler):
         if route.path == "/api/file":
             q = parse_qs(route.query)
             return self._send_file(q.get("name", [""])[0])
+        if route.path == "/plotly.js":
+            return self._send_static("vendor/plotly.min.js", "application/javascript; charset=utf-8")
+        if route.path == "/readme":
+            return self._send_readme()
+        if route.path == "/api/plotdata":
+            with _LOCK:
+                run_dir = _RUN_DIR
+            if not run_dir:
+                return self._send_json(200, {"available": False, "samples": [], "studies": []})
+            return self._send_json(200, plot_data.build_plot_data(Paths(run_dir)))
         if route.path == "/favicon.ico":
             self.send_response(204)
             self.end_headers()
@@ -321,6 +484,38 @@ class Handler(BaseHTTPRequestHandler):
                 ok = rep.provide_cluster_fix(fix)
             return self._send_json(200 if ok else 409,
                                    {"ok": True} if ok else {"error": "not awaiting a cluster fix"})
+        if route.path == "/api/cluster_status":
+            try:
+                body = self._read_body()
+            except Exception:
+                return self._send_json(400, {"error": "invalid JSON"})
+            # Works even with NO active run (after a server restart): take SSH creds + JOB_TAG from the
+            # active run's config.json if present, else the saved settings + this instance's tag. The
+            # probe then DISCOVERS the cluster root from this instance's <JOB_TAG>_* jobs.
+            with _LOCK:
+                run_dir = _RUN_DIR
+            cfg, fallback_root = {}, ""
+            if run_dir:
+                P = Paths(run_dir)
+                try:
+                    cfg = (json.load(open(P.config, encoding="utf-8")).get("cluster_cfg")) or {}
+                except Exception:
+                    cfg = {}
+                fallback_root = cluster_deploy._read_config_root(P) or ""
+            settings = _load_settings()
+            sc = settings.get("cluster") or {}
+            host = (cfg.get("ssh_host") or sc.get("ssh_host") or "").strip()
+            user = (cfg.get("ssh_user") or sc.get("ssh_user") or "").strip()
+            port = str(cfg.get("ssh_port") or sc.get("ssh_port") or "22").strip() or "22"
+            keyfile = (cfg.get("ssh_key") or sc.get("ssh_key") or "").strip()
+            password = (body.get("ssh_password") or settings.get("ssh_password") or "").strip()
+            # use THIS instance's own tag — NOT the shared saved-settings JOB_TAG (one settings file
+            # across instances), which made e.g. an sra3 instance read sra2's jobs.
+            job_tag = (body.get("job_tag") or cfg.get("JOB_TAG") or _INSTANCE_TAG or "sra").strip()
+            if not fallback_root:
+                fallback_root = (sc.get("PIPELINE_ROOT") or "").strip()
+            return self._send_json(200, cluster_deploy.remote_status(
+                host, user, port, keyfile, password, job_tag, fallback_root))
         self._send_json(404, {"error": "not found"})
 
 
@@ -335,7 +530,10 @@ def _page():
         },
     }
     return (PAGE.replace("__DEFAULT_QUERY__", _html_attr(pipeline.DEFAULT_QUERY))
-                .replace("__LLM_CONFIG__", json.dumps(llm_cfg)))
+                .replace("__LLM_CONFIG__", json.dumps(llm_cfg))
+                .replace("__INSTANCE_TAG__", _html_attr(_INSTANCE_TAG))
+                .replace("__INSTANCE_SLOT__", str(_INSTANCE_SLOT or 1))
+                .replace("__STAGE_DOCS__", json.dumps(stage_docs.STAGE_DOCS)))
 
 
 def _html_attr(s):
@@ -344,6 +542,7 @@ def _html_attr(s):
 
 
 def main():
+    global _INSTANCE_SLOT, _INSTANCE_TAG, _INSTANCE_LOCK_PATH
     ap = argparse.ArgumentParser(description="Web front end for the GEO RNA-seq pipeline")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8765)
@@ -352,9 +551,20 @@ def main():
 
     # serve relative to this script so runs/ lands next to the pipeline code
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
-    httpd = ThreadingHTTPServer((a.host, a.port), Handler)
-    url = f"http://{a.host if a.host != '0.0.0.0' else '127.0.0.1'}:{a.port}/"
-    print(f"GEO RNA-seq pipeline UI -> {url}")
+
+    # claim this instance's slot -> sra1 / sra2 / sra3 ... (released on exit; dead slots reclaimed)
+    _INSTANCE_SLOT, _INSTANCE_LOCK_PATH = _claim_instance_slot()
+    _INSTANCE_TAG = f"sra{_INSTANCE_SLOT}"
+    atexit.register(_release_instance_slot)
+
+    # auto-pick a free port so EVERY launch starts its own instance (run concurrent projects)
+    httpd, port = _bind_server(a.host, a.port)
+    url = f"http://{a.host if a.host != '0.0.0.0' else '127.0.0.1'}:{port}/"
+    print(f"GEO RNA-seq pipeline UI  (instance #{_INSTANCE_SLOT}, cluster JOB_TAG \"{_INSTANCE_TAG}\")  ->  {url}")
+    if port != a.port:
+        print(f"   (port {a.port} was busy -> using {port})")
+    print("   Launch this again any time to run a concurrent project — each instance gets its own")
+    print("   port and its own cluster JOB_TAG (sra1, sra2, sra3, ...).")
     print("Press Ctrl+C to stop.")
     if not a.no_open:
         try:
@@ -366,6 +576,8 @@ def main():
     except KeyboardInterrupt:
         print("\nshutting down.")
         httpd.shutdown()
+    finally:
+        _release_instance_slot()
 
 
 # ----------------------------------------------------------------------------
@@ -388,6 +600,9 @@ PAGE = r"""<!DOCTYPE html>
     font:15px/1.5 ui-sans-serif,system-ui,"Segoe UI",Roboto,Arial,sans-serif}
   .wrap{max-width:860px;margin:0 auto;padding:32px 20px 80px}
   header h1{margin:0 0 4px;font-size:24px;letter-spacing:.2px}
+  .ibadge{display:inline-block;font-size:12px;font-weight:600;color:var(--accent);
+    background:rgba(91,140,255,.12);border:1px solid var(--line);border-radius:20px;
+    padding:3px 10px;margin-left:8px;vertical-align:middle;letter-spacing:0}
   header p{margin:0 0 24px;color:var(--mut)}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;
     padding:22px 22px;margin-bottom:18px;box-shadow:0 8px 30px rgba(0,0,0,.25)}
@@ -474,17 +689,63 @@ PAGE = r"""<!DOCTYPE html>
     border-radius:8px;padding:7px 14px;font-size:13px;font-weight:600}
   .tag{font-size:11px;background:var(--accent);color:#fff;border-radius:5px;padding:2px 7px;margin-left:8px;vertical-align:middle}
   .mutfoot{color:var(--mut);font-size:12px;margin-top:18px;word-break:break-all}
+  /* tabs */
+  .tabs{display:flex;gap:6px;margin:6px 0 14px}
+  .tabs button{background:var(--panel2);color:var(--mut);border:1px solid var(--line);
+    border-radius:10px;padding:8px 18px;font:600 14px/1 inherit;cursor:pointer}
+  .tabs button.on{color:#fff;border-color:transparent;background:linear-gradient(90deg,var(--accent),var(--accent2))}
+  .tabs button[hidden]{display:none}
+  /* step-doc modal */
+  .modal{position:fixed;inset:0;background:rgba(6,9,16,.66);display:flex;align-items:center;
+    justify-content:center;z-index:50;padding:20px}
+  .modal[hidden]{display:none}
+  .modal .box{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+    max-width:600px;width:100%;padding:22px 24px;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+  .modal h2{margin:0 0 12px;font-size:18px}
+  .modal #docBody p{margin:0 0 10px}
+  .modal .docmeta{margin-top:10px;font-size:12.5px;color:var(--mut);font-family:ui-monospace,Consolas,monospace;
+    word-break:break-word}
+  .modal .x{float:right;cursor:pointer;color:var(--mut);font-size:22px;line-height:1;border:none;background:none}
+  .slabel.doc{cursor:pointer} .slabel .qm{color:var(--accent);font-size:12px;opacity:.6}
+  .slabel.doc:hover .qm{opacity:1}
+  /* plots */
+  .psec{margin:18px 0 7px;font-size:12.5px;color:var(--mut);font-weight:600;text-transform:uppercase;letter-spacing:.5px}
+  .studylist{display:flex;flex-direction:column;gap:5px;max-height:280px;overflow:auto;margin-bottom:6px}
+  .studyitem{display:flex;gap:10px;align-items:baseline;background:var(--panel2);border:1px solid var(--line);
+    border-radius:8px;padding:8px 12px;cursor:pointer}
+  .studyitem:hover{border-color:var(--accent)}
+  .studyitem.sel{border-color:var(--accent);box-shadow:0 0 0 2px rgba(91,140,255,.18)}
+  .studyitem .snm{font-family:ui-monospace,Consolas,monospace;font-size:13px;flex:none}
+  .studyitem .sttl{flex:1;min-width:0;color:var(--mut);font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .studyitem .sn{color:var(--mut);font-size:12px;flex:none}
+  .chart{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:6px;margin-bottom:10px;min-height:120px}
+  /* page footer */
+  .pagefoot{color:var(--mut);font-size:12.5px;margin-top:28px;padding-top:14px;border-top:1px solid var(--line)}
+  .pagefoot a{color:var(--accent);text-decoration:none} .pagefoot a:hover{text-decoration:underline}
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
-    <h1>GEO RNA-seq Pipeline</h1>
+    <h1>GEO RNA-seq Pipeline <span class="ibadge" title="This instance's number and its cluster JOB_TAG. Launch the program again for a concurrent project — it gets the next free tag (sra1, sra2, ...).">instance __INSTANCE_SLOT__ &middot; JOB_TAG __INSTANCE_TAG__</span></h1>
     <p>Submit an NCBI GEO search and get cleaned, splicing-amenable, cell-line-grouped compound tables.</p>
   </header>
 
+  <div class="tabs" id="tabs">
+    <button id="tabRun" class="on" type="button">Run</button>
+    <button id="tabPlots" type="button" hidden>Plots</button>
+  </div>
+
+  <div id="runtab">
   <!-- SETUP -->
   <section id="setup" class="card">
+    <div id="clusterCheck" hidden style="margin-bottom:16px;padding:12px 14px;border:1px solid var(--line);border-radius:10px;background:var(--panel2)">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+        <span class="hint" style="margin:0">Cluster jobs from a previous launch of this instance still running? Check without starting a new run.</span>
+        <button type="button" class="ghost" id="clCheckBtn">Check cluster status</button>
+      </div>
+      <div id="clusterstatus2" style="margin-top:10px"></div>
+    </div>
     <form id="form">
       <label class="fld">
         <span class="lbl">NCBI GEO search query</span>
@@ -571,7 +832,7 @@ PAGE = r"""<!DOCTYPE html>
               <input type="number" id="clmem" placeholder="MEM_MB (32000)">
               <input type="text" id="clwall" placeholder="WALL (50:00)">
               <input type="number" id="clpfmem" placeholder="PREFETCH_MEM_MB (132000)">
-              <input type="text" id="cljob" placeholder="JOB_TAG (sra)" autocomplete="off">
+              <input type="text" id="cljob" value="__INSTANCE_TAG__" placeholder="JOB_TAG (auto per instance)" title="LSF job-name prefix. Auto-set to this instance's tag (sra1, sra2, ...) so concurrent projects' cluster jobs never collide. Edit if you want a custom tag." autocomplete="off">
             </div>
           </details>
         </div>
@@ -621,6 +882,25 @@ PAGE = r"""<!DOCTYPE html>
     </div>
     <div class="mutfoot" id="rundir"></div>
   </section>
+  </div><!-- /runtab -->
+
+  <!-- PLOTS -->
+  <section id="plots" class="card" hidden>
+    <div id="plotsbody"><div class="hint">Loading…</div></div>
+  </section>
+
+  <footer class="pagefoot">
+    <a href="/readme" target="_blank">&#128214; Project README</a> &nbsp;&middot;&nbsp; SpliceScout &nbsp;&middot;&nbsp; instance __INSTANCE_TAG__
+  </footer>
+</div>
+
+<!-- step documentation modal -->
+<div id="docmodal" class="modal" hidden>
+  <div class="box">
+    <button class="x" type="button" id="docClose">&times;</button>
+    <h2 id="docTitle"></h2>
+    <div id="docBody"></div>
+  </div>
 </div>
 
 <script>
@@ -650,6 +930,7 @@ skipEl.addEventListener('change', ()=>{ akeyEl.disabled = skipEl.checked; akeyEl
 
 // AI provider + model + per-provider key memory
 const LLM = __LLM_CONFIG__;
+const STAGE_DOCS = __STAGE_DOCS__;
 const providerEl=$('#provider'), modelEl=$('#model'), keyhintEl=$('#keyhint');
 let savedKeys = {};
 function rebuildModels(p){
@@ -762,7 +1043,8 @@ function stageRow(st, i){
   }
   const detail = (st.detail && st.status==='active') ? '<div class="sdetail">'+esc(st.detail)+'</div>' : '';
   return '<div class="stage '+st.status+'"><div class="sicon">'+icon+'</div>'
-       + '<div class="sbody"><div class="slabel">'+(i+1)+'. '+esc(st.label)+(st.status==='skipped'?' — skipped':'')+'</div>'
+       + '<div class="sbody"><div class="slabel doc" data-doc="'+esc(st.key)+'" title="What happens in this step?">'
+       + (i+1)+'. '+esc(st.label)+(st.status==='skipped'?' — skipped':'')+' <span class="qm">&#9432;</span></div>'
        + mid + detail + '</div></div>';
 }
 
@@ -785,6 +1067,8 @@ function render(s){
   $('#oeta').textContent = eta;
 
   $('#stages').innerHTML = (s.stages||[]).map(stageRow).join('');
+  $('#stages').querySelectorAll('.slabel.doc').forEach(el=>el.onclick=()=>openDoc(el.dataset.doc));
+  maybeRevealPlots(s);
   renderSelect(s);
   renderClusterFix(s);
 
@@ -856,6 +1140,12 @@ function renderResults(s){
     + ' <span class="sz">'+fmtSize(f.size)+'</span></span>'
     + '<a class="dl" href="/api/file?name='+encodeURIComponent(f.name)+'">Download</a></div>').join('');
   box.innerHTML = ddline + clline + stats + '<div class="files">'+filesHtml+'</div>';
+  if(cl && cl.mode==='autonomous' && cl.submitted){
+    box.innerHTML += '<div style="margin-top:14px"><button class="ghost" id="clstatBtn">Check cluster status</button>'
+      + ' <span class="hint">poll the cluster for download/convert progress + ETA</span></div>'
+      + '<div id="clusterstatus" style="margin-top:12px"></div>';
+    const b=$('#clstatBtn'); if(b) b.onclick=()=>fetchClusterStatus('clusterstatus');
+  }
   box.hidden=false;
 }
 function stat(n, k){ return '<div class="stat"><div class="n">'+(n==null?'—':Number(n).toLocaleString())+'</div><div class="k">'+esc(k)+'</div></div>'; }
@@ -927,6 +1217,226 @@ async function postClusterRetry(cancel){
   try{ await fetch('/api/cluster_retry',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); }catch(e){}
 }
 
+// ---- step-doc modal (click a pipeline step to read what it does) ----
+function openDoc(key){
+  const d=STAGE_DOCS[key]; if(!d) return;
+  $('#docTitle').textContent=d.title||key;
+  $('#docBody').innerHTML = '<p>'+esc(d.what||'')+'</p>'
+    + (d.inputs?'<div class="docmeta"><b>Inputs:</b> '+esc(d.inputs)+'</div>':'')
+    + (d.outputs?'<div class="docmeta"><b>Outputs:</b> '+esc(d.outputs)+'</div>':'');
+  $('#docmodal').hidden=false;
+}
+function closeDoc(){ $('#docmodal').hidden=true; }
+
+// ---- tabs (Run | Plots) ----
+function showTab(t){
+  $('#runtab').hidden = (t==='plots');
+  $('#plots').hidden  = (t!=='plots');
+  $('#tabRun').classList.toggle('on', t!=='plots');
+  $('#tabPlots').classList.toggle('on', t==='plots');
+  if(t==='plots') openPlots();
+}
+function maybeRevealPlots(s){
+  const ready = s && (s.state==='done'
+    || (s.stages||[]).some(st=>(st.key==='cellline_match'||st.key==='runtable_annotate') && st.status==='done'));
+  if(ready) $('#tabPlots').hidden=false;
+}
+
+// ---- Plots tab (Plotly, vendored at /plotly.js; loaded lazily on first open) ----
+let PLOTDATA=null, _plotlyStarted=false;
+function ensurePlotly(){
+  return new Promise((resolve,reject)=>{
+    if(window.Plotly) return resolve();
+    if(_plotlyStarted){ const i=setInterval(()=>{ if(window.Plotly){clearInterval(i);resolve();} },80); return; }
+    _plotlyStarted=true;
+    const sc=document.createElement('script'); sc.src='/plotly.js';
+    sc.onload=()=>resolve(); sc.onerror=()=>reject(new Error('could not load the plotting library'));
+    document.head.appendChild(sc);
+  });
+}
+async function loadPlotData(force){
+  if(PLOTDATA && !force) return PLOTDATA;
+  const d = await (await fetch('/api/plotdata')).json();
+  PLOTDATA = (d && d.available) ? d : null;
+  return PLOTDATA;
+}
+async function openPlots(){
+  const host=$('#plotsbody');
+  try{
+    const d = await loadPlotData(false);
+    if(!d){ host.innerHTML='<div class="hint">No plot data yet — plots use the deep-dived cell line\'s runs, available after the <b>match cell-line names</b> step. Reopen this tab then.</div>'; return; }
+    await ensurePlotly();
+    buildPlotsUI(d);
+  }catch(ex){ host.innerHTML='<div class="err">Plots unavailable: '+esc(ex.message)+'</div>'; }
+}
+const LABELS={spots:'read depth (spots)',avg_spot_len:'avg spot length (bp)',bases:'bases',
+  study:'study',drug:'drug',drug_treated:'drug treated',is_control:'control',dose:'dose',
+  instrument:'instrument',library_selection:'library selection',platform:'platform',assay:'assay',
+  layout:'library layout',source_name:'source name',treatment:'treatment'};
+const lab=v=>LABELS[v]||v;
+const PCONF={displayModeBar:false,responsive:true};
+function buildPlotsUI(d){
+  const studies=d.studies||[];
+  $('#plotsbody').innerHTML =
+      '<div style="display:flex;justify-content:space-between;align-items:baseline">'
+    + '<h3 class="psec" style="margin-top:0">'+esc(d.cell_line||'cell line')+' &mdash; studies ('+studies.length+' · '+d.samples.length+' runs)</h3>'
+    + '<button class="ghost" id="plReload" style="padding:6px 12px">&#8635; Reload</button></div>'
+    + '<div class="hint" style="margin-bottom:8px">Only the picked cell line\'s runs are shown. Click a study to chart read depth and spot length per run.</div>'
+    + '<div class="studylist" id="studylist">'
+    + studies.map(st=>'<div class="studyitem" data-gse="'+esc(st.gse)+'">'
+        + '<span class="snm">'+esc(st.gse)+'</span>'
+        + '<span class="sttl">'+esc(st.title||'')+'</span>'
+        + '<span class="sn">'+st.n_samples+' runs</span></div>').join('')
+    + '</div><div id="studycharts"></div>' + customPlotterHTML(d);
+  $('#studylist').querySelectorAll('.studyitem').forEach(el=>el.onclick=()=>{
+    $('#studylist').querySelectorAll('.studyitem').forEach(x=>x.classList.remove('sel'));
+    el.classList.add('sel'); renderStudyCharts(el.dataset.gse);
+  });
+  const rl=$('#plReload'); if(rl) rl.onclick=async()=>{ await loadPlotData(true); buildPlotsUI(PLOTDATA); };
+  bindCustomPlotter(d);
+  if(!window._plResize){ window._plResize=true; window.addEventListener('resize', ()=>{
+    document.querySelectorAll('.chart').forEach(c=>{ if(c.data && window.Plotly) Plotly.Plots.resize(c); }); }); }
+}
+function plotLayout(title, extra){
+  return Object.assign({ title:{text:title,font:{color:'#e7ecf5',size:14}},
+    paper_bgcolor:'rgba(0,0,0,0)', plot_bgcolor:'rgba(0,0,0,0)', font:{color:'#9aa6c0'},
+    autosize:true, height:360, margin:{l:90,r:20,t:42,b:46},
+    legend:{font:{color:'#9aa6c0'},orientation:'h',y:-0.18},
+    xaxis:{gridcolor:'#2b3450',zerolinecolor:'#2b3450',automargin:true},
+    yaxis:{gridcolor:'#2b3450',zerolinecolor:'#2b3450',automargin:true} }, extra||{});
+}
+function iqrBox(id, vals, labels, title){
+  if(!vals.filter(v=>v!=null).length){ $('#'+id).innerHTML='<div class="hint">No data.</div>'; return; }
+  Plotly.newPlot(id, [{ x:vals, type:'box', boxpoints:'all', jitter:0.5, pointpos:0, orientation:'h',
+    marker:{color:'#5b8cff',size:5,opacity:.55}, line:{color:'#7c5bff'}, fillcolor:'rgba(91,140,255,.12)',
+    text:labels, hovertemplate:'%{text}<br>%{x}<extra></extra>', name:'' }],
+    plotLayout(title,{height:210,yaxis:{showticklabels:false,gridcolor:'#2b3450',zerolinecolor:'#2b3450'}}), PCONF);
+}
+function renderStudyCharts(gse){
+  const rows=(PLOTDATA.samples||[]).filter(s=>s.study===gse);
+  $('#studycharts').innerHTML =
+      '<h3 class="psec">'+esc(gse)+' &mdash; read depth per run ('+rows.length+')</h3><div id="chartDepth" class="chart"></div>'
+    + '<h3 class="psec">'+esc(gse)+' &mdash; spot length (avg read length) per run</h3><div id="chartLen" class="chart"></div>';
+  iqrBox('chartDepth', rows.map(r=>r.spots), rows.map(r=>r.run), 'Read depth (spots)');
+  const len=rows.filter(r=>r.avg_spot_len!=null);
+  if(len.length) iqrBox('chartLen', len.map(r=>r.avg_spot_len), len.map(r=>r.run), 'Avg spot length (bp)');
+  else $('#chartLen').innerHTML='<div class="hint">No spot-length data for this study.</div>';
+}
+function customPlotterHTML(d){
+  const allvars=d.categorical.concat(d.numeric);
+  const opt=(arr,sel)=>arr.map(v=>'<option value="'+v+'"'+(v===sel?' selected':'')+'>'+esc(lab(v))+'</option>').join('');
+  const defX=d.categorical.includes('drug_treated')?'drug_treated':(d.categorical[0]||'study');
+  const defY=d.numeric.includes('spots')?'spots':(d.numeric[0]||'spots');
+  return '<h3 class="psec">Custom plot</h3>'
+   +'<div class="hint" style="margin-bottom:8px">'+d.samples.length+' runs of '+esc(d.cell_line||'the cell line')+'. Pick variables and a chart type.</div>'
+   +'<div class="row">'
+   +'<label class="fld" style="margin:0"><span class="lbl" style="font-size:12px">Chart type</span><select id="cpType">'
+     +'<option value="box">Box (IQR + dots)</option><option value="violin">Violin</option>'
+     +'<option value="bar">Bar (count)</option><option value="scatter">Scatter</option>'
+     +'<option value="histogram">Histogram</option><option value="heatmap">Heatmap (counts)</option>'
+     +'<option value="density">2D density</option></select></label>'
+   +'<label class="fld" style="margin:0"><span class="lbl" style="font-size:12px">X / group</span><select id="cpX">'+opt(allvars,defX)+'</select></label>'
+   +'<label class="fld" style="margin:0"><span class="lbl" style="font-size:12px">Y (numeric)</span><select id="cpY">'+opt(d.numeric,defY)+'</select></label>'
+   +'<label class="fld" style="margin:0"><span class="lbl" style="font-size:12px">Color / 2nd</span><select id="cpColor"><option value="">none</option>'+opt(d.categorical,'')+'</select></label>'
+   +'</div><div class="hint" id="cpHint" style="margin-bottom:8px"></div>'
+   +'<button class="ghost" id="cpPlot" style="margin-bottom:10px">Plot</button><div id="customchart" class="chart"></div>';
+}
+function bindCustomPlotter(d){
+  const b=$('#cpPlot'); if(!b) return;
+  const upd=()=>{ const t=$('#cpType').value;
+    const need={box:'Y by X (split by Color)',violin:'Y by X (split by Color)',bar:'run count of X (stacked by Color)',
+      scatter:'X vs Y (colored by Color)',histogram:'distribution of Y (split by Color)',
+      heatmap:'run counts of X × Color',density:'2D density of X (numeric) vs Y'};
+    $('#cpHint').textContent=need[t]||''; };
+  $('#cpType').onchange=upd; upd();
+  b.onclick=()=>renderCustom(d); renderCustom(d);
+}
+function renderCustom(d){
+  const type=$('#cpType').value, x=$('#cpX').value, y=$('#cpY').value, color=$('#cpColor').value;
+  const S=d.samples;
+  const groups = color ? [...new Set(S.map(r=>r[color]))].filter(g=>g!=='').sort() : [null];
+  const pick=g=> color ? S.filter(r=>r[color]===g) : S;
+  const H=h=>({height:h});
+  let traces=[];
+  if(type==='heatmap'){
+    const c2 = color || (d.categorical.find(v=>v!==x) || x);
+    const xs=[...new Set(S.map(r=>String(r[x])))].sort(), ys=[...new Set(S.map(r=>String(r[c2])))].sort();
+    const z=ys.map(yy=>xs.map(xx=>S.filter(r=>String(r[x])===xx && String(r[c2])===yy).length));
+    Plotly.newPlot('customchart',[{type:'heatmap',x:xs,y:ys,z:z,colorscale:'Blues',
+      hovertemplate:lab(x)+'=%{x}<br>'+lab(c2)+'=%{y}<br>%{z} runs<extra></extra>'}],
+      plotLayout('run counts: '+lab(x)+' × '+lab(c2), H(Math.max(280, 70+30*ys.length))), PCONF); return;
+  }
+  if(type==='density'){
+    Plotly.newPlot('customchart',[{type:'histogram2d',x:S.map(r=>r[x]),y:S.map(r=>r[y]),colorscale:'Blues'}],
+      plotLayout(lab(y)+' vs '+lab(x)+' (density)', H(420)), PCONF); return;
+  }
+  if(type==='bar'){
+    const cats=[...new Set(S.map(r=>String(r[x])))].sort();
+    groups.forEach(g=>{ const rows=pick(g);
+      traces.push({type:'bar', x:cats, y:cats.map(c=>rows.filter(r=>String(r[x])===c).length), name:g==null?'runs':String(g)}); });
+    Plotly.newPlot('customchart',traces,plotLayout('run count by '+lab(x),Object.assign({barmode:'stack'},H(380))),PCONF); return;
+  }
+  if(type==='histogram'){
+    groups.forEach(g=>traces.push({type:'histogram', x:pick(g).map(r=>r[y]).filter(v=>v!=null), name:g==null?lab(y):String(g), opacity:.7}));
+    Plotly.newPlot('customchart',traces,plotLayout(lab(y)+' distribution',Object.assign({barmode:'overlay'},H(380))),PCONF); return;
+  }
+  if(type==='scatter'){
+    groups.forEach(g=>{ const rows=pick(g);
+      traces.push({type:'scatter',mode:'markers', x:rows.map(r=>r[x]), y:rows.map(r=>r[y]), text:rows.map(r=>r.run),
+        name:g==null?'':String(g), marker:{size:6,opacity:.6}}); });
+    Plotly.newPlot('customchart',traces,plotLayout(lab(y)+' vs '+lab(x),H(420)),PCONF); return;
+  }
+  // box / violin — HORIZONTAL: Y(numeric) distribution by X(category), split by Color
+  const xs=[...new Set(S.map(r=>String(r[x])))];
+  const h=Math.max(300, 50+28*Math.max(xs.length, xs.length*groups.length));
+  groups.forEach(g=>{ const rows=pick(g);
+    traces.push(Object.assign({type:type, x:rows.map(r=>r[y]), y:rows.map(r=>String(r[x])), orientation:'h',
+      text:rows.map(r=>r.run), name:g==null?'':String(g)},
+      type==='box'?{boxpoints:'all',jitter:.4,pointpos:0,marker:{size:4,opacity:.5}}:{points:'all'})); });
+  Plotly.newPlot('customchart',traces,plotLayout(lab(y)+' by '+lab(x),Object.assign({boxmode:'group',violinmode:'group'},H(h))),PCONF);
+}
+
+// ---- on-demand cluster status (poll the cluster after an autonomous launch) ----
+async function fetchClusterStatus(panelId){
+  panelId = panelId || 'clusterstatus';
+  const host=$('#'+panelId); if(!host) return;
+  host.innerHTML='<div class="hint">Checking the cluster…</div>';
+  try{
+    const d = await (await fetch('/api/cluster_status',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})).json();
+    if(!d.ok){ host.innerHTML='<div class="err">'+esc((d.diagnosis&&d.diagnosis.title)||d.error||'Could not reach the cluster')
+        +(d.diagnosis&&d.diagnosis.detail?' — '+esc(d.diagnosis.detail):'')+'</div>'; return; }
+    renderClusterStatus(d, panelId);
+  }catch(ex){ host.innerHTML='<div class="err">'+esc(ex.message)+'</div>'; }
+}
+function renderClusterStatus(d, panelId){
+  panelId = panelId || 'clusterstatus';
+  const host=$('#'+panelId), ov=d.overall||{};
+  const tag = d.job_tag ? ' ('+esc(d.job_tag)+')' : '';
+  let h='<div class="banner '+(d.complete?'ok':(d.stalled?'err':'pick'))+'">'
+    + (d.complete?'✓ Cluster pipeline complete':(d.stalled?'⚠ Watchdog stopped (stalled)':'Cluster progress'))+tag
+    + (ov.exp!=null?' &mdash; '+ov.converted+' converted &middot; '+ov.downloaded+' downloaded / '+ov.exp+' runs ('+ov.pct+'%)':'')
+    + (d.live_jobs!=null?' &middot; '+d.live_jobs+' active jobs':'')
+    + (d.eta_seconds!=null&&!d.complete?' &middot; ~'+fmtDur(d.eta_seconds)+' left to convert':'') + '</div>';
+  if(ov.exp){ h+='<div class="obar" title="solid = converted, faint = downloaded" style="margin-bottom:4px;position:relative">'
+    + '<span style="width:'+(ov.dl_pct||0)+'%;opacity:.30"></span>'
+    + '<span style="width:'+(ov.pct||0)+'%;position:absolute;left:1px;top:0"></span></div>'
+    + '<div class="hint" style="margin-bottom:12px;font-size:11.5px">solid = converted, faint = downloaded</div>'; }
+  else if(d.live_jobs){ h+='<div class="hint" style="margin-bottom:8px">'+d.live_jobs+' active job(s) found'+tag
+    +', but no per-study counts'+(d.root?' under <code>'+esc(d.root)+'</code>':'')+' — see the probe output below.</div>'; }
+  else { h+='<div class="hint" style="margin-bottom:8px">No active jobs found for this instance'+tag+'. '
+    + (d.root?'Checked <code>'+esc(d.root)+'</code>.':'Start a cluster run first.')+'</div>'; }
+  const ps=(d.per_study||[]).slice().sort((a,b)=>(a.converted/Math.max(1,a.exp))-(b.converted/Math.max(1,b.exp)));
+  if(ps.length){ h+='<div class="hint" style="margin-bottom:6px">Per study (downloaded · converted / total):</div>'
+    + '<div class="files" style="max-height:240px;overflow:auto">'
+    + ps.map(s=>'<div class="file"><span class="nm">'+esc(s.gse)+'</span><span class="sz">'
+        + s.downloaded+' dl &middot; '+s.converted+' conv / '+s.exp+'</span></div>').join('')+'</div>'; }
+  if(d.root){ h+='<div class="mutfoot" style="margin-top:8px">root: '+esc(d.root)+'</div>'; }
+  if(d.raw){ h+='<details style="margin-top:8px"><summary class="hint" style="cursor:pointer">probe output</summary>'
+    + '<pre style="white-space:pre-wrap;font-size:11px;color:#9aa6c0;max-height:220px;overflow:auto;background:#0a0e17;border:1px solid var(--line);border-radius:8px;padding:8px;margin-top:6px">'+esc(d.raw)+'</pre></details>'; }
+  h+='<button class="ghost" id="clstatRefresh_'+panelId+'" style="margin-top:10px">Refresh</button>';
+  host.innerHTML=h; const b=$('#clstatRefresh_'+panelId); if(b) b.onclick=()=>fetchClusterStatus(panelId);
+}
+
 // prefill the form from locally-saved settings (keys + cluster info remembered between launches)
 function setVal(id, v){ const el=$('#'+id); if(el && v!=null && v!=='') el.value=v; }
 function applySettings(s){
@@ -945,14 +1455,20 @@ function applySettings(s){
   setVal('clroot', c.PIPELINE_ROOT); setVal('clscratch', c.SCRATCH_DIR); setVal('clqueue', c.LSF_QUEUE);
   setVal('cltool', c.SRATOOLKIT_MODULE); setVal('claspera', c.ASPERA_MODULE);
   setVal('clthreads', c.THREADS); setVal('clmem', c.MEM_MB); setVal('clwall', c.WALL);
-  setVal('clpfmem', c.PREFETCH_MEM_MB); setVal('cljob', c.JOB_TAG);
+  setVal('clpfmem', c.PREFETCH_MEM_MB);   // JOB_TAG is auto per-instance (sra1, sra2, ...) — keep the instance default, don't restore a saved one
   setVal('sshhost', c.ssh_host); setVal('sshuser', c.ssh_user); setVal('sshport', c.ssh_port); setVal('sshkey', c.ssh_key);
   setVal('sshpass', s.ssh_password);
+  if(s.cluster && (s.cluster.ssh_host||'').trim()) $('#clusterCheck').hidden=false;  // enable after-restart status check
   syncScope(); syncPick(); syncClusterMode();
 }
 
 // resume an in-flight (or finished) run if the page is reloaded
 (async function init(){
+  $('#tabRun').onclick=()=>showTab('run'); $('#tabPlots').onclick=()=>showTab('plots');
+  $('#clCheckBtn').onclick=()=>fetchClusterStatus('clusterstatus2');
+  $('#docClose').onclick=closeDoc;
+  $('#docmodal').onclick=(e)=>{ if(e.target.id==='docmodal') closeDoc(); };
+  document.addEventListener('keydown',e=>{ if(e.key==='Escape') closeDoc(); });
   try{ applySettings(await (await fetch('/api/settings')).json()); }catch(ex){}
   try{
     const s = await (await fetch('/api/status')).json();

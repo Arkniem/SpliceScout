@@ -393,6 +393,165 @@ def submit_over_ssh(P, cluster_cfg, secrets, reporter=NULL):
         return {"submitted": False, "reason": str(e), "diagnosis": diag}
 
 
+# ---------- on-demand cluster status (read status.sh + watchdog.log over SSH) ----------
+def _ssh_capture_systemssh(host, port, user, keyfile, command, timeout=60):
+    target = f"{user}@{host}"
+    common = ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=20"]
+    ssh = ["ssh", "-p", str(port)] + common + (["-i", keyfile] if keyfile else [])
+    p = subprocess.run(ssh + [target, command], capture_output=True, text=True, timeout=timeout)
+    out = (p.stdout or "") + (p.stderr or "")
+    if p.returncode != 0 and not (p.stdout or "").strip():
+        raise _SubmitError(f"ssh exit {p.returncode}: {out.strip()[:400]}", out)
+    return p.stdout or ""
+
+
+def _ssh_capture_paramiko(host, port, user, password, keyfile, command, timeout=60):
+    import paramiko
+    cli = paramiko.SSHClient()
+    cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    kw = {"hostname": host, "port": int(port), "username": user, "timeout": 20}
+    if password:
+        kw["password"] = password
+    if keyfile:
+        kw["key_filename"] = keyfile
+    cli.connect(**kw)
+    try:
+        _in, _out, _err = cli.exec_command(command, timeout=timeout)
+        out = _out.read().decode("utf-8", "replace")
+        err = _err.read().decode("utf-8", "replace")
+    finally:
+        cli.close()
+    return out or err
+
+
+def _eta_from_watchdog(wd_text, overall):
+    """ETA (seconds) from timestamped 'progress: done/exp' lines in watchdog.log; None if unknown.
+    Uses the conversion RATE between the first and last progress line, so the cluster's timezone is
+    irrelevant — only the time DIFFERENCE matters."""
+    if not wd_text or not overall or not overall.get("exp"):
+        return None
+    import calendar
+    pts = []
+    for m in re.finditer(
+            r"\[(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})\][^\n]*progress:\s*(\d+)\s*/\s*(\d+)",
+            wd_text):
+        t = calendar.timegm(tuple(int(m.group(i)) for i in range(1, 7)) + (0, 0, 0))
+        pts.append((t, int(m.group(7))))
+    if len(pts) < 2:
+        return None
+    (t0, d0), (t1, d1) = pts[0], pts[-1]
+    remaining = overall["exp"] - overall["done"]
+    if remaining <= 0:
+        return 0
+    if t1 <= t0 or d1 <= d0:
+        return None
+    rate = (d1 - d0) / (t1 - t0)                      # runs per second
+    return int(remaining / rate) if rate > 0 else None
+
+
+def parse_status(text):
+    """Parse the remote progress probe (a ROOT line + STUDY lines + ---META--- + ---WATCHDOG--- tail)
+    into a dict. Per study: DOWNLOADED (a `.sra` exists in a per-accession subdir or flat, or it's
+    already converted) and CONVERTED (a `.fastq.gz` exists) — so a study mid-download doesn't read as
+    0. Unit-testable (no SSH)."""
+    head, _, wd = text.partition("---WATCHDOG---")
+    body, _, meta = head.partition("---META---")
+    rm = re.search(r"(?m)^ROOT\s+(\S.*?)\s*$", body)
+    root = rm.group(1).strip() if rm else ""
+    per_study = []
+    for m in re.finditer(r"(?m)^STUDY\s+(\S+)\s+(\d+)\s+(\d+)\s+(\d+)\s*$", body):
+        per_study.append({"gse": m.group(1), "exp": int(m.group(2)),
+                          "downloaded": int(m.group(3)), "converted": int(m.group(4))})
+    overall = None
+    if per_study:
+        exp = sum(s["exp"] for s in per_study)
+        dl = sum(s["downloaded"] for s in per_study)
+        cv = sum(s["converted"] for s in per_study)
+        overall = {"exp": exp, "downloaded": dl, "converted": cv,
+                   "pct": round(100 * cv / exp, 1) if exp else 0.0,
+                   "dl_pct": round(100 * dl / exp, 1) if exp else 0.0}
+    lm = re.search(r"(?m)^LIVE\s+(\d+)", meta)
+    eta_base = {"exp": overall["exp"], "done": overall["converted"]} if overall else None
+    return {"overall": overall, "per_study": per_study, "root": root,
+            "live_jobs": int(lm.group(1)) if lm else None,
+            "complete": "COMPLETE" in meta, "stalled": "STALLED" in meta,
+            "eta_seconds": _eta_from_watchdog(wd, eta_base), "raw": text[-4000:]}
+
+
+# Self-discovering progress probe: find the pipeline root from this instance's <TAG>_* LSF jobs (their
+# bsub CWD), so status works even after the SpliceScout server restarted and the local run dir is gone
+# (the user's manual ssh diagnostic does the same). Then count per study against each SraAccList.txt.
+# DOWNLOADED = accessions with a `.sra` in a per-accession subdir (`<GSE>/<acc>/<acc>.sra`, prefetch's
+# layout) OR flat, OR already converted; CONVERTED = `.fastq.gz`. (raw string -> literal globs.)
+_STATUS_PROBE = r'''TAG=%TAG%; FB=%FB%
+jobcwd() { bjobs -l "$1" 2>/dev/null | tr -d '\n' | sed -n 's/.*CWD <\([^>]*\)>.*/\1/p' | tr -d ' '; }
+# studies dir = a pf/cs job's bsub CWD (that IS <root>/by_study), or dirname of an fqd job's CWD
+SD=""
+for pat in "${TAG}_pf_*" "${TAG}_cs_*" "${TAG}_fqd_*"; do
+  JID=$(bjobs -noheader -o jobid -J "$pat" 2>/dev/null | head -1); [ -n "$JID" ] || continue
+  C=$(jobcwd "$JID"); [ -n "$C" ] || continue
+  case "$pat" in "${TAG}_fqd_*") C=$(dirname "$C") ;; esac
+  SD="$C"; [ -d "$SD" ] && break
+done
+# root = watchdog's CWD, else dirname of the studies dir, else the caller's fallback
+ROOT=""
+WID=$(bjobs -noheader -o jobid -J "${TAG}_watchdog" 2>/dev/null | head -1)
+[ -n "$WID" ] && ROOT=$(jobcwd "$WID")
+[ -z "$ROOT" ] && [ -n "$SD" ] && ROOT=$(dirname "$SD")
+[ -z "$ROOT" ] && ROOT="$FB"
+[ -n "$SD" ] && [ -d "$SD" ] || SD="$ROOT/by_study"
+echo "ROOT $ROOT"
+echo "SDIR $SD"
+if [ -d "$SD" ]; then
+  cd "$SD"
+  for d in */; do
+    g=${d%/}; L="$g/SraAccList.txt"; [ -f "$L" ] || continue
+    exp=$(grep -c . "$L")
+    sra=$(ls "$g"/*/*.sra "$g"/*.sra "$g"/*/*.sralite "$g"/*.sralite 2>/dev/null | sed 's#.*/##; s/\.sralite$//; s/\.sra$//' | sort -u | grep -c .)
+    cv=$(ls "$g"/*.fastq.gz 2>/dev/null | sed 's#.*/##; s/_[0-9]\.fastq\.gz$//; s/\.fastq\.gz$//' | sort -u | grep -c .)
+    echo "STUDY $g $exp $((sra+cv)) $cv"
+  done
+fi
+echo "---META---"
+[ -n "$ROOT" ] && [ -f "$ROOT/PIPELINE_COMPLETE.txt" ] && echo COMPLETE
+[ -n "$ROOT" ] && [ -f "$ROOT/PIPELINE_STALLED.txt" ] && echo STALLED
+echo "LIVE $(bjobs -noheader -o stat -J "${TAG}_*" 2>/dev/null | grep -cE 'RUN|PEND')"
+echo "---WATCHDOG---"
+[ -n "$ROOT" ] && tail -n 80 "$ROOT/watchdog.log" 2>/dev/null
+true'''
+
+
+def remote_status(host, user, port, keyfile, password, job_tag, fallback_root=""):
+    """SSH to the LSF submit host, DISCOVER the pipeline root from this instance's `<job_tag>_*` jobs
+    (works even after a server restart with no local run dir), then count per study DOWNLOADED (.sra in
+    a per-accession subdir or flat, or already converted) and CONVERTED (.fastq.gz). Falls back to
+    `fallback_root` if no jobs are live. Non-fatal (returns {"ok": False, ...} on SSH error)."""
+    host = (host or "").strip()
+    user = (user or "").strip()
+    if not host or not user:
+        return {"ok": False, "error": "missing SSH host/user",
+                "diagnosis": diagnose_failure("missing host/user")}
+    port = str(port or "22").strip() or "22"
+    keyfile = (keyfile or "").strip()
+    cmd = (_STATUS_PROBE.replace("%TAG%", "'" + (job_tag or "sra") + "'")
+                        .replace("%FB%", "'" + (fallback_root or "") + "'"))
+    try:
+        if password:
+            try:
+                import paramiko  # noqa: F401
+            except Exception:
+                raise _SubmitError("password auth needs paramiko (pip install paramiko) or use an SSH key", "")
+            text = _ssh_capture_paramiko(host, port, user, password, keyfile, cmd)
+        else:
+            text = _ssh_capture_systemssh(host, port, user, keyfile, cmd)
+    except Exception as e:
+        output = getattr(e, "output", "") or str(e)
+        return {"ok": False, "error": str(e), "diagnosis": diagnose_failure(output, str(e))}
+    parsed = parse_status(text)
+    parsed.update({"ok": True, "host": host, "job_tag": job_tag})
+    return parsed
+
+
 def main():
     import argparse
     import json

@@ -67,9 +67,19 @@ if ! "$PY" -c "import paramiko" >/dev/null 2>&1; then
   "$PY" -m pip install paramiko >/dev/null 2>&1
 fi
 
+# ---- 3b) Vendored Plotly for the Plots tab (download once if missing) ----
+if [ ! -f "vendor/plotly.min.js" ]; then
+  echo "Downloading the Plotly charting library (first run only, for the Plots tab)..."
+  mkdir -p vendor
+  curl -fsSL -o vendor/plotly.min.js https://cdn.plot.ly/plotly-2.35.2.min.js \
+    || echo "Plotly download failed - the Plots tab will need internet once."
+fi
+
 # ---- 4) Launch the web UI (opens your browser) ----
 echo "Starting the web UI - a browser window will open shortly."
 echo "Keep this window open while you work; close it (or press Ctrl+C) to stop."
+echo "TIP: run launch_Mac.command again to start ANOTHER instance for a concurrent project --"
+echo "     each instance gets its own port and cluster JOB_TAG (sra1, sra2, sra3, ...)."
 echo
 "$PY" server.py
 
