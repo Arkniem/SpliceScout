@@ -405,12 +405,12 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _send_readme(self):
-        """Render README.md as a minimal dark page (preformatted; no markdown deps)."""
+        """Render USER_GUIDE.md as a minimal dark page (preformatted; no markdown deps)."""
         try:
-            md = open(os.path.join(HERE, "README.md"), encoding="utf-8").read()
+            md = open(os.path.join(HERE, "USER_GUIDE.md"), encoding="utf-8").read()
         except Exception:
-            md = "README.md not found."
-        html = ("<!DOCTYPE html><html><head><meta charset='utf-8'><title>SpliceScout — README</title>"
+            md = "USER_GUIDE.md not found."
+        html = ("<!DOCTYPE html><html><head><meta charset='utf-8'><title>SpliceScout — User Guide</title>"
                 "<style>body{background:#0f1420;color:#e7ecf5;font:14px/1.6 ui-monospace,Consolas,"
                 "monospace;max-width:920px;margin:0 auto;padding:32px 22px}a{color:#5b8cff}"
                 "pre{white-space:pre-wrap;word-wrap:break-word}</style></head><body><pre>"
@@ -973,7 +973,7 @@ PAGE = r"""<!DOCTYPE html>
   </section>
 
   <footer class="pagefoot">
-    <a href="/readme" target="_blank">&#128214; Project README</a> &nbsp;&middot;&nbsp; SpliceScout &nbsp;&middot;&nbsp; instance __INSTANCE_TAG__
+    <a href="/readme" target="_blank">&#128214; User Guide</a> &nbsp;&middot;&nbsp; SpliceScout &nbsp;&middot;&nbsp; instance __INSTANCE_TAG__
   </footer>
 </div>
 
