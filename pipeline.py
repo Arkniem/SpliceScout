@@ -15,6 +15,7 @@ import json
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass, asdict
 from datetime import datetime
 
@@ -29,6 +30,7 @@ import build_final
 
 DEFAULT_QUERY = "rna-seq[Description] AND human[Organism] AND drug"
 STAGES = ["fetch", "extract", "prep", "ai_compounds", "ai_samples", "merge", "build"]
+_AI_RATE_RETRY_SECS = 30   # on an AI rate-limit (429), wait this long and re-submit, instead of pausing
 
 
 @dataclass
@@ -41,10 +43,13 @@ class RunConfig:
     run_dir: str
     skip_ai: bool = False
     provider: str = "anthropic"   # AI provider for cleaning: anthropic | openai | gemini
+    base_url: str = ""         # custom OpenAI-compatible endpoint (MiMo/Qwen/local/OpenRouter); blank = default
+    module: str = "bulk_rna_seq"  # analysis module: drives the library-prep filter + the analysis pipeline (STAR)
     deep_dive: bool = True     # after build, deep-dive the best cell line into a Run Selector table
     pick_mode: str = "auto"    # "auto" (top real line) or "manual" (UI/CLI picks from the ranked list)
     cluster_mode: str = "off"  # "off" | "manual" (build bundle) | "autonomous" (build + upload/launch)
     cluster_cfg: dict = None   # config.sh values + ssh host/port/user/key (NO password — that's a secret)
+    star_cfg: dict = None      # STAR config.sh values (genome index, organism, build resources) for bulk_rna_seq
 
 
 def _ask(prompt, default=None, secret=False):
@@ -82,11 +87,19 @@ def main():
     ap.add_argument("--openai-key", default=None)
     ap.add_argument("--gemini-key", default=None)
     ap.add_argument("--model", default=None, help="provider-specific model (else the provider default)")
+    ap.add_argument("--openai-base-url", default=None,
+                    help="custom OpenAI-compatible endpoint (a MiMo/Qwen host, local vLLM/LM-Studio, or "
+                         "OpenRouter https://openrouter.ai/api/v1); used with --provider openai")
     ap.add_argument("--concurrency", type=int, default=8)
     ap.add_argument("--run-dir", default=None)
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--skip-ai", action="store_true", help="run deterministic stages only")
     ap.add_argument("--no-deep-dive", action="store_true", help="skip the cell-line metadata deep dive")
+    ap.add_argument("--module", default=None, help="analysis module (e.g. bulk_rna_seq) — drives filter + alignment")
+    ap.add_argument("--star-genome-dir", default=None, help="prebuilt STAR genome index dir (bulk_rna_seq module)")
+    ap.add_argument("--star-gtf", default=None, help="GTF for STAR splice junctions (optional)")
+    ap.add_argument("--star-index-root", default=None, help="where a build-once STAR index is written")
+    ap.add_argument("--star-organism", default=None, help="organism override (default: auto-detect from the runs)")
     ap.add_argument("--pick", choices=["auto", "manual"], default="auto",
                     help="deep-dive cell-line pick: auto (top real line) or manual (prompt)")
     ap.add_argument("--cell-line", default=None, help="deep-dive a specific cell line by name")
@@ -123,6 +136,13 @@ def main():
             cfg.provider = llm_providers.normalize_provider(a.provider)
         if a.model:
             cfg.model = a.model
+        if a.openai_base_url is not None:
+            cfg.base_url = a.openai_base_url
+        if a.module:
+            cfg.module = a.module
+        sc = _star_cfg_from_args(a)
+        if sc:
+            cfg.star_cfg = {**(cfg.star_cfg or {}), **sc}
         if a.no_deep_dive:
             cfg.deep_dive = False
         if a.pick != "auto" or a.cell_line:
@@ -141,14 +161,19 @@ def main():
         ncbi_key = a.ncbi_key or _ask("NCBI E-utilities API key (blank = keyless)", "") or None
         provider = llm_providers.normalize_provider(a.provider)
         model = a.model or _ask(f"{provider} model", llm_providers.DEFAULT_MODEL[provider])
+        base_url = a.openai_base_url
+        if base_url is None and provider in ("openai", "gemini"):
+            base_url = _ask("Custom OpenAI-compatible base URL (blank = provider default)", "") or None
         slug = re.sub(r"[^a-z0-9]+", "-", query.lower())[:40].strip("-") or "run"
         run_dir = a.run_dir or os.path.join("runs", f"{slug}_{datetime.now():%Y%m%d-%H%M%S}")
         P = Paths(run_dir).ensure_dirs()
         pick_mode = "manual" if (a.pick == "manual" or a.cell_line) else "auto"
         cfg = RunConfig(query=query, cap=cap, ncbi_key=ncbi_key, model=model, provider=provider,
-                        concurrency=a.concurrency, run_dir=P.run_dir, skip_ai=a.skip_ai,
-                        deep_dive=not a.no_deep_dive, pick_mode=pick_mode,
-                        cluster_mode=a.cluster_mode, cluster_cfg=_cluster_cfg_from_args(a))
+                        base_url=base_url or "", module=(a.module or "bulk_rna_seq"),
+                        concurrency=a.concurrency, run_dir=P.run_dir,
+                        skip_ai=a.skip_ai, deep_dive=not a.no_deep_dive, pick_mode=pick_mode,
+                        cluster_mode=a.cluster_mode, cluster_cfg=_cluster_cfg_from_args(a),
+                        star_cfg=_star_cfg_from_args(a))
         json.dump(asdict(cfg), open(P.config, "w", encoding="utf-8"), indent=2)
 
     # provider API key into env (CLI: prompt if missing)
@@ -176,7 +201,8 @@ def main():
     if os.environ.get("CLUSTER_SSH_PASSWORD"):
         secrets["ssh_password"] = os.environ["CLUSTER_SSH_PASSWORD"]
 
-    run_pipeline(cfg, P, select_fn=select_fn, secrets=secrets, cluster_fix_fn=_console_cluster_fix)
+    run_pipeline(cfg, P, select_fn=select_fn, secrets=secrets,
+                 cluster_fix_fn=_console_cluster_fix, ai_fix_fn=_console_ai_fix)
 
 
 def _cluster_cfg_from_args(a):
@@ -192,6 +218,20 @@ def _cluster_cfg_from_args(a):
         c["ssh_port"] = a.ssh_port
     if a.ssh_key:
         c["ssh_key"] = a.ssh_key
+    return c or None
+
+
+def _star_cfg_from_args(a):
+    """Collect STAR settings from CLI args into a star_cfg dict (or None)."""
+    c = {}
+    if getattr(a, "star_genome_dir", None):
+        c["GENOME_DIR"] = a.star_genome_dir
+    if getattr(a, "star_gtf", None):
+        c["SJDB_GTF"] = a.star_gtf
+    if getattr(a, "star_index_root", None):
+        c["STAR_INDEX_ROOT"] = a.star_index_root
+    if getattr(a, "star_organism", None):
+        c["ORGANISM"] = a.star_organism
     return c or None
 
 
@@ -258,6 +298,38 @@ def _console_cluster_fix(diagnosis, current):
     if go in ("n", "no"):
         return {"action": "cancel"}
     return fix
+
+
+def _console_ai_fix(diagnosis, current):
+    """CLI: explain why AI cleaning can't start and read a corrected provider/model/key (or turn AI
+    off). Returns {provider?, model?, api_key?} | {"action": "skip_ai"} | None (TTY only)."""
+    if not sys.stdin.isatty():
+        return None   # non-interactive -> caller turns AI off
+    diagnosis = diagnosis or {}
+    current = current or {}
+    print("\n  -- AI cleaning can't start --")
+    print(f"  {diagnosis.get('title','')}: {diagnosis.get('detail','')}")
+    print(f"  Current: provider={current.get('provider','')} model={current.get('model','')}")
+    print("  Enter corrections (blank = keep current), or type 'off' to run without AI.")
+    try:
+        prov = input("    provider (anthropic|openai|gemini, or 'off'): ").strip()
+    except EOFError:
+        return None
+    if prov.lower() in ("off", "skip", "none", "no"):
+        return {"action": "skip_ai"}
+    out = {}
+    if prov:
+        out["provider"] = prov
+    try:
+        model = input(f"    model [{current.get('model','')}]: ").strip()
+        if model:
+            out["model"] = model
+        key = getpass.getpass("    API key (blank = keep current): ")
+        if key:
+            out["api_key"] = key
+    except Exception:
+        pass
+    return out
 
 
 def _submit_with_retry(P, cfg, deep, secrets, reporter, cluster_fix_fn=None, max_attempts=6):
@@ -418,7 +490,96 @@ def _cluster_summary(P):
     return out
 
 
-def run_pipeline(cfg, P, reporter=NULL, select_fn=None, secrets=None, cluster_fix_fn=None):
+def _save_star_status(P, cfg, built, submit_res):
+    """Record what the STAR stage actually did (survives resume / page reload)."""
+    if built is None and submit_res is None and os.path.exists(P.star_status):
+        return  # resume that didn't re-run STAR -> keep prior status
+    status = {"mode": cfg.cluster_mode, "built": bool(built),
+              "attempted": cfg.cluster_mode == "autonomous" and submit_res is not None,
+              "submitted": bool(submit_res and submit_res.get("submitted"))}
+    if built:
+        status.update({k: built.get(k) for k in ("organism", "bam_out", "job_tag") if built.get(k)})
+    if submit_res and not submit_res.get("submitted") and submit_res.get("reason"):
+        status["reason"] = submit_res.get("reason")
+    try:
+        json.dump(status, open(P.star_status, "w", encoding="utf-8"))
+    except Exception:
+        pass
+
+
+def _star_summary(P):
+    """Compact STAR-handoff summary for the UI (read from files; robust to resume)."""
+    if not os.path.exists(P.star_bundle_zip) and not os.path.exists(P.star_status):
+        return None
+    out = {}
+    if os.path.exists(P.star_bundle_zip):
+        out["bundle"] = True
+        out["zip"] = os.path.basename(P.star_bundle_zip)
+    if os.path.exists(P.star_status):
+        try:
+            st = json.load(open(P.star_status, encoding="utf-8"))
+            for k in ("mode", "built", "attempted", "submitted", "organism", "bam_out", "job_tag", "reason"):
+                if k in st:
+                    out[k] = st.get(k)
+        except Exception:
+            pass
+    return out or None
+
+
+def _persist_cfg(P, cfg):
+    """Save the (non-secret) RunConfig to config.json so a --resume uses any corrected values."""
+    try:
+        json.dump(asdict(cfg), open(P.config, "w", encoding="utf-8"), indent=2)
+    except Exception:
+        pass
+
+
+def _ensure_ai_works(cfg, P, reporter, ai_fix_fn):
+    """Preflight the AI provider/model/key. On failure (bad key/model/etc.) PAUSE: the UI shows a fix
+    form (provider/model/key) + 'Turn off AI', the CLI prompts. Loop until AI works or the user turns
+    it off (sets cfg.skip_ai). The server passes reporter.await_ai_fix; the CLI passes _console_ai_fix.
+    """
+    import ai_clean
+    while not cfg.skip_ai:
+        print(f"[AI] validating provider={cfg.provider} model={cfg.model} …")
+        reporter.set_detail(f"validating {cfg.provider} / {cfg.model}…")
+        err = ai_clean.preflight({"provider": cfg.provider, "model": cfg.model,
+                                  "base_url": getattr(cfg, "base_url", "") or ""})
+        if err is None:
+            print("[AI] provider/model/key OK")
+            return
+        diag = llm_providers.classify_ai_error(err)
+        if diag.get("category") == "rate":           # transient throttle -> wait & re-submit, don't pause
+            print(f"[AI] rate limited ({diag['title']}); re-submitting in {_AI_RATE_RETRY_SECS}s "
+                  "(not pausing for a fix)…")
+            reporter.set_detail(f"rate limited — re-submitting in {_AI_RATE_RETRY_SECS}s…")
+            time.sleep(_AI_RATE_RETRY_SECS)
+            continue
+        print(f"[AI] preflight failed: {diag['title']} — {diag['detail']}")
+        asker = ai_fix_fn or reporter.await_ai_fix
+        fix = asker(diag, {"provider": cfg.provider, "model": cfg.model})
+        if not fix or fix.get("action") in ("skip_ai", "cancel"):
+            cfg.skip_ai = True
+            reporter.skip_stage("ai_compounds")
+            reporter.skip_stage("ai_samples")
+            _persist_cfg(P, cfg)
+            print("** AI cleaning turned OFF -> running the deterministic stages only. **")
+            return
+        if fix.get("provider"):
+            newp = llm_providers.normalize_provider(fix["provider"])
+            if newp != cfg.provider and not fix.get("model"):
+                cfg.model = llm_providers.DEFAULT_MODEL[newp]   # default model for the new provider
+            cfg.provider = newp
+        if fix.get("model"):
+            cfg.model = str(fix["model"]).strip()
+        if fix.get("api_key"):
+            os.environ[llm_providers.KEY_ENV[cfg.provider]] = str(fix["api_key"]).strip()
+        _persist_cfg(P, cfg)
+        print(f"[AI] retrying with provider={cfg.provider} model={cfg.model} …")
+
+
+def run_pipeline(cfg, P, reporter=NULL, select_fn=None, secrets=None, cluster_fix_fn=None,
+                 ai_fix_fn=None):
     """Execute the full pipeline (7 base + 5 deep-dive + 2 cluster stages) for a run dir.
 
     Single source of truth shared by the CLI (`main`) and the web server (`server.py`).
@@ -437,7 +598,7 @@ def run_pipeline(cfg, P, reporter=NULL, select_fn=None, secrets=None, cluster_fi
     cap_int = None if cfg.cap == "unlimited" else int(cfg.cap)
     fetch_max = 100000 if cfg.cap == "unlimited" else int(cfg.cap)
     ai_cfg = {"provider": cfg.provider, "model": cfg.model, "concurrency": cfg.concurrency,
-              "max_retries": 8, "max_tokens": 16000}
+              "base_url": getattr(cfg, "base_url", "") or "", "max_retries": 8, "max_tokens": 16000}
 
     reporter.set_meta(query=cfg.query, cap=cfg.cap, model=cfg.model, provider=cfg.provider,
                       skip_ai=cfg.skip_ai, run_dir=P.run_dir)
@@ -460,6 +621,11 @@ def run_pipeline(cfg, P, reporter=NULL, select_fn=None, secrets=None, cluster_fi
     print(f"\n=== PIPELINE run_dir={P.run_dir} ===")
     print(f"query={cfg.query!r} cap={cfg.cap} model={cfg.model} skip_ai={cfg.skip_ai}\n")
 
+    # 0 AI PREFLIGHT: validate provider/model/key up front (unless skipping, or AI already done on a
+    # resume) so a bad model/key PAUSES for a fix (or 'turn off AI') instead of failing mid-run.
+    if not cfg.skip_ai and not (done("ai_compounds") and done("ai_samples")):
+        _ensure_ai_works(cfg, P, reporter, ai_fix_fn)
+
     # 1 FETCH
     if begin("fetch"):
         fetch_5000_ncbi.run(cfg.query, fetch_max, P, cfg.ncbi_key, reporter=reporter)
@@ -468,7 +634,7 @@ def run_pipeline(cfg, P, reporter=NULL, select_fn=None, secrets=None, cluster_fi
 
     # 2 EXTRACT + PROTOCOL
     if begin("extract"):
-        structured_extract.run(P, cfg.ncbi_key, cap_int, reporter=reporter)
+        structured_extract.run(P, cfg.ncbi_key, cap_int, reporter=reporter, workers=cfg.concurrency)
         mark("extract")
     reporter.complete_stage("extract")
 
@@ -502,7 +668,7 @@ def run_pipeline(cfg, P, reporter=NULL, select_fn=None, secrets=None, cluster_fi
 
     # 7 BUILD (always re-runs; idempotent — rewrites the tables + cellline_index.json)
     reporter.begin_stage("build")
-    summary = build_final.build_all(P)
+    summary = build_final.build_all(P, module=getattr(cfg, "module", "bulk_rna_seq") or "bulk_rna_seq")
     mark("build")
     reporter.complete_stage("build")
 
@@ -511,8 +677,9 @@ def run_pipeline(cfg, P, reporter=NULL, select_fn=None, secrets=None, cluster_fi
     # 8-14 DEEP DIVE (+ cluster handoff): best cell line -> Run Selector metadata + SraAccList
     _DEEP = ("runtable_fetch", "runtable_build", "cellline_match", "runtable_annotate")
     _CLUSTER = ("cluster_bundle", "cluster_submit")
+    _STAR = ("star_bundle", "star_submit")
     if not cfg.deep_dive:
-        for k in ("select",) + _DEEP + _CLUSTER:
+        for k in ("select",) + _DEEP + _CLUSTER + _STAR:
             reporter.skip_stage(k)
     else:
         import deepdive_select
@@ -537,12 +704,12 @@ def run_pipeline(cfg, P, reporter=NULL, select_fn=None, secrets=None, cluster_fi
         reporter.complete_stage("select")
 
         if deep is None:
-            for k in _DEEP + _CLUSTER:
+            for k in _DEEP + _CLUSTER + _STAR:
                 reporter.skip_stage(k)
         else:
             if begin("runtable_fetch"):
                 import runtable_fetch
-                runtable_fetch.run(P, deep, cfg.ncbi_key, reporter=reporter)
+                runtable_fetch.run(P, deep, cfg.ncbi_key, reporter=reporter, workers=cfg.concurrency)
                 mark("runtable_fetch")
             reporter.complete_stage("runtable_fetch")
 
@@ -585,6 +752,41 @@ def run_pipeline(cfg, P, reporter=NULL, select_fn=None, secrets=None, cluster_fi
                     reporter.skip_stage("cluster_submit")
                 _save_cluster_status(P, cfg.cluster_mode, submit_res)
 
+            # 15-16 STAR ALIGNMENT (Bulk RNA-seq module; auto-chained AFTER the download)
+            star_on = (getattr(cfg, "module", "bulk_rna_seq") == "bulk_rna_seq"
+                       and cfg.cluster_mode != "off")
+            if not star_on:
+                for k in _STAR:
+                    reporter.skip_stage(k)
+            else:
+                import cluster_deploy
+                import star_deploy
+                download_root = (cluster_deploy._read_config_root(P)
+                                 or cluster_deploy._effective_root(cfg.cluster_cfg, deep))
+                dl_tag = (cfg.cluster_cfg or {}).get("JOB_TAG", "sra")
+                star_built = None
+                if begin("star_bundle"):
+                    star_built = star_deploy.build_star_bundle(
+                        P, deep, download_root, getattr(cfg, "star_cfg", None),
+                        download_job_tag=dl_tag, reporter=reporter)
+                    mark("star_bundle")
+                reporter.complete_stage("star_bundle")
+
+                star_submit_res = None
+                bundle_ready = (star_built is not None
+                                or os.path.exists(os.path.join(P.star_dir, "config.sh")))
+                if not bundle_ready:
+                    reporter.skip_stage("star_submit")
+                elif cfg.cluster_mode == "autonomous":
+                    if begin("star_submit"):
+                        star_submit_res = star_deploy.submit_star_over_ssh(
+                            P, cfg.cluster_cfg, secrets, download_root, reporter=reporter)
+                        mark("star_submit")
+                    reporter.complete_stage("star_submit")
+                else:
+                    reporter.skip_stage("star_submit")
+                _save_star_status(P, cfg, star_built, star_submit_res)
+
     deep_dive = _deep_summary(P)
     if deep_dive:
         summary = dict(summary or {}, deep_dive=deep_dive)
@@ -598,6 +800,14 @@ def run_pipeline(cfg, P, reporter=NULL, select_fn=None, secrets=None, cluster_fi
                   f"(root {cluster.get('pipeline_root')}) ===")
         else:
             print(f"=== CLUSTER BUNDLE -> {P.cluster_bundle_zip} (root {cluster.get('pipeline_root')}) ===")
+    star = _star_summary(P)
+    if star:
+        summary = dict(summary or {}, star=star)
+        if star.get("submitted"):
+            print(f"=== STAR: alignment auto-chained on the cluster (organism {star.get('organism')}; "
+                  f"BAMs -> {star.get('bam_out')}) ===")
+        elif star.get("bundle"):
+            print(f"=== STAR BUNDLE -> {P.star_bundle_zip} (organism {star.get('organism')}) ===")
 
     print(f"\n=== DONE. run_dir={P.run_dir} ===")
     files = _list_outputs(P)

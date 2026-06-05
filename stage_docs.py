@@ -142,4 +142,24 @@ STAGE_DOCS = {
         "inputs": "cluster_bundle.zip, your SSH settings",
         "outputs": "(remote) running LSF download/convert jobs; cluster_submit.json",
     },
+    "star_bundle": {
+        "title": "Build STAR bundle",
+        "what": "(Bulk RNA-seq module) Assembles the STAR alignment bundle: the vendored STAR scripts, a "
+                "config.sh pointed at the download's FASTQ output + the run's SraRunTable (so runs of one "
+                "BioSample merge into one BAM), the organism (auto-detected from the run table), and a "
+                "genome-index resolution (your GENOME_DIR → the organism registry → a build-once index "
+                "job). JOB_TAG is the download tag + '_star' so the two stages never collide.",
+        "inputs": "the download's by_study/ FASTQ tree, SraRunTable_<line>.csv, star_index_registry.json",
+        "outputs": "runtable/star/ + star_bundle.zip",
+    },
+    "star_submit": {
+        "title": "Launch STAR alignment",
+        "what": "(Autonomous mode only) Uploads the STAR bundle and queues a launcher that WAITS for the "
+                "SRA download to finish (LSF dependency on the download watchdog + a sentinel poll), then "
+                "runs ./run_star_pipeline.sh — STAR 2-pass aligning every downloaded sample to BAMs + "
+                "splice junctions. Consumes the FASTQs (never the .sra). Non-fatal: the bundle stays "
+                "downloadable.",
+        "inputs": "star_bundle.zip, your SSH settings, the running download",
+        "outputs": "(remote) STAR BAMs + SJ.out.tab; star_submit.json",
+    },
 }

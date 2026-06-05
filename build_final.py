@@ -37,6 +37,22 @@ SC_TITLE = re.compile(r"scrna|single[\s_-]?cell|single[\s_-]?nucle|\bsnrna\b|\bs
 SMARTSEQ = re.compile(r"smart[\s_-]?seq", re.I)
 
 
+# Analysis modules: the selected module owns the library-prep FILTER (which protocols are kept in the
+# headline table) and, downstream, the analysis pipeline. Each maps to the build() "mode" whose keep-rule
+# defines its headline table. Adding a module = add an entry here (+ a keep-branch in build() if it needs
+# a NEW filter). bulk_rna_seq == the original splicing-amenable filter (drop 10x/single-cell/3'-tag, keep
+# Smart-seq), so output is byte-identical to before when module='bulk_rna_seq'.
+MODULES = {
+    "bulk_rna_seq": {"label": "Bulk RNA-seq (STAR)", "mode": "splicing"},
+}
+DEFAULT_MODULE = "bulk_rna_seq"
+
+
+def module_mode(module):
+    """The build() headline filter mode for an analysis module (falls back to the default module)."""
+    return MODULES.get(module, MODULES[DEFAULT_MODULE])["mode"]
+
+
 def protocol_class(text):
     t = (text or "").lower()
     if re.search(r"drug-?seq|\bbrb-?seq\b|quant-?seq|cel-?seq|mars-?seq|\btag-?seq\b|"
@@ -60,8 +76,10 @@ def protocol_class(text):
     return "other bulk kit (NEBNext/KAPA/etc.)"
 
 
-def build(P, mode=""):
-    """mode in {'', 'splicing', 'truseq'}. Returns summary dict."""
+def build(P, mode="", is_headline=False):
+    """mode in {'', 'splicing', 'truseq'} (the library-prep filter); is_headline marks the selected
+    module's headline pass, which also writes cellline_index.json (the deep-dive input). Returns a
+    summary dict."""
     struct = {}
     for line in open(P.samples_jsonl, encoding="utf-8"):
         if line.strip():
@@ -193,7 +211,7 @@ def build(P, mode=""):
                 d["total_spots"] += sp
             cat_counter[cell][category] += 1
 
-    if mode == "splicing":
+    if is_headline:
         _write_cellline_index(P, cl, cat_counter)
     return _write_tables(P, mode, cl, cat_counter, study_maxreads, removed_class,
                          n_struct_cell, n_ai_cell, n_regex_cell)
@@ -329,13 +347,16 @@ def _write_cellline_index(P, cl, cat_counter):
         print(f"  ** could not write cellline_index.json: {e} **")
 
 
-def build_all(P):
-    """Emit all tables; splicing is the headline. Returns a summary for the front end."""
-    splicing = build(P, "splicing")   # headline first
+def build_all(P, module=DEFAULT_MODULE):
+    """Emit the selected module's headline table (its library-prep filter) + the all-protocols and
+    TruSeq reference tables. Returns a summary for the front end. bulk_rna_seq maps to mode 'splicing',
+    so output is byte-identical to before when module='bulk_rna_seq'."""
+    headline_mode = module_mode(module)
+    splicing = build(P, headline_mode, is_headline=True)   # headline + cellline_index (deep-dive input)
     allp = build(P, "")
     truseq = build(P, "truseq")
     _write_protocol_audit(P)
-    return {"splicing": splicing, "all": allp, "truseq": truseq}
+    return {"splicing": splicing, "all": allp, "truseq": truseq, "module": module}
 
 
 def main():
@@ -349,7 +370,7 @@ def main():
     if a.mode == "all":
         build_all(P)
     else:
-        build(P, a.mode)
+        build(P, a.mode, is_headline=(a.mode == module_mode(DEFAULT_MODULE)))
 
 
 if __name__ == "__main__":

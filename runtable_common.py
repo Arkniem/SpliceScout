@@ -10,12 +10,14 @@ because the Run Selector reconstruction is validated byte-for-byte against this 
 import re
 import time
 import json
+import threading
 import urllib.request
 import urllib.parse
 
 EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
 
 _state = {"key": "", "interval": 0.34, "last": 0.0}
+_throttle_lock = threading.Lock()   # global pacer so parallel callers stay within NCBI's rate
 
 
 def configure(ncbi_key):
@@ -25,10 +27,13 @@ def configure(ncbi_key):
 
 
 def _throttle():
-    dt = time.time() - _state["last"]
-    if dt < _state["interval"]:
-        time.sleep(_state["interval"] - dt)
-    _state["last"] = time.time()
+    """Block until the caller may START a request, keeping the GLOBAL rate <= 1/interval (thread-safe),
+    so parallel deep-dive fetches never exceed NCBI's limit."""
+    with _throttle_lock:
+        dt = time.time() - _state["last"]
+        if dt < _state["interval"]:
+            time.sleep(_state["interval"] - dt)
+        _state["last"] = time.time()
 
 
 def http_get(url, tries=5, timeout=180):

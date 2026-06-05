@@ -234,10 +234,15 @@ def _start_run(body):
         api_key = (body.get("api_key") or "").strip()
         ncbi_key = (body.get("ncbi_key") or "").strip() or None
         model = (body.get("model") or "").strip() or llm_providers.DEFAULT_MODEL[provider]
+        base_url = (body.get("base_url") or "").strip()   # custom OpenAI-compatible endpoint (optional)
         deep_dive = bool(body.get("deep_dive", True))
         pick_mode = "manual" if (body.get("pick_mode") == "manual") else "auto"
+        module = (body.get("module") or "bulk_rna_seq").strip() or "bulk_rna_seq"
+        star_in = body.get("star") or {}
+        _sk = ("GENOME_DIR", "SJDB_GTF", "STAR_INDEX_ROOT", "ORGANISM", "THREADS", "MEM_MB", "WALL")
+        star_cfg = {k: str(star_in.get(k)).strip() for k in _sk if str(star_in.get(k) or "").strip()} or None
         try:
-            concurrency = max(1, min(32, int(body.get("concurrency", 8))))
+            concurrency = max(1, min(99, int(body.get("concurrency", 8))))
         except Exception:
             concurrency = 8
 
@@ -279,9 +284,10 @@ def _start_run(body):
         run_dir = os.path.join("runs", f"{slug}_{datetime.now():%Y%m%d-%H%M%S}_{_INSTANCE_TAG}")
         P = Paths(run_dir).ensure_dirs()
         cfg = pipeline.RunConfig(query=query, cap=cap, ncbi_key=ncbi_key, model=model,
-                                 provider=provider, concurrency=concurrency, run_dir=P.run_dir,
-                                 skip_ai=skip_ai, deep_dive=deep_dive, pick_mode=pick_mode,
-                                 cluster_mode=cluster_mode, cluster_cfg=cluster_cfg)
+                                 provider=provider, base_url=base_url, module=module,
+                                 concurrency=concurrency, run_dir=P.run_dir, skip_ai=skip_ai,
+                                 deep_dive=deep_dive, pick_mode=pick_mode,
+                                 cluster_mode=cluster_mode, cluster_cfg=cluster_cfg, star_cfg=star_cfg)
         # config.json mirrors the CLI (ncbi_key + cluster_cfg stored; Anthropic key + SSH password NOT)
         json.dump(asdict(cfg), open(P.config, "w", encoding="utf-8"), indent=2)
 
@@ -318,9 +324,11 @@ def _save_settings(body):
     includes the Anthropic key, NCBI key, and any SSH password, at ~/.geo_pipeline_settings.json."""
     keep = {k: body[k] for k in
             ("query", "scope", "cap", "skip_ai", "provider", "api_keys", "ncbi_key", "model",
-             "concurrency", "pick_mode", "cluster_mode", "ssh_password") if k in body}
+             "base_url", "module", "concurrency", "pick_mode", "cluster_mode", "ssh_password") if k in body}
     if isinstance(body.get("cluster"), dict):
         keep["cluster"] = body["cluster"]
+    if isinstance(body.get("star"), dict):
+        keep["star"] = body["star"]
     try:
         with open(_settings_path(), "w", encoding="utf-8") as f:
             json.dump(keep, f, indent=2)
@@ -484,6 +492,28 @@ class Handler(BaseHTTPRequestHandler):
                 ok = rep.provide_cluster_fix(fix)
             return self._send_json(200 if ok else 409,
                                    {"ok": True} if ok else {"error": "not awaiting a cluster fix"})
+        if route.path == "/api/ai_retry":
+            try:
+                body = self._read_body()
+            except Exception:
+                return self._send_json(400, {"error": "invalid JSON"})
+            with _LOCK:
+                rep = _REPORTER
+            if not rep:
+                return self._send_json(409, {"error": "no active run"})
+            if (body.get("action") or "").strip() == "skip_ai":
+                ok = rep.provide_ai_fix({"action": "skip_ai"})
+            else:
+                fix = {}
+                for k in ("provider", "model"):
+                    v = str(body.get(k) or "").strip()
+                    if v:
+                        fix[k] = v
+                if body.get("api_key"):       # secret -> transient only, never written to config.json
+                    fix["api_key"] = body.get("api_key")
+                ok = rep.provide_ai_fix(fix)
+            return self._send_json(200 if ok else 409,
+                                   {"ok": True} if ok else {"error": "not awaiting an AI fix"})
         if route.path == "/api/cluster_status":
             try:
                 body = self._read_body()
@@ -511,11 +541,31 @@ class Handler(BaseHTTPRequestHandler):
             password = (body.get("ssh_password") or settings.get("ssh_password") or "").strip()
             # use THIS instance's own tag — NOT the shared saved-settings JOB_TAG (one settings file
             # across instances), which made e.g. an sra3 instance read sra2's jobs.
-            job_tag = (body.get("job_tag") or cfg.get("JOB_TAG") or _INSTANCE_TAG or "sra").strip()
+            # Scope strictly to THIS instance's tag: the UI sends its INSTANCE_TAG, and we never fall
+            # back to a bare "sra" (which would prefix-match other instances' jobs on the cluster).
+            job_tag = (body.get("job_tag") or cfg.get("JOB_TAG") or _INSTANCE_TAG or "").strip()
+            if not job_tag:
+                return self._send_json(400, {"error": "instance job tag not set — cannot scope the status check"})
             if not fallback_root:
                 fallback_root = (sc.get("PIPELINE_ROOT") or "").strip()
-            return self._send_json(200, cluster_deploy.remote_status(
-                host, user, port, keyfile, password, job_tag, fallback_root))
+            status = cluster_deploy.remote_status(host, user, port, keyfile, password, job_tag, fallback_root)
+            # if this run is the Bulk RNA-seq (STAR) module, also report STAR alignment progress
+            run_module = ""
+            if run_dir:
+                try:
+                    run_module = json.load(open(Paths(run_dir).config, encoding="utf-8")).get("module") or ""
+                except Exception:
+                    run_module = ""
+            if run_module == "bulk_rna_seq" and status.get("ok"):
+                bam_out = (fallback_root.rstrip("/") + "/STAR_bams") if fallback_root else ""
+                try:
+                    star = cluster_deploy.remote_star_status(host, user, port, keyfile, password,
+                                                             f"{job_tag}_star", bam_out)
+                    if star and star.get("ok"):
+                        status["star"] = star
+                except Exception:
+                    pass
+            return self._send_json(200, status)
         self._send_json(404, {"error": "not found"})
 
 
@@ -782,7 +832,38 @@ PAGE = r"""<!DOCTYPE html>
         </div>
         <input type="password" id="akey" autocomplete="off" placeholder="API key" style="margin-top:10px">
         <div class="hint" id="keyhint">Used for the AI cleaning passes (drug-name canonicalization + sample classification).</div>
+        <div id="baseurlrow" style="margin-top:10px;display:none">
+          <input type="text" id="baseurl" autocomplete="off" spellcheck="false" style="width:100%"
+                 placeholder="Custom OpenAI-compatible base URL (optional)">
+          <div class="hint">Point the OpenAI provider at a custom OpenAI-compatible endpoint — a MiMo/Qwen host, a local vLLM/LM-Studio server, or OpenRouter <code>https://openrouter.ai/api/v1</code>. Blank = <code>api.openai.com</code>. The API key above is sent to this endpoint.</div>
+        </div>
         <label class="check"><input type="checkbox" id="skip"> <span>Skip AI cleaning — run the deterministic stages only (no key needed). Tables will lack canonical drug names &amp; recovered cell lines.</span></label>
+      </label>
+
+      <label class="fld">
+        <span class="lbl">Analysis module</span>
+        <div class="hint" style="margin-bottom:9px">Sets the library-prep filter (which protocols pass the headline table) and the downstream analysis pipeline. More modules (single-cell, etc.) coming.</div>
+        <div class="scope" id="modulesel">
+          <label id="lblBulkRna" class="sel"><input type="radio" name="module" value="bulk_rna_seq" checked> Bulk RNA-seq (STAR)</label>
+        </div>
+        <div class="hint">Keeps full-length / splicing-amenable protocols (drops 10x, single-cell, 3'-tag) and, on the cluster, aligns the downloaded reads with STAR.</div>
+        <div id="starfields">
+          <input type="text" id="star_genome" autocomplete="off" spellcheck="false" style="width:100%;margin-top:8px"
+                 placeholder="STAR genome index dir on the cluster (GENOME_DIR) — blank = resolve/build by organism">
+          <div class="hint">If blank or not a real index, an index is resolved by organism: the registry (<code>star_index_registry.json</code>) &rarr; a previously built index &rarr; a one-time build job. Fill the registry with your GRCh38 index path to skip the build. Used only when the cluster is on.</div>
+          <details class="adv" style="margin-top:8px"><summary>STAR options</summary>
+            <div class="row" style="margin-top:8px">
+              <input type="text" id="star_org" placeholder="Organism (blank = auto-detect; default Homo sapiens)" autocomplete="off">
+              <input type="text" id="star_gtf" placeholder="GTF path (optional)" autocomplete="off">
+            </div>
+            <input type="text" id="star_indexroot" placeholder="STAR_INDEX_ROOT (where a build-once index is written)" autocomplete="off" style="width:100%;margin-top:8px">
+            <div class="row" style="margin-top:8px">
+              <input type="number" id="star_threads" placeholder="threads (6)" min="1" max="32">
+              <input type="number" id="star_mem" placeholder="mem MB (64000)" min="1000">
+              <input type="text" id="star_wall" placeholder="wall (24:00)">
+            </div>
+          </details>
+        </div>
       </label>
 
       <label class="fld">
@@ -842,7 +923,8 @@ PAGE = r"""<!DOCTYPE html>
         <summary>Advanced options</summary>
         <label class="fld">
           <span class="lbl">AI concurrency</span>
-          <input type="number" id="conc" min="1" max="32" value="8">
+          <input type="number" id="conc" min="1" max="99" value="8">
+          <div class="hint">Parallel AI requests (1–99). Higher = faster; a rate-limited key may 429 (which now pauses cleanly via the AI-fix prompt).</div>
         </label>
         <label class="fld" style="margin-bottom:0">
           <span class="lbl">NCBI E-utilities API key (optional)</span>
@@ -869,6 +951,7 @@ PAGE = r"""<!DOCTYPE html>
     <div class="stages" id="stages"></div>
 
     <div id="selectpanel" hidden></div>
+    <div id="aifix" hidden></div>
     <div id="clusterfix" hidden></div>
     <div id="results" hidden></div>
 
@@ -931,6 +1014,7 @@ skipEl.addEventListener('change', ()=>{ akeyEl.disabled = skipEl.checked; akeyEl
 // AI provider + model + per-provider key memory
 const LLM = __LLM_CONFIG__;
 const STAGE_DOCS = __STAGE_DOCS__;
+const INSTANCE_TAG = "__INSTANCE_TAG__";   // this server instance's cluster JOB_TAG (sra1/sra2/...)
 const providerEl=$('#provider'), modelEl=$('#model'), keyhintEl=$('#keyhint');
 let savedKeys = {};
 function rebuildModels(p){
@@ -944,6 +1028,7 @@ function syncProvider(){
   akeyEl.value = savedKeys[p] || '';
   akeyEl.placeholder = LLM.keyHint[p] || 'API key';
   keyhintEl.textContent = 'Used for the AI cleaning passes. ' + (LLM.keyHint[p]||'');
+  const br=$('#baseurlrow'); if(br) br.style.display = (p==='openai') ? '' : 'none';  // custom endpoint = openai-format
 }
 providerEl.addEventListener('change', syncProvider);
 akeyEl.addEventListener('input', ()=>{ savedKeys[providerEl.value] = akeyEl.value; });
@@ -954,6 +1039,11 @@ function syncPick(){
   $('#lblManual').classList.toggle('sel', manual); $('#lblAuto').classList.toggle('sel', !manual);
 }
 $('#pickmode').addEventListener('change', syncPick); syncPick();
+function syncModule(){
+  const m = (document.querySelector('input[name=module]:checked')||{}).value || 'bulk_rna_seq';
+  const b=$('#lblBulkRna'); if(b) b.classList.toggle('sel', m==='bulk_rna_seq');
+}
+$('#modulesel').addEventListener('change', syncModule); syncModule();
 
 // cluster section
 function syncClusterMode(){
@@ -982,9 +1072,15 @@ $('#form').addEventListener('submit', async e=>{
     api_keys: savedKeys,
     ncbi_key: $('#ncbi').value,
     model: modelEl.value,
+    base_url: (($('#baseurl')||{}).value || ''),
     concurrency: $('#conc').value,
     deep_dive: true,
     pick_mode: document.querySelector('input[name=pick]:checked').value,
+    module: (document.querySelector('input[name=module]:checked')||{}).value || 'bulk_rna_seq',
+    star: { GENOME_DIR:(($('#star_genome')||{}).value||''), ORGANISM:(($('#star_org')||{}).value||''),
+            SJDB_GTF:(($('#star_gtf')||{}).value||''), STAR_INDEX_ROOT:(($('#star_indexroot')||{}).value||''),
+            THREADS:(($('#star_threads')||{}).value||''), MEM_MB:(($('#star_mem')||{}).value||''),
+            WALL:(($('#star_wall')||{}).value||'') },
     cluster_mode: document.querySelector('input[name=clmode]:checked').value,
     cluster: {
       PIPELINE_ROOT: $('#clroot').value, SCRATCH_DIR: $('#clscratch').value,
@@ -1070,6 +1166,7 @@ function render(s){
   $('#stages').querySelectorAll('.slabel.doc').forEach(el=>el.onclick=()=>openDoc(el.dataset.doc));
   maybeRevealPlots(s);
   renderSelect(s);
+  renderAiFix(s);
   renderClusterFix(s);
 
   // log (append-aware autoscroll)
@@ -1215,6 +1312,40 @@ async function postClusterRetry(cancel){
   box.innerHTML='<div class="banner pick">'+(cancel?'Skipping cluster upload…':'Retrying cluster upload…')+'</div>';
   box.dataset.built='1';
   try{ await fetch('/api/cluster_retry',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); }catch(e){}
+}
+
+// AI preflight failed (bad provider / model / key) -> fix the info or turn AI off, then continue
+function renderAiFix(s){
+  const box=$('#aifix');
+  if(!s.awaiting_ai_fix || !s.ai_prompt){ box.hidden=true; box.dataset.built=''; box.innerHTML=''; return; }
+  if(box.dataset.built==='1') return;          // don't clobber what the user is typing each poll
+  const d=s.ai_prompt.diagnosis||{}, c=s.ai_prompt.current||{};
+  box.innerHTML =
+      '<div class="banner err">AI cleaning can\'t start — '+esc(d.title||'unknown')+'</div>'
+    + '<div class="hint" style="margin:-6px 0 14px">'+esc(d.detail||'')
+    + ' Fix the details below and retry, or turn AI off to run the deterministic pipeline.</div>'
+    + '<label class="fld" style="margin-bottom:10px"><span class="lbl" style="font-size:13px">Provider</span>'
+    + '<select id="af_prov"><option value="anthropic">Anthropic (Claude)</option>'
+    + '<option value="openai">OpenAI (ChatGPT)</option><option value="gemini">Google Gemini</option></select></label>'
+    + '<label class="fld" style="margin-bottom:10px"><span class="lbl" style="font-size:13px">Model</span>'
+    + '<input id="af_model" type="text" value="'+esc(c.model||'')+'" autocomplete="off"></label>'
+    + '<label class="fld" style="margin-bottom:10px"><span class="lbl" style="font-size:13px">API key (blank = keep current)</span>'
+    + '<input id="af_key" type="password" value="" autocomplete="off"></label>'
+    + '<div style="display:flex;gap:10px;margin-top:4px">'
+    + '<button class="primary" id="afRetry">Retry AI</button>'
+    + '<button class="ghost" id="afSkip">Turn off AI — run without it</button></div>';
+  box.hidden=false; box.dataset.built='1';
+  const sel=$('#af_prov'); if(sel && c.provider) sel.value=c.provider;
+  $('#afRetry').onclick=()=>postAiRetry(false);
+  $('#afSkip').onclick=()=>postAiRetry(true);
+}
+async function postAiRetry(skip){
+  const box=$('#aifix');
+  const body = skip ? {action:'skip_ai'}
+    : {provider:$('#af_prov').value, model:$('#af_model').value, api_key:$('#af_key').value};
+  box.innerHTML='<div class="banner pick">'+(skip?'Turning off AI…':'Retrying AI…')+'</div>';
+  box.dataset.built='1';
+  try{ await fetch('/api/ai_retry',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); }catch(e){}
 }
 
 // ---- step-doc modal (click a pipeline step to read what it does) ----
@@ -1397,26 +1528,89 @@ function renderCustom(d){
 }
 
 // ---- on-demand cluster status (poll the cluster after an autonomous launch) ----
-async function fetchClusterStatus(panelId){
+let clstatTimer=null;   // single self-rescheduling auto-refresh timer (every 2 min)
+
+// least-squares slope (runs/sec) over [{t,c}] points; null if <2 points
+function clstatSlope(pts){
+  const n=pts.length; if(n<2) return null;
+  let st=0,sc=0,stt=0,stc=0;
+  for(const p of pts){ st+=p.t; sc+=p.c; stt+=p.t*p.t; stc+=p.t*p.c; }
+  const den=n*stt-st*st; if(den===0) return null;
+  return (n*stc-st*sc)/den;
+}
+// record this check's converted count (persisted, keyed by job+root) so the ETA refines with every
+// check. Resets if a new run reuses the same tag (total changes, or converted regresses).
+function clstatRecord(d){
+  const ov=d.overall||{}; if(ov.exp==null||ov.converted==null) return null;
+  const key='clstat_hist_'+(d.job_tag||'def')+'_'+(d.root||'');
+  let hist=[]; try{ hist=JSON.parse(localStorage.getItem(key)||'[]'); }catch(e){ hist=[]; }
+  const last=hist.length?hist[hist.length-1]:null;
+  if(last && (ov.exp!==last.e || ov.converted<last.c)) hist=[];     // new run on same tag -> reset
+  const now=Math.floor(Date.now()/1000);
+  if(!hist.length || now-hist[hist.length-1].t>=5) hist.push({t:now,c:ov.converted,e:ov.exp});
+  if(hist.length>300) hist=hist.slice(-300);
+  try{ localStorage.setItem(key, JSON.stringify(hist)); }catch(e){}
+  return hist;
+}
+// ETA seconds to finish converting. Primary = rate observed across YOUR checks (refines each check);
+// first-check fallback = the cluster watchdog's own logged rate.
+function clstatEta(d, hist){
+  const ov=d.overall||{};
+  if(hist && hist.length>=2 && ov.exp!=null){
+    const t0=hist[0].t, r=clstatSlope(hist.map(p=>({t:p.t-t0,c:p.c})));
+    if(r && r>0){ const rem=ov.exp-ov.converted;
+      return {sec: rem<=0?0:Math.round(rem/r), src:'your '+hist.length+' checks'}; }
+  }
+  if(d.eta_seconds!=null) return {sec:d.eta_seconds, src:'cluster log'};
+  return {sec:null, src:null};
+}
+function clstatSchedule(panelId, d){
+  if(clstatTimer){ clearTimeout(clstatTimer); clstatTimer=null; }
+  if(d && (d.complete || d.stalled)) return;                         // finished/stalled -> stop
+  clstatTimer=setTimeout(()=>fetchClusterStatus(panelId, true), 120000);   // every 2 min
+}
+async function fetchClusterStatus(panelId, auto){
   panelId = panelId || 'clusterstatus';
-  const host=$('#'+panelId); if(!host) return;
-  host.innerHTML='<div class="hint">Checking the cluster…</div>';
+  const host=$('#'+panelId);
+  if(!host){ if(clstatTimer){ clearTimeout(clstatTimer); clstatTimer=null; } return; }   // panel gone
+  if(!auto) host.innerHTML='<div class="hint">Checking the cluster…</div>';
   try{
-    const d = await (await fetch('/api/cluster_status',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})).json();
-    if(!d.ok){ host.innerHTML='<div class="err">'+esc((d.diagnosis&&d.diagnosis.title)||d.error||'Could not reach the cluster')
-        +(d.diagnosis&&d.diagnosis.detail?' — '+esc(d.diagnosis.detail):'')+'</div>'; return; }
+    const d = await (await fetch('/api/cluster_status',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({job_tag:INSTANCE_TAG})})).json();
+    if(!d.ok){
+      if(!auto) host.innerHTML='<div class="err">'+esc((d.diagnosis&&d.diagnosis.title)||d.error||'Could not reach the cluster')
+          +(d.diagnosis&&d.diagnosis.detail?' — '+esc(d.diagnosis.detail):'')+'</div>';
+      clstatSchedule(panelId, null);   // transient error -> keep retrying every 2 min
+      return;
+    }
     renderClusterStatus(d, panelId);
-  }catch(ex){ host.innerHTML='<div class="err">'+esc(ex.message)+'</div>'; }
+    clstatSchedule(panelId, d);
+  }catch(ex){
+    if(!auto) host.innerHTML='<div class="err">'+esc(ex.message)+'</div>';
+    clstatSchedule(panelId, null);
+  }
 }
 function renderClusterStatus(d, panelId){
   panelId = panelId || 'clusterstatus';
   const host=$('#'+panelId), ov=d.overall||{};
+  const hist=clstatRecord(d), eta=clstatEta(d, hist);   // refine the ETA from every check
   const tag = d.job_tag ? ' ('+esc(d.job_tag)+')' : '';
   let h='<div class="banner '+(d.complete?'ok':(d.stalled?'err':'pick'))+'">'
     + (d.complete?'✓ Cluster pipeline complete':(d.stalled?'⚠ Watchdog stopped (stalled)':'Cluster progress'))+tag
     + (ov.exp!=null?' &mdash; '+ov.converted+' converted &middot; '+ov.downloaded+' downloaded / '+ov.exp+' runs ('+ov.pct+'%)':'')
     + (d.live_jobs!=null?' &middot; '+d.live_jobs+' active jobs':'')
-    + (d.eta_seconds!=null&&!d.complete?' &middot; ~'+fmtDur(d.eta_seconds)+' left to convert':'') + '</div>';
+    + (eta.sec!=null&&!d.complete?' &middot; ~'+fmtDur(eta.sec)+' left to convert':'') + '</div>';
+  if(d.star){
+    const s=d.star, so=s.overall||{};
+    const phase = s.complete ? '✓ STAR alignment complete'
+      : s.stalled ? '⚠ STAR stalled'
+      : s.launch_pending ? 'STAR queued — waiting for the download to finish'
+      : s.building ? 'STAR — building genome index…'
+      : 'STAR aligning';
+    h += '<div class="banner '+(s.complete?'ok':(s.stalled?'err':'pick'))+'" style="margin-top:6px">'
+       + phase + (so.exp?' &mdash; '+so.done+' / '+so.exp+' BAMs ('+so.pct+'%)':'')
+       + (s.live_jobs!=null?' &middot; '+s.live_jobs+' jobs':'')
+       + (s.eta_seconds!=null&&!s.complete?' &middot; ~'+fmtDur(s.eta_seconds)+' left':'') + '</div>';
+  }
   if(ov.exp){ h+='<div class="obar" title="solid = converted, faint = downloaded" style="margin-bottom:4px;position:relative">'
     + '<span style="width:'+(ov.dl_pct||0)+'%;opacity:.30"></span>'
     + '<span style="width:'+(ov.pct||0)+'%;position:absolute;left:1px;top:0"></span></div>'
@@ -1433,7 +1627,13 @@ function renderClusterStatus(d, panelId){
   if(d.root){ h+='<div class="mutfoot" style="margin-top:8px">root: '+esc(d.root)+'</div>'; }
   if(d.raw){ h+='<details style="margin-top:8px"><summary class="hint" style="cursor:pointer">probe output</summary>'
     + '<pre style="white-space:pre-wrap;font-size:11px;color:#9aa6c0;max-height:220px;overflow:auto;background:#0a0e17;border:1px solid var(--line);border-radius:8px;padding:8px;margin-top:6px">'+esc(d.raw)+'</pre></details>'; }
-  h+='<button class="ghost" id="clstatRefresh_'+panelId+'" style="margin-top:10px">Refresh</button>';
+  h+='<div class="hint" style="margin-top:10px;font-size:11.5px">'
+    + (d.complete?'Pipeline complete — auto-refresh stopped.'
+       :(d.stalled?'Watchdog stalled — auto-refresh stopped.'
+         :'Auto-refreshing every 2 min.'+(eta.sec==null?' ETA appears once conversions progress.':'')))
+    + ' Last checked '+esc(new Date().toLocaleTimeString())
+    + (eta.src&&eta.sec!=null&&!d.complete?' &middot; ETA from '+esc(eta.src):'') + '</div>';
+  h+='<button class="ghost" id="clstatRefresh_'+panelId+'" style="margin-top:8px">Refresh now</button>';
   host.innerHTML=h; const b=$('#clstatRefresh_'+panelId); if(b) b.onclick=()=>fetchClusterStatus(panelId);
 }
 
@@ -1448,8 +1648,10 @@ function applySettings(s){
   savedKeys = Object.assign({}, s.api_keys || {});
   syncProvider();   // rebuild model suggestions + fill the key for the chosen provider
   if(s.model) modelEl.value = s.model;   // restore any saved model (editable — custom strings too)
+  setVal('baseurl', s.base_url);         // restore a saved custom OpenAI-compatible endpoint
   setVal('ncbi', s.ncbi_key); setVal('conc', s.concurrency);
   if(s.pick_mode){ const r=document.querySelector('input[name=pick][value="'+s.pick_mode+'"]'); if(r) r.checked=true; }
+  if(s.module){ const r=document.querySelector('input[name=module][value="'+s.module+'"]'); if(r) r.checked=true; }
   if(s.cluster_mode){ const r=document.querySelector('input[name=clmode][value="'+s.cluster_mode+'"]'); if(r) r.checked=true; }
   const c=s.cluster||{};
   setVal('clroot', c.PIPELINE_ROOT); setVal('clscratch', c.SCRATCH_DIR); setVal('clqueue', c.LSF_QUEUE);
@@ -1458,8 +1660,12 @@ function applySettings(s){
   setVal('clpfmem', c.PREFETCH_MEM_MB);   // JOB_TAG is auto per-instance (sra1, sra2, ...) — keep the instance default, don't restore a saved one
   setVal('sshhost', c.ssh_host); setVal('sshuser', c.ssh_user); setVal('sshport', c.ssh_port); setVal('sshkey', c.ssh_key);
   setVal('sshpass', s.ssh_password);
+  const st=s.star||{};
+  setVal('star_genome', st.GENOME_DIR); setVal('star_org', st.ORGANISM); setVal('star_gtf', st.SJDB_GTF);
+  setVal('star_indexroot', st.STAR_INDEX_ROOT); setVal('star_threads', st.THREADS);
+  setVal('star_mem', st.MEM_MB); setVal('star_wall', st.WALL);
   if(s.cluster && (s.cluster.ssh_host||'').trim()) $('#clusterCheck').hidden=false;  // enable after-restart status check
-  syncScope(); syncPick(); syncClusterMode();
+  syncScope(); syncPick(); syncModule(); syncClusterMode();
 }
 
 // resume an in-flight (or finished) run if the page is reloaded

@@ -1,0 +1,23 @@
+{
+  "_comment": "Organism -> prebuilt STAR index on THIS cluster (organisms) + build-once reference URLs (reference_urls). Keys are NCBI scientific names (the SraRunTable 'Organism' value), matched case-insensitively. RECOMMENDED: fill organisms.<org>.index_dir with your cluster's prebuilt STAR index (must contain SAindex + Genome) to SKIP the heavy build-once step. gtf is optional (leave '' if the index was built WITH a GTF, the usual case). If index_dir is empty AND no GENOME_DIR is given, the pipeline builds an index once from reference_urls into STAR_INDEX_ROOT/<organism>.",
+  "version": 1,
+  "organisms": {
+    "homo sapiens": {"index_dir": "", "gtf": "", "assembly": "GRCh38",
+                     "notes": "Fill index_dir with your lab's GRCh38 STAR index path to avoid the build-once step."},
+    "mus musculus": {"index_dir": "", "gtf": "", "assembly": "GRCm39"}
+  },
+  "reference_urls": {
+    "homo sapiens": {
+      "assembly": "GRCh38",
+      "fasta_url": "https://ftp.ensembl.org/pub/release-111/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz",
+      "gtf_url": "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_44/gencode.v44.primary_assembly.annotation.gtf.gz",
+      "sjdb_overhang": 100
+    },
+    "mus musculus": {
+      "assembly": "GRCm39",
+      "fasta_url": "https://ftp.ensembl.org/pub/release-111/fasta/mus_musculus/dna/Mus_musculus.GRCm39.dna.primary_assembly.fa.gz",
+      "gtf_url": "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M34/gencode.vM34.primary_assembly.annotation.gtf.gz",
+      "sjdb_overhang": 100
+    }
+  }
+}

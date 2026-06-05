@@ -100,7 +100,8 @@ async def _classify_async(payload, ai_cfg, cost_log):
             "target_aliases": payload.get("target_aliases", []),
             "candidates": [c["value"] if isinstance(c, dict) else c
                            for c in payload.get("candidates", [])]}
-    client = llm_providers.make_client(provider, ai_cfg.get("max_retries", 8))
+    client = llm_providers.make_client(provider, ai_cfg.get("max_retries", 8),
+                                       base_url=ai_cfg.get("base_url"))
     try:
         results, usage = await llm_providers.classify(
             client, provider, model, INSTRUCTIONS, user, TOOL, ai_cfg.get("max_tokens", 8000))

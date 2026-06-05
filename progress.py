@@ -33,6 +33,9 @@ STAGES = [
     # cluster handoff
     ("cluster_bundle", "Build cluster bundle"),
     ("cluster_submit", "Upload + launch on cluster"),
+    # STAR alignment (Bulk RNA-seq module; auto-chained after the download)
+    ("star_bundle", "Build STAR bundle"),
+    ("star_submit", "Launch STAR alignment"),
 ]
 
 # Rough fraction-of-wall-time weights used only to drive the *overall* progress bar
@@ -53,6 +56,8 @@ WEIGHTS = {
     "runtable_annotate": 0.02,
     "cluster_bundle": 0.01,
     "cluster_submit": 0.02,
+    "star_bundle": 0.01,
+    "star_submit": 0.02,
 }
 
 
@@ -108,6 +113,11 @@ class RunReporter:
         self._cluster_prompt = None
         self._cluster_fix = None
         self._cluster_event = threading.Event()
+        # AI preflight fix: pause if the provider/model/key is bad -> correct it or turn AI off
+        self._awaiting_ai = False
+        self._ai_prompt = None
+        self._ai_fix = None
+        self._ai_event = threading.Event()
         self.run_dir = run_dir
         self.progress_path = progress_path or (
             os.path.join(run_dir, "progress.json") if run_dir else None)
@@ -248,6 +258,36 @@ class RunReporter:
         self._cluster_event.set()
         return True
 
+    # ---- AI preflight fix (bad provider/model/key -> correct it or turn AI off) ----------
+    def await_ai_fix(self, diagnosis, current, timeout=3600):
+        """Block until the UI/CLI supplies a corrected AI config or chooses to turn AI off.
+
+        Sets `awaiting_ai_fix` + `ai_prompt` (the diagnosis + current provider/model) in the snapshot
+        so the server can render a fix form and POST /api/ai_retry. Returns the fix payload
+        {provider?, model?, api_key?} or {"action": "skip_ai"}; None on timeout (caller turns AI off).
+        """
+        with self._lock:
+            self._ai_prompt = {"diagnosis": diagnosis, "current": current or {}}
+            self._awaiting_ai = True
+            self._ai_fix = None
+            self._ai_event.clear()
+            self._flush_locked(force=True)
+        got = self._ai_event.wait(timeout)
+        with self._lock:
+            self._awaiting_ai = False
+            fix = self._ai_fix
+            self._flush_locked(force=True)
+        return fix if got else None
+
+    def provide_ai_fix(self, payload):
+        """Called by the server (/api/ai_retry) to deliver corrected AI info. True if accepted."""
+        with self._lock:
+            if not self._awaiting_ai:
+                return False
+            self._ai_fix = payload
+        self._ai_event.set()
+        return True
+
     # ---- terminal states -------------------------------------------------
     def finish(self, result=None, files=None):
         with self._lock:
@@ -329,6 +369,8 @@ class RunReporter:
                 "candidates": self._candidates if self._awaiting else [],
                 "awaiting_cluster_fix": self._awaiting_cluster,
                 "cluster_prompt": self._cluster_prompt if self._awaiting_cluster else None,
+                "awaiting_ai_fix": self._awaiting_ai,
+                "ai_prompt": self._ai_prompt if self._awaiting_ai else None,
                 "meta": dict(self._meta),
                 "elapsed": round(elapsed, 1),
                 "started_epoch": self._started_epoch,
@@ -397,6 +439,12 @@ class _NullReporter:
         return None  # standalone/CLI with no UI: caller leaves the bundle downloadable
 
     def provide_cluster_fix(self, payload):
+        return False
+
+    def await_ai_fix(self, diagnosis, current, timeout=3600):
+        return None  # standalone/CLI with no UI: caller turns AI off
+
+    def provide_ai_fix(self, payload):
         return False
 
     def finish(self, *a, **k):

@@ -13,6 +13,7 @@ RunReporter and re-runnable (already-cached studies are skipped).
 import os
 import re
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import runtable_common as C
 from progress import NULL
@@ -52,23 +53,34 @@ def fetch_study(gse, cache_dir):
     return "ENA %s (%d experiments)" % (ena_study, n)
 
 
-def run(P, sel, ncbi_key=None, reporter=NULL):
-    """Cache full SRA XML for every study of the selected cell line. Resumable (skips cached)."""
+def run(P, sel, ncbi_key=None, reporter=NULL, workers=8):
+    """Cache full SRA XML for every study of the selected cell line, IN PARALLEL behind the global
+    runtable_common pacer (so the NCBI key's higher rate pays off without exceeding the limit). Each
+    study writes its OWN cache file(s), so no write lock is needed. Resumable (skips cached)."""
     C.configure(ncbi_key)
     os.makedirs(P.xml_cache_dir, exist_ok=True)
     studies = sel.get("studies", [])
     reporter.set_total(len(studies))
-    reporter.set_detail(f"{len(studies)} studies for {sel.get('canonical','?')}")
+    n_workers = max(1, min(int(workers or 8), 12))   # usually few studies; the pacer bounds req/s
+    reporter.set_detail(f"{len(studies)} studies for {sel.get('canonical','?')} · {n_workers} parallel")
     print(f"=== DEEP-DIVE FETCH: {len(studies)} studies for "
-          f"{sel.get('canonical','?')!r} -> {P.xml_cache_dir} ===")
-    for i, gse in enumerate(studies, 1):
+          f"{sel.get('canonical','?')!r} -> {P.xml_cache_dir} ({n_workers} parallel) ===")
+
+    def handle(gse):
         try:
-            status = fetch_study(gse, P.xml_cache_dir)
+            return gse, fetch_study(gse, P.xml_cache_dir)
         except Exception as e:
-            status = "ERROR: %s" % e
-        print(f"  [{i}/{len(studies)}] {gse:<12} {status}")
-        reporter.advance(1)
-        reporter.set_detail(f"{gse}: {status}")
+            return gse, "ERROR: %s" % e
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=n_workers) as ex:
+        futs = [ex.submit(handle, gse) for gse in studies]
+        for fut in as_completed(futs):
+            gse, status = fut.result()
+            done += 1
+            print(f"  [{done}/{len(studies)}] {gse:<12} {status}")
+            reporter.advance(1)
+            reporter.set_detail(f"{gse}: {status}")
     return {"studies": len(studies)}
 
 

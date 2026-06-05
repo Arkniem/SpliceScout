@@ -14,8 +14,10 @@ import re
 import json
 import time
 import html
+import threading
 import urllib.request
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from normalize_v2 import clean_compound  # single source of truth for dose/control logic
 from progress import NULL
@@ -32,7 +34,13 @@ CELL_TAGS = {"cell line", "cell-line", "cell_line", "cellline", "cell line name"
 SOURCE_TAGS = {"source_name", "source name", "tissue", "sample type",
                "cell type", "cell-type", "cell_type"}
 
+# Global request pacer shared by the parallel extract workers. NCBI allows ~10 req/s with an API key,
+# ~3 req/s without. _throttle() serializes only the request STARTS (it sleeps while holding the lock,
+# then releases before the network call), so starts are spaced >= interval globally (rate <= 1/interval)
+# while responses overlap across threads — that's what makes the API key's higher rate actually pay off
+# WITHOUT ever exceeding NCBI's limit.
 _state = {"key": None, "interval": 0.34, "last": 0.0}
+_throttle_lock = threading.Lock()
 
 
 def _configure(ncbi_key):
@@ -45,13 +53,19 @@ def _ksuf():
     return f"&api_key={_state['key']}" if _state["key"] else ""
 
 
-def fetch(url, retries=4):
-    url += _ksuf()
-    for attempt in range(retries):
+def _throttle():
+    """Block until this thread may START a request, keeping the GLOBAL rate <= 1/interval."""
+    with _throttle_lock:
         wait = _state["interval"] - (time.monotonic() - _state["last"])
         if wait > 0:
             time.sleep(wait)
         _state["last"] = time.monotonic()
+
+
+def fetch(url, retries=4):
+    url += _ksuf()
+    for attempt in range(retries):
+        _throttle()                      # global pacing (thread-safe); network call is outside the lock
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=45) as r:
@@ -155,8 +169,23 @@ def process_study(uid, acc):
     return rows, (protocol or {"protocol": "", "strategy": "", "selection": "", "instrument": ""})
 
 
-def run(P, ncbi_key=None, cap=None, reporter=NULL):
-    """Stage 2 entry. Writes P.samples_jsonl, P.done_set, P.study_protocol. Resumable."""
+def _checkpoint(P, done, protocols):
+    """Persist the resume checkpoint (done-set + protocols). Called every N studies + at the end —
+    batching keeps these growing O(n) JSON dumps off the per-study hot path on big runs. Safe because
+    structured_samples.jsonl is keyed by GSM downstream (build_final), so a crash that re-fetches a few
+    not-yet-checkpointed studies just rewrites the same rows (deduped), never corrupts the output."""
+    json.dump(sorted(done), open(P.done_set, "w", encoding="utf-8"))
+    json.dump(protocols, open(P.study_protocol, "w", encoding="utf-8"), ensure_ascii=False)
+
+
+def run(P, ncbi_key=None, cap=None, reporter=NULL, workers=8):
+    """Stage 2 entry. Writes P.samples_jsonl, P.done_set, P.study_protocol. Resumable.
+
+    Studies are fetched in PARALLEL (ThreadPoolExecutor) behind the global _throttle() pacer, so the
+    NCBI API key's higher rate (10/s vs 3/s) actually turns into speed — the pacer caps request STARTS
+    to NCBI's limit while responses overlap, so we never exceed the limit. `workers` is capped to a safe
+    ceiling; the rate limiter (not the thread count) is what bounds the request rate. Resume-safe: the
+    done-set + protocols are checkpointed after each completed study under a write lock."""
     _configure(ncbi_key)
     with open(P.raw_json, "r", encoding="utf-8") as f:
         result = json.load(f)["result"]
@@ -183,34 +212,58 @@ def run(P, ncbi_key=None, cap=None, reporter=NULL):
     skipped = sum(1 for (_, acc) in pairs if (not acc) or (acc in done))
     if skipped:
         reporter.advance(skipped)
-    reporter.set_detail(f"{len(pairs)} studies (resuming {len(done)} done)")
+    todo = [(uid, acc) for (uid, acc) in pairs if acc and acc not in done]
+    n_workers = max(1, min(int(workers or 8), 24))   # rate limiter caps req/s regardless of thread count
+    reporter.set_detail(f"{len(todo)} studies to fetch · {n_workers} parallel · "
+                        f"{'keyed ~10/s' if ncbi_key else 'keyless ~3/s'}")
+    print(f"=== EXTRACT+PROTOCOL: {len(pairs)} studies (done already: {len(done)}; "
+          f"{len(todo)} to fetch, {n_workers} parallel) ===")
 
-    print(f"=== EXTRACT+PROTOCOL: {len(pairs)} studies (done already: {len(done)}) ===")
     jf = open(P.samples_jsonl, "a", encoding="utf-8")
-    processed = 0
-    for i, (uid, acc) in enumerate(pairs):
-        if not acc or acc in done:
-            continue
+    write_lock = threading.Lock()
+    counters = {"processed": 0, "failed": 0, "seen": 0}
+
+    def handle(uid, acc):
         rows, protocol = process_study(uid, acc)
-        if rows is None:
-            print(f"  [{i}] {acc} FETCH FAILED (will retry next run)")
-            reporter.advance(1)
-            reporter.set_detail(f"{acc}: fetch failed (will retry)")
-            continue
-        for r in rows:
-            jf.write(json.dumps(r, ensure_ascii=False) + "\n")
-        jf.flush()
-        protocols[acc] = protocol
-        done.add(acc)
-        json.dump(sorted(done), open(P.done_set, "w", encoding="utf-8"))
-        json.dump(protocols, open(P.study_protocol, "w", encoding="utf-8"), ensure_ascii=False)
-        processed += 1
-        reporter.advance(1)
-        reporter.set_detail(f"{acc} (+{len(rows)} samples)")
-        if processed % 20 == 0:
-            print(f"  [{i+1}/{len(pairs)}] {acc}  (+{len(rows)} samples)")
-    jf.close()
-    print(f"  Done. Processed {processed} new studies. Total: {len(done)}.")
+        return acc, rows, protocol
+
+    try:
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            futs = [ex.submit(handle, uid, acc) for (uid, acc) in todo]
+            for fut in as_completed(futs):
+                try:
+                    acc, rows, protocol = fut.result()
+                except Exception as e:
+                    counters["failed"] += 1
+                    reporter.advance(1)
+                    reporter.set_detail(f"fetch error: {str(e)[:80]}")
+                    continue
+                if rows is None:
+                    counters["failed"] += 1
+                    print(f"  {acc} FETCH FAILED (will retry next run)")
+                    reporter.advance(1)
+                    reporter.set_detail(f"{acc}: fetch failed (will retry)")
+                    continue
+                with write_lock:
+                    for r in rows:
+                        jf.write(json.dumps(r, ensure_ascii=False) + "\n")
+                    jf.flush()
+                    protocols[acc] = protocol
+                    done.add(acc)
+                    counters["processed"] += 1
+                    counters["seen"] += 1
+                    seen = counters["seen"]
+                    if seen % 25 == 0:                 # periodic checkpoint (final one in finally)
+                        _checkpoint(P, done, protocols)
+                reporter.advance(1)
+                reporter.set_detail(f"{acc} (+{len(rows)} samples)")
+                if seen % 20 == 0:
+                    print(f"  [{seen}/{len(todo)}] {acc}  (+{len(rows)} samples)")
+    finally:
+        _checkpoint(P, done, protocols)               # always persist final progress
+        jf.close()
+    print(f"  Done. Processed {counters['processed']} new studies "
+          f"({counters['failed']} fetch failures). Total: {len(done)}.")
     return {"studies_done": len(done)}
 
 

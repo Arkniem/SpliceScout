@@ -59,16 +59,29 @@ def have_key(provider):
     return bool(api_key(provider))
 
 
-def make_client(provider, max_retries=8):
-    """Create the async client for a provider (anthropic, openai, or gemini-via-openai-compat)."""
+def make_client(provider, max_retries=8, timeout=None, base_url=None):
+    """Create the async client for a provider (anthropic, openai, or gemini-via-openai-compat).
+
+    `timeout` (seconds), when set, caps each request — used by the AI preflight so a bad/slow
+    endpoint fails fast instead of blocking on the SDK's long default.
+    `base_url`, when set, points the provider at a CUSTOM OpenAI-compatible endpoint — e.g. running
+    an OpenAI-format model (MiMo, Qwen, a local vLLM/LM-Studio server, OpenRouter, …) through the
+    'openai' provider. Blank/None => the provider's default endpoint (api.openai.com for 'openai';
+    the Gemini OpenAI-compat URL for 'gemini')."""
+    extra = {} if timeout is None else {"timeout": timeout}
+    base_url = (base_url or "").strip() or None
     if provider == "anthropic":
         from anthropic import AsyncAnthropic
-        return AsyncAnthropic(max_retries=max_retries)
+        if base_url:
+            extra["base_url"] = base_url
+        return AsyncAnthropic(max_retries=max_retries, **extra)
     from openai import AsyncOpenAI
     if provider == "gemini":
-        return AsyncOpenAI(api_key=api_key("gemini"), base_url=GEMINI_OPENAI_BASE,
-                           max_retries=max_retries)
-    return AsyncOpenAI(max_retries=max_retries)   # OPENAI_API_KEY from env
+        return AsyncOpenAI(api_key=api_key("gemini"), base_url=base_url or GEMINI_OPENAI_BASE,
+                           max_retries=max_retries, **extra)
+    if base_url:                                  # custom OpenAI-compatible host (MiMo etc.)
+        extra["base_url"] = base_url
+    return AsyncOpenAI(max_retries=max_retries, **extra)   # OPENAI_API_KEY from env
 
 
 async def close_client(client):
@@ -147,3 +160,45 @@ async def classify(client, provider, model, system_text, user_obj, tool, max_tok
              "output_tokens": getattr(u, "completion_tokens", 0) if u else 0,
              "cache_read": 0, "cache_creation": 0}
     return results, usage
+
+
+def classify_ai_error(exc):
+    """Turn an AI-provider exception into an actionable diagnosis {category, title, detail}.
+    Categories: auth | model | perm | rate | network | unknown. Used to tell the user whether to fix
+    the API key, the model name, the provider, etc. — or turn AI off."""
+    msg = str(exc or "")
+    low = msg.lower()
+    status = (getattr(exc, "status_code", None)
+              or getattr(getattr(exc, "response", None), "status_code", None))
+
+    def D(category, title, detail):
+        return {"category": category, "title": title, "detail": detail}
+
+    if status == 401 or any(s in low for s in ("api key", "api_key", "unauthorized", "authenticat",
+                                               "invalid x-api-key", "no auth credentials",
+                                               "invalid_api_key")):
+        return D("auth", "API key rejected",
+                 "The API key was missing or invalid for this provider. Paste a valid key, switch "
+                 "provider, or turn off AI cleaning.")
+    if status == 404 or any(s in low for s in ("not found", "does not exist", "is not a valid model",
+                                               "unknown model", "no such model", "model_not_found")):
+        return D("model", "Model not found",
+                 "That model name isn't valid for this provider/account. Fix the model id, switch "
+                 "provider, or turn off AI cleaning.")
+    if status == 403 or "permission" in low or ("access" in low and "denied" in low):
+        return D("perm", "Access denied for this model",
+                 "Your account can't access this model. Use a different model/provider, or turn off "
+                 "AI cleaning.")
+    if status == 429 or any(s in low for s in ("rate limit", "ratelimit", "quota",
+                                               "resource_exhausted", "too many requests")):
+        return D("rate", "Rate limit / quota exceeded",
+                 "The provider is rate-limiting this key (often a free tier). Lower concurrency, wait, "
+                 "switch provider, or turn off AI cleaning.")
+    if any(s in low for s in ("timed out", "timeout", "connection", "network", "temporary failure",
+                              "getaddrinfo", "ssl")):
+        return D("network", "Couldn't reach the provider",
+                 "Network error contacting the AI provider. Check connectivity / base URL, switch "
+                 "provider, or turn off AI cleaning.")
+    return D("unknown", "AI provider call failed",
+             (msg[:200] or "The AI provider call failed.")
+             + "  Fix the provider / model / key, or turn off AI cleaning.")

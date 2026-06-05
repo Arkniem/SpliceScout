@@ -45,21 +45,23 @@ NUMERIC = {"THREADS", "MEM_MB", "PREFETCH_MEM_MB", "WATCHDOG_INTERVAL_MIN"}
 
 
 # ---------- config.sh generation ----------
-def _shval(name, value):
-    if name in NUMERIC:
+def _shval(name, value, numeric=NUMERIC, defaults=CONFIG_DEFAULTS):
+    if name in numeric:
         try:
             return str(int(value))
         except Exception:
-            return str(CONFIG_DEFAULTS[name])
+            return str(defaults.get(name, value))
     s = str(value).replace('"', '\\"')
     return f'"{s}"'
 
 
-def fill_config(template_text, vals):
-    """Replace each EDIT-THESE assignment in the vendored config.sh with the user's value."""
+def fill_config(template_text, vals, numeric=NUMERIC, defaults=CONFIG_DEFAULTS):
+    """Replace each EDIT-THESE assignment in the vendored config.sh with the user's value.
+    `numeric`/`defaults` let other templates (e.g. the STAR config.sh) reuse this with their own var
+    sets; the download call sites keep the module defaults, so their output is unchanged."""
     out = template_text
     for name, value in vals.items():
-        rep = f"{name}={_shval(name, value)}"
+        rep = f"{name}={_shval(name, value, numeric, defaults)}"
         out = re.sub(rf"(?m)^{re.escape(name)}=.*$", lambda m, r=rep: r, out, count=1)
     return out
 
@@ -293,21 +295,25 @@ def _run(argv, timeout=180):
     return out
 
 
-def _submit_systemssh(P, host, port, user, keyfile, root, reporter):
+def _submit_systemssh(P, host, port, user, keyfile, root, reporter, src_dir=None,
+                      launch_cmd="./run_pipeline.sh"):
+    src_dir = src_dir or P.cluster_dir
     target = f"{user}@{host}"
     common = ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=20"]
     ssh = ["ssh", "-p", str(port)] + common + (["-i", keyfile] if keyfile else [])
     scp = ["scp", "-r", "-P", str(port)] + common + (["-i", keyfile] if keyfile else [])
     _run(ssh + [target, f"mkdir -p '{root}'"])
-    items = [os.path.join(P.cluster_dir, n) for n in sorted(os.listdir(P.cluster_dir))]
+    items = [os.path.join(src_dir, n) for n in sorted(os.listdir(src_dir))]
     _run(scp + items + [f"{target}:{root}/"], timeout=600)
-    out = _run(ssh + [target, f"cd '{root}' && chmod +x *.sh && ./run_pipeline.sh"], timeout=600)
+    out = _run(ssh + [target, f"cd '{root}' && chmod +x *.sh && {launch_cmd}"], timeout=600)
     print(f"  CLUSTER SUBMIT: launched on {target}:{root}")
     reporter.set_detail(f"launched on {host}")
     return {"submitted": True, "host": host, "root": root, "output": out[-2000:]}
 
 
-def _submit_paramiko(P, host, port, user, password, keyfile, root, reporter):
+def _submit_paramiko(P, host, port, user, password, keyfile, root, reporter, src_dir=None,
+                     launch_cmd="./run_pipeline.sh"):
+    src_dir = src_dir or P.cluster_dir
     import paramiko
     cli = paramiko.SSHClient()
     cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -331,8 +337,8 @@ def _submit_paramiko(P, host, port, user, password, keyfile, root, reporter):
     try:
         ex(f"mkdir -p '{root}'")
         sftp = cli.open_sftp()
-        for base, _dirs, files in os.walk(P.cluster_dir):
-            rel = os.path.relpath(base, P.cluster_dir)
+        for base, _dirs, files in os.walk(src_dir):
+            rel = os.path.relpath(base, src_dir)
             rdir = root if rel == "." else f"{root}/" + rel.replace(os.sep, "/")
             try:
                 sftp.mkdir(rdir)
@@ -341,7 +347,7 @@ def _submit_paramiko(P, host, port, user, password, keyfile, root, reporter):
             for fn in files:
                 sftp.put(os.path.join(base, fn), f"{rdir}/{fn}")
         sftp.close()
-        out = ex(f"cd '{root}' && chmod +x *.sh && ./run_pipeline.sh")
+        out = ex(f"cd '{root}' && chmod +x *.sh && {launch_cmd}")
     finally:
         cli.close()
     print(f"  CLUSTER SUBMIT: launched on {user}@{host}:{root}")
@@ -549,6 +555,74 @@ def remote_status(host, user, port, keyfile, password, job_tag, fallback_root=""
         return {"ok": False, "error": str(e), "diagnosis": diagnose_failure(output, str(e))}
     parsed = parse_status(text)
     parsed.update({"ok": True, "host": host, "job_tag": job_tag})
+    return parsed
+
+
+# ---------- STAR alignment progress (the analysis stage after the download) ----------
+# Given the STAR JOB_TAG (download tag + "_star") + its BAM_OUT, count aligned BAMs vs the sample list,
+# note whether the launcher is still PENDing (waiting on the download) and whether a genome-index build
+# is running, plus COMPLETE/STALLED + the watchdog tail (for an ETA). (raw string -> literal globs.)
+_STAR_STATUS_PROBE = r'''TAG=%TAG%; BO=%BO%
+echo "BAMOUT $BO"
+if [ -d "$BO" ]; then
+  L="$BO/sample_list.tsv"
+  exp=0; [ -f "$L" ] && exp=$(grep -cve '^[[:space:]]*$' "$L")
+  done=$(ls "$BO"/*.bam 2>/dev/null | grep -c .)
+  echo "COUNT $exp $done"
+fi
+echo "---META---"
+[ -n "$BO" ] && [ -f "$BO/PIPELINE_COMPLETE.txt" ] && echo COMPLETE
+[ -n "$BO" ] && [ -f "$BO/PIPELINE_STALLED.txt" ] && echo STALLED
+echo "LIVE $(bjobs -noheader -o stat -J "${TAG}_*" 2>/dev/null | grep -cE 'RUN|PEND')"
+echo "LAUNCHPEND $(bjobs -noheader -o stat -J "${TAG}_launch" 2>/dev/null | grep -c PEND)"
+echo "BUILD $(bjobs -noheader -o stat -J "${TAG}_staridx_*" 2>/dev/null | grep -cE 'RUN|PEND')"
+echo "---WATCHDOG---"
+[ -n "$BO" ] && tail -n 40 "$BO/watchdog.log" 2>/dev/null
+true'''
+
+
+def parse_star_status(text):
+    """Parse the STAR progress probe into a dict (unit-testable, no SSH)."""
+    head, _, wd = text.partition("---WATCHDOG---")
+    body, _, meta = head.partition("---META---")
+    overall = None
+    m = re.search(r"(?m)^COUNT\s+(\d+)\s+(\d+)", body)
+    if m:
+        exp, done = int(m.group(1)), int(m.group(2))
+        overall = {"exp": exp, "done": done, "pct": round(100 * done / exp, 1) if exp else 0.0}
+    lm = re.search(r"(?m)^LIVE\s+(\d+)", meta)
+    lp = re.search(r"(?m)^LAUNCHPEND\s+(\d+)", meta)
+    bd = re.search(r"(?m)^BUILD\s+(\d+)", meta)
+    eta = _eta_from_watchdog(wd, {"exp": overall["exp"], "done": overall["done"]}) if overall else None
+    return {"overall": overall, "live_jobs": int(lm.group(1)) if lm else None,
+            "launch_pending": bool(lp and int(lp.group(1)) > 0),
+            "building": bool(bd and int(bd.group(1)) > 0),
+            "complete": "COMPLETE" in meta, "stalled": "STALLED" in meta,
+            "eta_seconds": eta, "raw": text[-2000:]}
+
+
+def remote_star_status(host, user, port, keyfile, password, star_job_tag, bam_out=""):
+    """SSH to the submit host and report STAR alignment progress for `star_job_tag` (= '<dlTag>_star').
+    Non-fatal (returns {"ok": False, ...} on SSH error)."""
+    host = (host or "").strip(); user = (user or "").strip()
+    if not host or not user:
+        return {"ok": False, "error": "missing SSH host/user"}
+    port = str(port or "22").strip() or "22"
+    cmd = (_STAR_STATUS_PROBE.replace("%TAG%", "'" + (star_job_tag or "sra_star") + "'")
+                             .replace("%BO%", "'" + (bam_out or "") + "'"))
+    try:
+        if password:
+            try:
+                import paramiko  # noqa: F401
+            except Exception:
+                raise _SubmitError("password auth needs paramiko", "")
+            text = _ssh_capture_paramiko(host, port, user, password, keyfile, cmd)
+        else:
+            text = _ssh_capture_systemssh(host, port, user, keyfile, cmd)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    parsed = parse_star_status(text)
+    parsed.update({"ok": True, "job_tag": star_job_tag})
     return parsed
 
 

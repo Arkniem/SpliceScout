@@ -63,6 +63,11 @@ class Paths:
         self.cluster_bundle_zip = os.path.join(self.runtable_dir, "cluster_bundle.zip")
         self.cluster_status = os.path.join(self.runtable_dir, "cluster_submit.json")  # what the upload did
 
+        # stages 15-16: STAR alignment handoff (Bulk RNA-seq module; auto-chained after download)
+        self.star_dir = os.path.join(self.runtable_dir, "star")               # STAR bundle root
+        self.star_bundle_zip = os.path.join(self.runtable_dir, "star_bundle.zip")
+        self.star_status = os.path.join(self.runtable_dir, "star_submit.json")  # what the STAR upload did
+
     def runtable_filtered_csv(self, slug):
         return os.path.join(self.runtable_dir, f"SraRunTable_{slug}.csv")
 
@@ -75,6 +80,7 @@ class Paths:
     def ensure_dirs(self):
         for d in (self.run_dir, self.work_dir, self.compound_batches,
                   self.compound_results, self.sample_batches, self.sample_results,
-                  self.tables_dir, self.runtable_dir, self.xml_cache_dir, self.cluster_dir):
+                  self.tables_dir, self.runtable_dir, self.xml_cache_dir, self.cluster_dir,
+                  self.star_dir):
             os.makedirs(d, exist_ok=True)
         return self

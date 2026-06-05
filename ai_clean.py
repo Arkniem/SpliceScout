@@ -19,6 +19,8 @@ import asyncio
 from progress import NULL
 import llm_providers
 
+RATE_RETRY_SECS = 30   # on a provider rate-limit (429), wait this long and re-submit the SAME batch
+
 CATEGORIES = ["Cell line", "Primary cells", "Immune/PBMC", "iPSC/ESC",
               "Organoid", "Tissue", "Patient/Tumor", "Single-cell", "Unknown"]
 
@@ -191,7 +193,8 @@ async def _run_pass_async(pass_name, P, cfg, reporter=NULL):
     if not todo:
         return {"done": len(batches), "ran": 0}
 
-    client = llm_providers.make_client(provider, cfg.get("max_retries", 8))
+    client = llm_providers.make_client(provider, cfg.get("max_retries", 8),
+                                       base_url=cfg.get("base_url"))
     sem = asyncio.Semaphore(cfg["concurrency"])
     completed = [len(batches) - len(todo)]
 
@@ -199,17 +202,25 @@ async def _run_pass_async(pass_name, P, cfg, reporter=NULL):
         async with sem:
             out_path = os.path.join(out_dir, os.path.basename(b))
             result = 0
-            for attempt in range(2):
+            attempt = 0
+            while True:
                 try:
                     result = await _classify_batch(client, provider, spec, b, out_path, model,
                                                    cfg.get("max_tokens", 16000), P.cost_log)
                     break
                 except Exception as e:
-                    if attempt == 1:
+                    if llm_providers.classify_ai_error(e).get("category") == "rate":
+                        # transient throttle -> just re-submit later; don't count it as a failure
+                        print(f"  ~ {os.path.basename(b)} rate limited; re-submitting in {RATE_RETRY_SECS}s…")
+                        reporter.set_detail(f"rate limited — re-submitting batch in {RATE_RETRY_SECS}s…")
+                        await asyncio.sleep(RATE_RETRY_SECS)
+                        continue
+                    attempt += 1
+                    if attempt >= 2:
                         print(f"  ! {os.path.basename(b)} failed: {e}")
                         result = 0
-                    else:
-                        await asyncio.sleep(2)
+                        break
+                    await asyncio.sleep(2)
             completed[0] += 1
             reporter.advance(1)
             reporter.set_detail(f"batch {completed[0]}/{len(batches)}")
@@ -227,6 +238,34 @@ async def _run_pass_async(pass_name, P, cfg, reporter=NULL):
 def run_pass(pass_name, P, cfg, reporter=NULL):
     """Sync entry point used by the orchestrator."""
     return asyncio.run(_run_pass_async(pass_name, P, cfg, reporter))
+
+
+async def _preflight_async(provider, model, base_url=None):
+    client = llm_providers.make_client(provider, max_retries=2, timeout=25, base_url=base_url)
+    try:
+        results, _ = await llm_providers.classify(
+            client, provider, model, COMPOUND_INSTRUCTIONS, ["aspirin"], COMPOUND_TOOL, max_tokens=200)
+    finally:
+        await llm_providers.close_client(client)
+    if not results:
+        raise RuntimeError("the model returned no structured output "
+                           "(it may not support tool/function calling)")
+
+
+def preflight(cfg):
+    """Validate provider + model + key with ONE tiny live call before the batch fan-out.
+
+    Returns None if AI cleaning is usable, else the raised exception (classify it with
+    llm_providers.classify_ai_error). A valid-but-throttled provider still passes — a 1-item call is
+    fast even when 250-item batches are slow — so this only trips on a real misconfig (bad key/model).
+    """
+    provider = llm_providers.normalize_provider(cfg.get("provider", "anthropic"))
+    model = llm_providers.resolve_model(provider, cfg.get("model"))
+    try:
+        asyncio.run(_preflight_async(provider, model, cfg.get("base_url")))
+        return None
+    except Exception as e:
+        return e
 
 
 def main():
