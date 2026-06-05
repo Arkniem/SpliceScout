@@ -29,6 +29,41 @@ reschedule() {
   say "next pass scheduled for $when"
 }
 
+# Delete transient clutter after a SUCCESSFUL run. KEEPS .fastq.gz, SraAccList.txt,
+# the PIPELINE_COMPLETE.txt report, all scripts, and watchdog.log. Uses find so an
+# empty match is harmless (never touches outputs/inputs/scripts).
+cleanup_run() {
+  [ "${CLEANUP_ON_COMPLETE:-yes}" = "yes" ] || return 0
+  local S
+  for S in "$STUDIES_DIR"/*/; do
+    [ -d "$S" ] || continue
+    find "$S" -maxdepth 1 -type f \( -name '*.err' -o -name '*.out' -o -name '*.lsf' \
+         -o -name '*.sra.vdbcache' -o -name 'SraAccList_missing.txt' \) -delete 2>/dev/null
+    find "$S" -mindepth 1 -maxdepth 1 -type d -empty -delete 2>/dev/null   # empty acc subdirs
+  done
+  rm -f "$PIPELINE_ROOT/watchdog.out" "$PIPELINE_ROOT/watchdog.err" \
+        "$PIPELINE_ROOT/.watchdog.state" "$PIPELINE_ROOT/.watchdog.state.stall" \
+        "$PIPELINE_ROOT/job_map.tsv" 2>/dev/null
+  say "cleanup: removed transient logs/.lsf/temp files (CLEANUP_ON_COMPLETE=yes)"
+
+  # Optionally remove the pipeline's OWN scripts too, leaving a data-only folder.
+  # Guard: only if the scripts live inside PIPELINE_ROOT (never a shared tools dir).
+  # Safe to delete the running watchdog.sh — bash keeps executing the open file.
+  if [ "${CLEANUP_SCRIPTS_ON_COMPLETE:-yes}" = "yes" ] && [ -n "${SCRIPTS_DIR:-}" ]; then
+    case "$SCRIPTS_DIR" in
+      "$PIPELINE_ROOT"|"$PIPELINE_ROOT"/*)
+        rm -f "$SCRIPTS_DIR"/config.sh "$SCRIPTS_DIR"/lib.sh "$SCRIPTS_DIR"/run_pipeline.sh \
+              "$SCRIPTS_DIR"/setup.sh "$SCRIPTS_DIR"/run_all.sh "$SCRIPTS_DIR"/prefetch_job.sh \
+              "$SCRIPTS_DIR"/fasterqdump_job.sh "$SCRIPTS_DIR"/convert_study.sh \
+              "$SCRIPTS_DIR"/fetch_missing.sh "$SCRIPTS_DIR"/status.sh "$SCRIPTS_DIR"/README.md \
+              "$SCRIPTS_DIR"/watchdog.sh 2>/dev/null
+        say "cleanup: removed pipeline scripts from $SCRIPTS_DIR (re-copy the template to re-run)" ;;
+      *)
+        say "cleanup: kept scripts ($SCRIPTS_DIR is outside PIPELINE_ROOT - shared install)" ;;
+    esac
+  fi
+}
+
 finalize() {  # $1 = COMPLETE | STALLED
   local status="$1"
   local rep="$PIPELINE_ROOT/PIPELINE_${status}.txt"
@@ -55,6 +90,7 @@ finalize() {  # $1 = COMPLETE | STALLED
       done
     fi
   } > "$rep"
+  [ "$status" = "COMPLETE" ] && cleanup_run   # tidy up only on success, never on STALLED
   say "FINALIZED ($status) -> $rep  (watchdog stopping)"
 }
 

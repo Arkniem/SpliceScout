@@ -45,6 +45,17 @@ PREFETCH_MEM_MB=132000  # memory (-M) per prefetch (download) job
 WATCHDOG_INTERVAL_MIN=30   # how often the self-driving watchdog re-checks
 JOB_TAG="sra"              # short prefix that namespaces this project's LSF job
                            # names (set something unique if you run >1 project).
+CLEANUP_ON_COMPLETE="yes"  # after a SUCCESSFUL run, delete transient clutter:
+                           # per-job .err/.out logs, generated .lsf scripts,
+                           # *_missing lists, empty accession subdirs, state files.
+                           # KEEPS: .fastq.gz, SraAccList.txt, PIPELINE_COMPLETE.txt,
+                           # watchdog.log. Never runs on STALLED (logs kept to debug).
+                           # Set "no" to keep all.
+CLEANUP_SCRIPTS_ON_COMPLETE="yes"  # ALSO delete the pipeline's own scripts on a
+                           # successful run, leaving a clean data-only folder. Only
+                           # deletes scripts that live INSIDE PIPELINE_ROOT (a shared
+                           # tools dir used by other projects is never touched). After
+                           # this, re-copy the template to run again. Set "no" to keep.
 
 # ----------------------------- END EDIT THESE --------------------------------
 
@@ -56,7 +67,7 @@ SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 export PIPELINE_ROOT STUDIES_DIR SCRATCH_DIR SRATOOLKIT_MODULE ASPERA_MODULE \
        LSF_QUEUE THREADS MEM_MB WALL PREFETCH_MEM_MB WATCHDOG_INTERVAL_MIN \
-       JOB_TAG SCRIPTS_DIR
+       JOB_TAG CLEANUP_ON_COMPLETE CLEANUP_SCRIPTS_ON_COMPLETE SCRIPTS_DIR
 
 # Make the 'module' command available even in a non-login job shell.
 sra_init_modules() {
