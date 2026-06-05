@@ -7,9 +7,15 @@ handoff to an LSF cluster.**
 SpliceScout automates a workflow that's otherwise done by hand: scrape GEO for a query, pull
 per-sample structured metadata (cell line / treatment compound / read counts) and the library-prep
 protocol from SRA, AI-clean the messy free text (canonical drug names, recovered cell lines,
-drug-treated vs not), filter to splicing-amenable library preps, and emit the tables. It then
-"deep-dives" the most promising cell line into the exact SRA Run Selector metadata and a flat
-`SraAccList.txt` ready for `prefetch`.
+drug-treated vs not), filter to library preps appropriate for the chosen **analysis module**, and emit
+the tables. It then "deep-dives" the most promising cell line into the exact SRA Run Selector metadata
+and a flat `SraAccList.txt` ready for `prefetch`.
+
+With the **Bulk RNA-seq (STAR)** module + an autonomous cluster, it goes all the way: download the
+reads, then **automatically STAR-align them to BAMs** on the cluster — and because that chain lives
+entirely on the cluster, you can close SpliceScout afterward (downloads can take days). The analysis
+module is a pluggable concept: it drives both the library-prep filter and the downstream aligner, so
+more assays (single-cell, etc.) can be added later.
 
 It's a single self-contained program with a local web UI (pure-Python stdlib HTTP server + inline
 browser JS) and an equivalent command-line interface. No Node.js, no web framework, no database.
@@ -62,11 +68,18 @@ The single setup page (or the CLI) collects everything a run needs:
 - **GEO search query** — Entrez syntax, e.g. `rna-seq[Description] AND human[Organism] AND drug`.
 - **Scope** — scan **all** matching studies, or **cap at N** (start at ~25 to validate, then scale up).
 - **AI provider + key** — Anthropic (Claude), OpenAI (ChatGPT), or Google Gemini — or tick
-  **Skip AI cleaning** to run the deterministic stages only (no key needed).
+  **Skip AI cleaning** to run the deterministic stages only (no key needed). The OpenAI provider also
+  accepts a **custom base URL**, so you can point it at any OpenAI-compatible host (MiMo, Qwen, a local
+  vLLM/LM-Studio server, OpenRouter, …). A bad key or model name is caught up front and you're asked to
+  fix it or turn AI off — it won't silently grind.
+- **Analysis module** — currently **Bulk RNA-seq (STAR)**. The module sets which library-prep protocols
+  pass the headline table *and*, on the cluster, which aligner runs. When chosen with an autonomous
+  cluster, it adds a STAR genome-index field (leave blank to auto-resolve / build one by organism).
 - **Deep-dive pick** — **auto** (top real cell line by # unique compounds, then total reads) or
   **manual** (the run pauses after the scan so you can choose from the ranked list).
 - **Cluster handoff** — **off**, **download a bundle** (manual), or **autonomous** (upload + launch).
-- *Advanced:* AI concurrency, optional NCBI E-utilities API key (raises the rate limit 3 -> 10 req/s).
+- *Advanced:* AI concurrency (up to 99), optional NCBI E-utilities API key (raises the rate limit
+  3 → 10 req/s — and the metadata fetch is parallelized, so the key genuinely speeds it up).
 
 Your entries (including API keys and cluster info) are saved locally at
 `~/.geo_pipeline_settings.json` so they prefill next time. **That file is plaintext on your machine**
@@ -90,9 +103,11 @@ Outputs land in `runs/<query-slug>_<timestamp>/`:
 | `runtable/by_study/<GSE>/SraAccList.txt` | per-study run lists (each study downloaded separately) |
 | `runtable/drug_annotation_review.csv` | audit of the drug / dose / control / drug-treated calls |
 | `runtable/cluster_bundle.zip` | ready-to-run LSF download bundle (when cluster handoff is on) |
+| `runtable/star_bundle.zip` | ready-to-run STAR alignment bundle (Bulk RNA-seq module, cluster on) |
 
 The cell-line tables carry a **three-way drug-treated** split: **Drug Treated / Not Drug Treated /
-Undetermined**.
+Undetermined**. On an autonomous cluster run, the cluster itself produces the **`.fastq.gz`** reads and
+(Bulk RNA-seq module) the STAR **`.bam`** alignments + splice junctions — under your `PIPELINE_ROOT`.
 
 ---
 
@@ -111,34 +126,38 @@ The web UI's **Run** tab shows a live stepper while the pipeline runs. Two thing
     scatter, bar, histogram, **heatmap**, **2D density**). Variables are the run table's fields: read
     depth, spot length, bases, drug, drug-treated, dose, instrument, platform, …
 
-A **Project README** link sits at the bottom of every page.
+A **User Guide** link sits at the bottom of every page.
 
 ---
 
 ## How it works
 
-A 14-stage pipeline, each stage checkpointed (resumable) in `pipeline_state.json`:
+A 16-stage pipeline, each stage checkpointed (resumable) in `pipeline_state.json`:
 
 ```
 1  fetch            GEO esearch + esummary
-2  extract          per-sample SRA metadata {cell line, treatments, reads} + library protocol
+2  extract          per-sample SRA metadata {cell line, treatments, reads} + library protocol (parallel)
 3  prep             build the AI batches
 4  ai_compounds     canonicalize drug/compound names           (skipped with Skip-AI)
 5  ai_samples       classify cell line / sample type / treated  (skipped with Skip-AI)
 6  merge            assemble the AI lookup maps
-7  build            emit all tables (splicing = headline)
+7  build            emit the module's headline table + reference tables
    --- deep dive: the single best cell line ---
 8  select           pick the top real cell line (auto or manual)
-9  runtable_fetch   full SRA XML for that line's studies
+9  runtable_fetch   full SRA XML for that line's studies (parallel)
 10 runtable_build   byte-exact Run Selector reconstruction
 11 cellline_match   AI disambiguation (A549 ~ A-549, excludes BEAS-2B) -> SraAccList.txt
 12 runtable_annotate  drug / dose / control + 3-way drug-treated + Excel workbook
    --- cluster handoff (optional) ---
 13 cluster_bundle   fill config.sh + per-study lists + zip
-14 cluster_submit   (autonomous) upload over SSH + launch ./run_pipeline.sh
+14 cluster_submit   (autonomous) upload over SSH + launch the download (./run_pipeline.sh)
+   --- STAR alignment (Bulk RNA-seq module, autonomous cluster) ---
+15 star_bundle      fill STAR config.sh pointed at the download's FASTQ + organism/index resolution + zip
+16 star_submit      upload + arm a self-rescheduling launcher that runs STAR once the download finishes
 ```
 
-**Splicing filter:** keeps full-length protocols (TruSeq / NEBNext / KAPA / total-RNA **and
+**Library-prep filter (module-tied).** Each analysis module owns which protocols pass the headline
+table. **Bulk RNA-seq** keeps full-length protocols (TruSeq / NEBNext / KAPA / total-RNA **and
 Smart-seq**) and removes 3'-end methods (single-cell/nuclei, 10x/droplet, plate-seq, and bulk 3'-tag
 such as QuantSeq / DRUG-seq / BRB-seq). Compound and cell-line cleaning come from the depositor's
 structured metadata + AI canonicalization — never keyword-guessed from titles.
@@ -156,7 +175,16 @@ One `classify()` interface drives all three providers (`llm_providers.py`):
 | Google Gemini | `gemma-4-31b-it` | `GEMINI_API_KEY` |
 
 The model box is editable — type any model your account can access. Paste the key in the UI (held in
-memory only, never written to `config.json`), set the env var, or tick **Skip AI cleaning**
+memory only, never written to `config.json`), set the env var, or tick **Skip AI cleaning**.
+
+- **Custom OpenAI-compatible endpoint.** Pick the OpenAI provider and fill the **Base URL** field to run
+  any OpenAI-format model on another host (MiMo `https://api.xiaomimimo.com/v1`, a local vLLM/LM-Studio
+  server, OpenRouter, …). Blank = `api.openai.com`. The endpoint must support function/tool calls
+  (most do; there's a JSON fallback for those that don't).
+- **Preflight, fix-or-disable.** Before the long stages a one-item validation call checks the
+  provider/model/key. If it's wrong (bad key, unknown model, …) the run **pauses** and lets you correct
+  it or turn AI off — instead of failing 30 minutes in. A **rate-limit (429)** isn't treated as a
+  misconfig: it auto-retries every 30 s and keeps going (lower concurrency to avoid them).
 
 ---
 
@@ -219,11 +247,33 @@ can check **even after closing and relaunching** the server). It SSHes to the su
 running pipeline by **discovering its folder from this instance's live `sraN_*` LSF jobs** (so it works
 with no active run / a fresh server), then reports, per study, how many runs are **downloaded** (`.sra`
 fetched — including SRA-toolkit's per-accession subfolders) and **converted** (`.fastq.gz`) — so a study
-still downloading no longer reads as 0 — plus overall percent, active-job count, and an ETA. Hit
-**Refresh** any time.
+still downloading no longer reads as 0 — plus overall percent, active-job count, and an **ETA that
+sharpens with each check**. After the first check it **auto-refreshes every 2 minutes** (until the
+pipeline completes/stalls), the check is **scoped strictly to this instance's jobs**, and for a Bulk
+RNA-seq run it also shows the **STAR alignment** progress once the download finishes.
 
 > The cluster scripts in `cluster_template/` are vendored from your own LSF pipeline; see
-> [`cluster_template/README.md`](cluster_template/README.md) for what runs on the cluster.
+> [`cluster_template/DOWNLOAD_PIPELINE_GUIDE.md`](cluster_template/DOWNLOAD_PIPELINE_GUIDE.md) for what runs on the cluster.
+
+---
+
+## STAR alignment (Bulk RNA-seq module)
+
+With the **Bulk RNA-seq** module and an **autonomous** cluster, SpliceScout adds two stages that turn
+the downloaded reads into aligned BAMs — fully **auto-chained on the cluster**:
+
+- It uploads a STAR bundle (vendored `star_template/`) configured to read the download's `*.fastq.gz`
+  and merge runs of the same BioSample into one BAM (using the deep-dive's `SraRunTable`).
+- It arms a **self-rescheduling LSF launcher** that waits for the download to finish, then runs STAR
+  2-pass alignment → sorted, indexed `.bam` + `SJ.out.tab` splice junctions. Because the whole chain is
+  LSF jobs on the cluster, **you can close SpliceScout right after the upload** — downloads can take
+  days and STAR still fires itself when they complete.
+
+**Genome index.** Fill the **STAR genome index** field with your prebuilt index path and it's used
+directly. Leave it blank and SpliceScout resolves one by organism (auto-detected from the run table):
+a registry (`star_index_registry.json`) → a previously built index → a one-time `genomeGenerate` build
+job. Fill the registry's `organisms` entry (or the field) with your reference's index to skip the
+~1–2 h build for the common case.
 
 ---
 
@@ -250,10 +300,11 @@ python pipeline.py --run-dir runs/<existing> --cluster-retry
 ```
 
 **Flags:** `--query --cap (int|unlimited) --ncbi-key --provider anthropic|openai|gemini
---anthropic-key --openai-key --gemini-key --model --concurrency --run-dir --resume --skip-ai --yes`;
-deep-dive `--no-deep-dive --pick auto|manual --cell-line NAME --validate-runtable`; cluster
-`--cluster-mode off|manual|autonomous --cluster-root PATH --ssh-host --ssh-user --ssh-port --ssh-key
---cluster-retry` (SSH password via `$CLUSTER_SSH_PASSWORD`).
+--anthropic-key --openai-key --gemini-key --model --openai-base-url --concurrency --module
+--run-dir --resume --skip-ai --yes`; deep-dive `--no-deep-dive --pick auto|manual --cell-line NAME
+--validate-runtable`; cluster `--cluster-mode off|manual|autonomous --cluster-root PATH --ssh-host
+--ssh-user --ssh-port --ssh-key --cluster-retry` (SSH password via `$CLUSTER_SSH_PASSWORD`); STAR
+`--star-genome-dir --star-gtf --star-index-root --star-organism`.
 
 ---
 
@@ -262,16 +313,20 @@ deep-dive `--no-deep-dive --pick auto|manual --cell-line NAME --validate-runtabl
 ```
 launch_Win.bat / launch_Mac.command   one-click launchers (install deps, start the UI)
 server.py            web front end (HTTP server + single-page UI + live progress/ETA)
-pipeline.py          orchestrator — run_pipeline(cfg, P, reporter) is the shared 14-stage DAG
+pipeline.py          orchestrator — run_pipeline(cfg, P, reporter) is the shared 16-stage DAG
 progress.py          thread-safe per-run progress / ETA / log + pause-for-input hooks
 llm_providers.py     one classify() for Anthropic / OpenAI / Gemini
 fetch_5000_ncbi.py   stage 1   structured_extract.py  stage 2   prep_ai.py        stage 3
 ai_clean.py          stages 4-5  merge_ai.py           stage 6   build_final.py    stage 7
 deepdive_select.py   stage 8   runtable_fetch.py       stage 9   runtable_build.py stage 10
 cellline_match.py    stage 11  runtable_annotate.py    stage 12  cluster_deploy.py stages 13-14
+build_final.py       stage 7 + the per-module library-prep filter (MODULES)
+star_deploy.py       stages 15-16  STAR alignment handoff (Bulk RNA-seq module), auto-chained
 normalize_v2.py / cell_utils.py   shared cleaning helpers
 pipeline_paths.py    single source of truth for every output path
 cluster_template/    vendored LSF download pipeline (only config.sh is regenerated per run)
+star_template/       vendored STAR 2-pass alignment pipeline (consumes the download's fastq.gz)
+star_index_registry.json   organism -> prebuilt STAR index / build-once reference URLs
 runs/                output (one folder per query run)
 ```
 
