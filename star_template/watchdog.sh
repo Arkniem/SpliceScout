@@ -21,19 +21,25 @@ STATE="$PIPELINE_ROOT/.watchdog.state"
 ts()  { date '+%Y-%m-%d %H:%M:%S'; }
 say() { echo "[$(ts)] $*" >> "$LOG"; }
 
+# Reschedule-first: the NEXT pass is queued at the START of each pass, so a mid-pass walltime kill
+# (e.g. bsub blocked on the LSF pending-job threshold) can NEVER break the self-driving chain.
+# finalize() cancels the successor once the pipeline is actually done.
+WATCHDOG_NEXT_JID=""
 reschedule() {
   local when
   when=$(date -d "+$WATCHDOG_INTERVAL_MIN min" '+%Y:%m:%d:%H:%M' 2>/dev/null) ||
   when=$(date -v+"${WATCHDOG_INTERVAL_MIN}"M '+%Y:%m:%d:%H:%M' 2>/dev/null)
   star_qopt
-  bsub -L /bin/bash -n 1 -M 1000 -W 20 -b "$when" -J "${JOB_TAG}_watchdog" \
+  WATCHDOG_NEXT_JID=$(bsub -L /bin/bash -n 1 -M 1000 -W 20 -b "$when" -J "${JOB_TAG}_watchdog" \
        -o "$LOG_DIR/watchdog.out" -e "$LOG_DIR/watchdog.err" \
-       ${QOPT[@]+"${QOPT[@]}"} "$SCRIPTS_DIR/watchdog.sh" >/dev/null 2>&1
-  say "next pass scheduled for $when"
+       ${QOPT[@]+"${QOPT[@]}"} "$SCRIPTS_DIR/watchdog.sh" 2>/dev/null | star_jobid)
+  say "next pass scheduled for $when (job ${WATCHDOG_NEXT_JID:-?})"
 }
 
 finalize() {                            # $1 = COMPLETE | STALLED
-  local status="$1" rep="$PIPELINE_ROOT/PIPELINE_${status}.txt" label rest
+  local status="$1" label rest
+  local rep="$PIPELINE_ROOT/PIPELINE_${status}.txt"   # SEPARATE line: bash 4.2 + set -u can't see $status declared in the SAME `local`
+  [ -n "${WATCHDOG_NEXT_JID:-}" ] && bkill "$WATCHDOG_NEXT_JID" >/dev/null 2>&1   # cancel queued successor
   {
     echo "STAR alignment pipeline $status at $(ts)"
     echo "Aligned: $done_n / $exp_n samples"
@@ -60,7 +66,11 @@ finalize() {                            # $1 = COMPLETE | STALLED
 }
 
 say "=== watchdog pass start ==="
+if [ -f "$PIPELINE_ROOT/PIPELINE_COMPLETE.txt" ] || [ -f "$PIPELINE_ROOT/PIPELINE_STALLED.txt" ]; then
+  say "already finalized -> stop"; exit 0
+fi
 [ -f "$SAMPLE_LIST" ] || { say "no sample list at $SAMPLE_LIST -- stopping"; exit 1; }
+reschedule                       # queue the NEXT pass FIRST (survives a mid-pass walltime kill)
 LIVE="$(star_live_names)"
 
 # 1) resubmit missing/invalid samples that have no live job
@@ -98,4 +108,6 @@ else
   echo "$done_n" > "$STATE"; echo 0 > "$STATE.stall"
 fi
 
-reschedule
+# Safety net: a successor is normally queued at pass start; reschedule now if that bsub didn't take.
+[ -n "${WATCHDOG_NEXT_JID:-}" ] || reschedule
+say "pass end -> next pass queued (job ${WATCHDOG_NEXT_JID:-?})"

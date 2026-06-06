@@ -248,8 +248,8 @@ running pipeline by **discovering its folder from this instance's live `sraN_*` 
 with no active run / a fresh server), then reports, per study, how many runs are **downloaded** (`.sra`
 fetched — including SRA-toolkit's per-accession subfolders) and **converted** (`.fastq.gz`) — so a study
 still downloading no longer reads as 0 — plus overall percent, active-job count, and an **ETA that
-sharpens with each check**. After the first check it **auto-refreshes every 2 minutes** (until the
-pipeline completes/stalls), the check is **scoped strictly to this instance's jobs**, and for a Bulk
+sharpens with each check**. The check is **scoped strictly to this instance's jobs** and runs
+**on-demand** — click **Check cluster status** (or **Refresh now**) to update — and for a Bulk
 RNA-seq run it also shows the **STAR alignment** progress once the download finishes.
 
 > The cluster scripts in `cluster_template/` are vendored from your own LSF pipeline; see

@@ -44,6 +44,7 @@ class RunConfig:
     skip_ai: bool = False
     provider: str = "anthropic"   # AI provider for cleaning: anthropic | openai | gemini
     base_url: str = ""         # custom OpenAI-compatible endpoint (MiMo/Qwen/local/OpenRouter); blank = default
+    disable_reasoning: bool = False  # OpenAI-compatible "thinking off" body — for reasoning models (e.g. MiMo)
     module: str = "bulk_rna_seq"  # analysis module: drives the library-prep filter + the analysis pipeline (STAR)
     deep_dive: bool = True     # after build, deep-dive the best cell line into a Run Selector table
     pick_mode: str = "auto"    # "auto" (top real line) or "manual" (UI/CLI picks from the ranked list)
@@ -91,6 +92,9 @@ def main():
                     help="custom OpenAI-compatible endpoint (a MiMo/Qwen host, local vLLM/LM-Studio, or "
                          "OpenRouter https://openrouter.ai/api/v1); used with --provider openai")
     ap.add_argument("--concurrency", type=int, default=8)
+    ap.add_argument("--disable-reasoning", action="store_true",
+                    help="turn OFF chain-of-thought for OpenAI-compatible reasoning models (e.g. MiMo) "
+                         "whose thinking otherwise exhausts the token budget and truncates batches")
     ap.add_argument("--run-dir", default=None)
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--skip-ai", action="store_true", help="run deterministic stages only")
@@ -138,6 +142,8 @@ def main():
             cfg.model = a.model
         if a.openai_base_url is not None:
             cfg.base_url = a.openai_base_url
+        if a.disable_reasoning:
+            cfg.disable_reasoning = True
         if a.module:
             cfg.module = a.module
         sc = _star_cfg_from_args(a)
@@ -169,7 +175,8 @@ def main():
         P = Paths(run_dir).ensure_dirs()
         pick_mode = "manual" if (a.pick == "manual" or a.cell_line) else "auto"
         cfg = RunConfig(query=query, cap=cap, ncbi_key=ncbi_key, model=model, provider=provider,
-                        base_url=base_url or "", module=(a.module or "bulk_rna_seq"),
+                        base_url=base_url or "", disable_reasoning=a.disable_reasoning,
+                        module=(a.module or "bulk_rna_seq"),
                         concurrency=a.concurrency, run_dir=P.run_dir,
                         skip_ai=a.skip_ai, deep_dive=not a.no_deep_dive, pick_mode=pick_mode,
                         cluster_mode=a.cluster_mode, cluster_cfg=_cluster_cfg_from_args(a),
@@ -544,7 +551,8 @@ def _ensure_ai_works(cfg, P, reporter, ai_fix_fn):
         print(f"[AI] validating provider={cfg.provider} model={cfg.model} …")
         reporter.set_detail(f"validating {cfg.provider} / {cfg.model}…")
         err = ai_clean.preflight({"provider": cfg.provider, "model": cfg.model,
-                                  "base_url": getattr(cfg, "base_url", "") or ""})
+                                  "base_url": getattr(cfg, "base_url", "") or "",
+                                  "disable_reasoning": getattr(cfg, "disable_reasoning", False)})
         if err is None:
             print("[AI] provider/model/key OK")
             return
@@ -598,7 +606,8 @@ def run_pipeline(cfg, P, reporter=NULL, select_fn=None, secrets=None, cluster_fi
     cap_int = None if cfg.cap == "unlimited" else int(cfg.cap)
     fetch_max = 100000 if cfg.cap == "unlimited" else int(cfg.cap)
     ai_cfg = {"provider": cfg.provider, "model": cfg.model, "concurrency": cfg.concurrency,
-              "base_url": getattr(cfg, "base_url", "") or "", "max_retries": 8, "max_tokens": 16000}
+              "base_url": getattr(cfg, "base_url", "") or "", "max_retries": 8, "max_tokens": 16000,
+              "disable_reasoning": getattr(cfg, "disable_reasoning", False)}
 
     reporter.set_meta(query=cfg.query, cap=cfg.cap, model=cfg.model, provider=cfg.provider,
                       skip_ai=cfg.skip_ai, run_dir=P.run_dir)
@@ -685,6 +694,7 @@ def run_pipeline(cfg, P, reporter=NULL, select_fn=None, secrets=None, cluster_fi
         import deepdive_select
         deep = None
         if begin("select"):
+            deepdive_select.consolidate(P, reporter)   # merge cell-line NAME variants BEFORE ranking
             ranked = deepdive_select.rank_candidates(P)
             if not ranked:
                 print("[deep-dive] no real cell line in the splicing table -> skipping deep dive")
@@ -700,6 +710,7 @@ def run_pipeline(cfg, P, reporter=NULL, select_fn=None, secrets=None, cluster_fi
             if os.path.exists(P.cellline_selection):
                 deep = json.load(open(P.cellline_selection, encoding="utf-8"))
             else:
+                deepdive_select.consolidate(P, reporter)
                 deep = deepdive_select.run(P, reporter)
         reporter.complete_stage("select")
 

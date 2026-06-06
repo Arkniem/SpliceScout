@@ -15,6 +15,7 @@ when no real cell line exists).
 """
 import json
 import os
+import re
 
 from progress import NULL
 
@@ -28,6 +29,83 @@ def _load_index(P):
         return json.load(open(P.cellline_index, encoding="utf-8"))
     except Exception:
         return {}
+
+
+# ---- pre-select consolidation: merge cell-line NAME variants so a line split across spellings
+# (A549 / A-549 / "A549 cells") isn't under-counted and mis-ranked. Deterministic, no AI. ----
+_CELL_SUFFIX = re.compile(r"[\s_\-]*\b(?:cell\s*lines?|cells?)\s*$", re.I)
+
+
+def _merge_key(name):
+    """Normalized clustering key: lowercase, drop a trailing 'cell line(s)'/'cells', strip
+    non-alphanumeric. So A549 / A-549 / A 549 / 'A549 cells' / 'A549 cell line' all -> 'a549'."""
+    s = _CELL_SUFFIX.sub("", (name or "").strip().lower())
+    return re.sub(r"[^a-z0-9]+", "", s)
+
+
+def _merge_entries(entries):
+    """Union the per-cell-line aggregates (counts, studies, GSMs, compounds, ...) of several rows."""
+    out = {"sample_type": entries[0].get("sample_type", REAL),
+           "compounds": set(), "studies": set(), "total": 0, "treated": 0, "not": 0,
+           "undetermined": 0, "total_spots": 0, "max_spots": 0,
+           "gsms": set(), "gsms_by_study": {}, "raw_tags": {}, "uids_by_study": {}}
+    for e in entries:
+        out["compounds"].update(e.get("compounds", []))
+        out["studies"].update(e.get("studies", []))
+        for k in ("total", "treated", "not", "undetermined", "total_spots"):
+            out[k] += e.get(k, 0)
+        out["max_spots"] = max(out["max_spots"], e.get("max_spots", 0))
+        out["gsms"].update(e.get("gsms", []))
+        for g, v in (e.get("gsms_by_study") or {}).items():
+            out["gsms_by_study"].setdefault(g, set()).update(v)
+        for t, c in (e.get("raw_tags") or {}).items():
+            out["raw_tags"][t] = out["raw_tags"].get(t, 0) + c
+        out["uids_by_study"].update(e.get("uids_by_study") or {})
+    out["compounds"] = sorted(out["compounds"])
+    out["studies"] = sorted(out["studies"])
+    out["gsms"] = sorted(out["gsms"])
+    out["gsms_by_study"] = {g: sorted(v) for g, v in out["gsms_by_study"].items()}
+    return out
+
+
+def consolidate(P, reporter=NULL):
+    """Merge cell-line NAME variants in cellline_index.json BEFORE ranking/selection — deterministic
+    (same Sample Type + same normalized key). Picks the dominant spelling (most samples) as canonical,
+    unions the aggregates, and records the other spellings as 'aliases' (reused by cellline_match for
+    run-table recall). Rewrites cellline_index.json in place + writes cellline_merge.json. Idempotent.
+    Returns the merge map {canonical: [original names...]}."""
+    index = _load_index(P)
+    if not index:
+        return {}
+    groups = {}
+    for name, d in index.items():
+        groups.setdefault((d.get("sample_type") or "", _merge_key(name)), []).append(name)
+
+    merged, merge_map, n_groups = {}, {}, 0
+    for (stype, key), names in groups.items():
+        if not key:                       # no alphanumerics to key on -> never collapse; keep each
+            for n in names:
+                merged[n], merge_map[n] = index[n], [n]
+            continue
+        canonical = sorted(names, key=lambda n: (-index[n].get("total", 0), len(n), n))[0]
+        agg = _merge_entries([index[n] for n in names])
+        alias_pool = set(names)
+        for n in names:                   # keep any prior aliases too -> idempotent on re-run
+            alias_pool.update(index[n].get("aliases") or [])
+        agg["aliases"] = sorted(alias_pool - {canonical})
+        merged[canonical], merge_map[canonical] = agg, sorted(names)
+        if len(names) > 1:
+            n_groups += 1
+
+    json.dump(merged, open(P.cellline_index, "w", encoding="utf-8"), ensure_ascii=False)
+    json.dump(merge_map, open(P.cellline_merge, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    if len(index) != len(merged):
+        print(f"  CONSOLIDATE: merged cell-line name variants {len(index)} -> {len(merged)} "
+              f"({n_groups} group(s) merged)")
+        reporter.set_detail(f"merged cell-line name variants: {len(index)} -> {len(merged)}")
+    else:
+        print(f"  CONSOLIDATE: {len(index)} cell-line names, no spelling variants to merge")
+    return merge_map
 
 
 def rank_candidates(P):
@@ -71,6 +149,7 @@ def select(P, canonical, reporter=NULL):
         "treated": d.get("treated", 0),
         "total_spots": d.get("total_spots", 0),
         "max_spots": d.get("max_spots", 0),
+        "aliases": d.get("aliases", []),   # other spellings merged into this line (-> cellline_match)
     }
     os.makedirs(P.runtable_dir, exist_ok=True)
     json.dump(sel, open(P.cellline_selection, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
@@ -107,6 +186,7 @@ def main():
     ap.add_argument("--cell-line", default=None, help="pick a specific canonical line (else rank 1)")
     a = ap.parse_args()
     P = Paths(a.run_dir).ensure_dirs()
+    consolidate(P)
     for r in rank_candidates(P)[:15]:
         print(f"  {r['n_compounds']:>3} cmpd | {r['total_spots']:>14,} reads | "
               f"{r['n_studies']:>2} studies | {r['canonical']}")

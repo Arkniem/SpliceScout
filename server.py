@@ -235,6 +235,7 @@ def _start_run(body):
         ncbi_key = (body.get("ncbi_key") or "").strip() or None
         model = (body.get("model") or "").strip() or llm_providers.DEFAULT_MODEL[provider]
         base_url = (body.get("base_url") or "").strip()   # custom OpenAI-compatible endpoint (optional)
+        disable_reasoning = bool(body.get("disable_reasoning"))   # turn off thinking for reasoning models (MiMo)
         deep_dive = bool(body.get("deep_dive", True))
         pick_mode = "manual" if (body.get("pick_mode") == "manual") else "auto"
         module = (body.get("module") or "bulk_rna_seq").strip() or "bulk_rna_seq"
@@ -284,7 +285,8 @@ def _start_run(body):
         run_dir = os.path.join("runs", f"{slug}_{datetime.now():%Y%m%d-%H%M%S}_{_INSTANCE_TAG}")
         P = Paths(run_dir).ensure_dirs()
         cfg = pipeline.RunConfig(query=query, cap=cap, ncbi_key=ncbi_key, model=model,
-                                 provider=provider, base_url=base_url, module=module,
+                                 provider=provider, base_url=base_url, disable_reasoning=disable_reasoning,
+                                 module=module,
                                  concurrency=concurrency, run_dir=P.run_dir, skip_ai=skip_ai,
                                  deep_dive=deep_dive, pick_mode=pick_mode,
                                  cluster_mode=cluster_mode, cluster_cfg=cluster_cfg, star_cfg=star_cfg)
@@ -324,7 +326,8 @@ def _save_settings(body):
     includes the Anthropic key, NCBI key, and any SSH password, at ~/.geo_pipeline_settings.json."""
     keep = {k: body[k] for k in
             ("query", "scope", "cap", "skip_ai", "provider", "api_keys", "ncbi_key", "model",
-             "base_url", "module", "concurrency", "pick_mode", "cluster_mode", "ssh_password") if k in body}
+             "base_url", "disable_reasoning", "module", "concurrency", "pick_mode", "cluster_mode",
+             "ssh_password") if k in body}
     if isinstance(body.get("cluster"), dict):
         keep["cluster"] = body["cluster"]
     if isinstance(body.get("star"), dict):
@@ -405,11 +408,11 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _send_readme(self):
-        """Render USER_GUIDE.md as a minimal dark page (preformatted; no markdown deps)."""
+        """Render README.md as a minimal dark page (preformatted; no markdown deps)."""
         try:
-            md = open(os.path.join(HERE, "USER_GUIDE.md"), encoding="utf-8").read()
+            md = open(os.path.join(HERE, "README.md"), encoding="utf-8").read()
         except Exception:
-            md = "USER_GUIDE.md not found."
+            md = "README.md not found."
         html = ("<!DOCTYPE html><html><head><meta charset='utf-8'><title>SpliceScout — User Guide</title>"
                 "<style>body{background:#0f1420;color:#e7ecf5;font:14px/1.6 ui-monospace,Consolas,"
                 "monospace;max-width:920px;margin:0 auto;padding:32px 22px}a{color:#5b8cff}"
@@ -836,6 +839,7 @@ PAGE = r"""<!DOCTYPE html>
           <input type="text" id="baseurl" autocomplete="off" spellcheck="false" style="width:100%"
                  placeholder="Custom OpenAI-compatible base URL (optional)">
           <div class="hint">Point the OpenAI provider at a custom OpenAI-compatible endpoint — a MiMo/Qwen host, a local vLLM/LM-Studio server, or OpenRouter <code>https://openrouter.ai/api/v1</code>. Blank = <code>api.openai.com</code>. The API key above is sent to this endpoint.</div>
+          <label class="check" style="margin-top:8px"><input type="checkbox" id="noreason"> <span>Disable model reasoning (chain-of-thought). Needed for reasoning models like <b>MiMo</b> whose &ldquo;thinking&rdquo; can use up the token budget and truncate a batch (logged as &ldquo;no output&rdquo;). Leave off for non-reasoning models.</span></label>
         </div>
         <label class="check"><input type="checkbox" id="skip"> <span>Skip AI cleaning — run the deterministic stages only (no key needed). Tables will lack canonical drug names &amp; recovered cell lines.</span></label>
       </label>
@@ -1073,6 +1077,7 @@ $('#form').addEventListener('submit', async e=>{
     ncbi_key: $('#ncbi').value,
     model: modelEl.value,
     base_url: (($('#baseurl')||{}).value || ''),
+    disable_reasoning: (($('#noreason')||{}).checked || false),
     concurrency: $('#conc').value,
     deep_dive: true,
     pick_mode: document.querySelector('input[name=pick]:checked').value,
@@ -1527,8 +1532,7 @@ function renderCustom(d){
   Plotly.newPlot('customchart',traces,plotLayout(lab(y)+' by '+lab(x),Object.assign({boxmode:'group',violinmode:'group'},H(h))),PCONF);
 }
 
-// ---- on-demand cluster status (poll the cluster after an autonomous launch) ----
-let clstatTimer=null;   // single self-rescheduling auto-refresh timer (every 2 min)
+// ---- on-demand cluster status (checked only when you click the button) ----
 
 // least-squares slope (runs/sec) over [{t,c}] points; null if <2 points
 function clstatSlope(pts){
@@ -1564,29 +1568,21 @@ function clstatEta(d, hist){
   if(d.eta_seconds!=null) return {sec:d.eta_seconds, src:'cluster log'};
   return {sec:null, src:null};
 }
-function clstatSchedule(panelId, d){
-  if(clstatTimer){ clearTimeout(clstatTimer); clstatTimer=null; }
-  if(d && (d.complete || d.stalled)) return;                         // finished/stalled -> stop
-  clstatTimer=setTimeout(()=>fetchClusterStatus(panelId, true), 120000);   // every 2 min
-}
-async function fetchClusterStatus(panelId, auto){
+async function fetchClusterStatus(panelId){
   panelId = panelId || 'clusterstatus';
   const host=$('#'+panelId);
-  if(!host){ if(clstatTimer){ clearTimeout(clstatTimer); clstatTimer=null; } return; }   // panel gone
-  if(!auto) host.innerHTML='<div class="hint">Checking the cluster…</div>';
+  if(!host) return;
+  host.innerHTML='<div class="hint">Checking the cluster…</div>';
   try{
     const d = await (await fetch('/api/cluster_status',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({job_tag:INSTANCE_TAG})})).json();
     if(!d.ok){
-      if(!auto) host.innerHTML='<div class="err">'+esc((d.diagnosis&&d.diagnosis.title)||d.error||'Could not reach the cluster')
+      host.innerHTML='<div class="err">'+esc((d.diagnosis&&d.diagnosis.title)||d.error||'Could not reach the cluster')
           +(d.diagnosis&&d.diagnosis.detail?' — '+esc(d.diagnosis.detail):'')+'</div>';
-      clstatSchedule(panelId, null);   // transient error -> keep retrying every 2 min
       return;
     }
     renderClusterStatus(d, panelId);
-    clstatSchedule(panelId, d);
   }catch(ex){
-    if(!auto) host.innerHTML='<div class="err">'+esc(ex.message)+'</div>';
-    clstatSchedule(panelId, null);
+    host.innerHTML='<div class="err">'+esc(ex.message)+'</div>';
   }
 }
 function renderClusterStatus(d, panelId){
@@ -1628,9 +1624,9 @@ function renderClusterStatus(d, panelId){
   if(d.raw){ h+='<details style="margin-top:8px"><summary class="hint" style="cursor:pointer">probe output</summary>'
     + '<pre style="white-space:pre-wrap;font-size:11px;color:#9aa6c0;max-height:220px;overflow:auto;background:#0a0e17;border:1px solid var(--line);border-radius:8px;padding:8px;margin-top:6px">'+esc(d.raw)+'</pre></details>'; }
   h+='<div class="hint" style="margin-top:10px;font-size:11.5px">'
-    + (d.complete?'Pipeline complete — auto-refresh stopped.'
-       :(d.stalled?'Watchdog stalled — auto-refresh stopped.'
-         :'Auto-refreshing every 2 min.'+(eta.sec==null?' ETA appears once conversions progress.':'')))
+    + (d.complete?'Pipeline complete.'
+       :(d.stalled?'Watchdog stalled.'
+         :'Click "Refresh now" to update.'+(eta.sec==null?' ETA appears once conversions progress.':'')))
     + ' Last checked '+esc(new Date().toLocaleTimeString())
     + (eta.src&&eta.sec!=null&&!d.complete?' &middot; ETA from '+esc(eta.src):'') + '</div>';
   h+='<button class="ghost" id="clstatRefresh_'+panelId+'" style="margin-top:8px">Refresh now</button>';
@@ -1649,6 +1645,7 @@ function applySettings(s){
   syncProvider();   // rebuild model suggestions + fill the key for the chosen provider
   if(s.model) modelEl.value = s.model;   // restore any saved model (editable — custom strings too)
   setVal('baseurl', s.base_url);         // restore a saved custom OpenAI-compatible endpoint
+  if(s.disable_reasoning!=null && $('#noreason')) $('#noreason').checked = !!s.disable_reasoning;
   setVal('ncbi', s.ncbi_key); setVal('conc', s.concurrency);
   if(s.pick_mode){ const r=document.querySelector('input[name=pick][value="'+s.pick_mode+'"]'); if(r) r.checked=true; }
   if(s.module){ const r=document.querySelector('input[name=module][value="'+s.module+'"]'); if(r) r.checked=true; }

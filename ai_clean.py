@@ -146,10 +146,12 @@ def _atomic_write(path, obj):
     os.replace(tmp, path)
 
 
-async def _classify_batch(client, provider, spec, in_path, out_path, model, max_tokens, cost_log):
+async def _classify_batch(client, provider, spec, in_path, out_path, model, max_tokens, cost_log,
+                          disable_reasoning=False):
     items = json.load(open(in_path, encoding="utf-8"))
     results, usage = await llm_providers.classify(
-        client, provider, model, spec["instr"], items, spec["tool"], max_tokens)
+        client, provider, model, spec["instr"], items, spec["tool"], max_tokens,
+        disable_reasoning=disable_reasoning)
     if not results:
         raise RuntimeError(f"no output for {os.path.basename(in_path)}")
     out = {}
@@ -206,7 +208,8 @@ async def _run_pass_async(pass_name, P, cfg, reporter=NULL):
             while True:
                 try:
                     result = await _classify_batch(client, provider, spec, b, out_path, model,
-                                                   cfg.get("max_tokens", 16000), P.cost_log)
+                                                   cfg.get("max_tokens", 16000), P.cost_log,
+                                                   disable_reasoning=cfg.get("disable_reasoning", False))
                     break
                 except Exception as e:
                     if llm_providers.classify_ai_error(e).get("category") == "rate":
@@ -240,11 +243,12 @@ def run_pass(pass_name, P, cfg, reporter=NULL):
     return asyncio.run(_run_pass_async(pass_name, P, cfg, reporter))
 
 
-async def _preflight_async(provider, model, base_url=None):
+async def _preflight_async(provider, model, base_url=None, disable_reasoning=False):
     client = llm_providers.make_client(provider, max_retries=2, timeout=25, base_url=base_url)
     try:
         results, _ = await llm_providers.classify(
-            client, provider, model, COMPOUND_INSTRUCTIONS, ["aspirin"], COMPOUND_TOOL, max_tokens=200)
+            client, provider, model, COMPOUND_INSTRUCTIONS, ["aspirin"], COMPOUND_TOOL, max_tokens=200,
+            disable_reasoning=disable_reasoning)
     finally:
         await llm_providers.close_client(client)
     if not results:
@@ -262,7 +266,8 @@ def preflight(cfg):
     provider = llm_providers.normalize_provider(cfg.get("provider", "anthropic"))
     model = llm_providers.resolve_model(provider, cfg.get("model"))
     try:
-        asyncio.run(_preflight_async(provider, model, cfg.get("base_url")))
+        asyncio.run(_preflight_async(provider, model, cfg.get("base_url"),
+                                     cfg.get("disable_reasoning", False)))
         return None
     except Exception as e:
         return e

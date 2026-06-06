@@ -18,15 +18,19 @@ ts() { date '+%Y-%m-%d %H:%M:%S'; }
 say() { echo "[$(ts)] $*" >> "$LOG"; }
 shopt -s nullglob
 
+# The NEXT pass is queued at the START of each pass (reschedule-first), so a mid-pass walltime kill
+# (e.g. bsub blocked on the LSF pending-job threshold) can NEVER break the self-driving chain. We keep
+# the successor's job id so finalize() can cancel it once the pipeline is actually done.
+WATCHDOG_NEXT_JID=""
 reschedule() {
   local when
   when=$(date -d "+$WATCHDOG_INTERVAL_MIN min" '+%Y:%m:%d:%H:%M' 2>/dev/null) ||
   when=$(date -v+"${WATCHDOG_INTERVAL_MIN}"M '+%Y:%m:%d:%H:%M' 2>/dev/null)   # BSD fallback
   sra_qopt
-  bsub -L /bin/bash -n 1 -M 1000 -W 20 -b "$when" -J "${JOB_TAG}_watchdog" \
+  WATCHDOG_NEXT_JID=$(bsub -L /bin/bash -n 1 -M 1000 -W 20 -b "$when" -J "${JOB_TAG}_watchdog" \
        -o "$PIPELINE_ROOT/watchdog.out" -e "$PIPELINE_ROOT/watchdog.err" \
-       ${QOPT[@]+"${QOPT[@]}"} "$SCRIPTS_DIR/watchdog.sh" >/dev/null 2>&1
-  say "next pass scheduled for $when"
+       ${QOPT[@]+"${QOPT[@]}"} "$SCRIPTS_DIR/watchdog.sh" 2>/dev/null | sra_jobid)
+  say "next pass scheduled for $when (job ${WATCHDOG_NEXT_JID:-?})"
 }
 
 # Delete transient clutter after a SUCCESSFUL run. KEEPS .fastq.gz, SraAccList.txt,
@@ -66,6 +70,9 @@ cleanup_run() {
 
 finalize() {  # $1 = COMPLETE | STALLED
   local status="$1"
+  # Done -> cancel the successor queued at pass start (it would only no-op, or fail on a cleaned-up
+  # script). Best-effort.
+  [ -n "${WATCHDOG_NEXT_JID:-}" ] && bkill "$WATCHDOG_NEXT_JID" >/dev/null 2>&1
   local rep="$PIPELINE_ROOT/PIPELINE_${status}.txt"
   {
     echo "Pipeline $status at $(ts)"
@@ -90,11 +97,26 @@ finalize() {  # $1 = COMPLETE | STALLED
       done
     fi
   } > "$rep"
+  # SpliceScout STAR auto-chain: if a STAR launcher is bundled here, kick it NOW so STAR starts the
+  # moment the download finishes (COMPLETE or STALLED) instead of waiting for the launcher's own poll
+  # cycle. Harmless no-op for plain download runs (no star/ dir). The launcher keeps its self-poll too.
+  if [ -f "$PIPELINE_ROOT/star/star_launch.sh" ]; then
+    sra_qopt
+    bsub -L /bin/bash -n 1 -M 1000 -W 120 -J "${JOB_TAG}_star_launch" \
+         -o "$PIPELINE_ROOT/star/launch.out" -e "$PIPELINE_ROOT/star/launch.err" \
+         ${QOPT[@]+"${QOPT[@]}"} "$PIPELINE_ROOT/star/star_launch.sh" >/dev/null 2>&1
+    say "kicked STAR launcher -> $PIPELINE_ROOT/star/star_launch.sh"
+  fi
   [ "$status" = "COMPLETE" ] && cleanup_run   # tidy up only on success, never on STALLED
   say "FINALIZED ($status) -> $rep  (watchdog stopping)"
 }
 
 say "=== watchdog pass start ==="
+# If a prior pass already finalized, this (already-queued) successor just stops — no work, no reschedule.
+if [ -f "$PIPELINE_ROOT/PIPELINE_COMPLETE.txt" ] || [ -f "$PIPELINE_ROOT/PIPELINE_STALLED.txt" ]; then
+  say "already finalized -> stop"; exit 0
+fi
+reschedule                       # queue the NEXT pass FIRST (survives a mid-pass walltime kill)
 LIVE="$(sra_live_names)"
 
 # 1) resubmit orphaned / failed conversions
@@ -104,7 +126,12 @@ for S in */; do
   for sra in "$sdir"/*.sra; do
     [ -e "$sra" ] || continue
     acc=$(basename "$sra" .sra)
-    { compgen -G "$sdir/$acc.fastq.gz" >/dev/null 2>&1 || compgen -G "$sdir/${acc}_[0-9].fastq.gz" >/dev/null 2>&1; } && continue
+    # already converted? DROP the now-redundant source .sra. (The per-acc converter deletes it on
+    # success, but the bulk convert_study path can leave it behind -> stranded .sra keep nsra>0 forever
+    # -> the "zero .sra left" completion gate never passes -> a FALSE STALL despite all data present.)
+    if compgen -G "$sdir/$acc.fastq.gz" >/dev/null 2>&1 || compgen -G "$sdir/${acc}_[0-9].fastq.gz" >/dev/null 2>&1; then
+      rm -f "$sra" "$sdir/${acc}.sra.vdbcache"; continue
+    fi
     sra_has_live "${JOB_TAG}_fqd_${acc}" "$LIVE" && continue
     sra_submit_conversion "$acc" "$sdir" >/dev/null && resub=$((resub+1))
   done
@@ -143,4 +170,6 @@ if [ "$nlive" -eq 0 ] && [ "$resub" -eq 0 ] && [ "$queued_new" -eq 0 ]; then
 else
   echo "$total_done" > "$STATE"; echo 0 > "$STATE.stall"
 fi
-reschedule
+# Safety net: a successor is normally queued at pass start; reschedule now if that bsub didn't take.
+[ -n "${WATCHDOG_NEXT_JID:-}" ] || reschedule
+say "pass end -> next pass queued (job ${WATCHDOG_NEXT_JID:-?})"

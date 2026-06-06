@@ -104,7 +104,8 @@ async def _classify_async(payload, ai_cfg, cost_log):
                                        base_url=ai_cfg.get("base_url"))
     try:
         results, usage = await llm_providers.classify(
-            client, provider, model, INSTRUCTIONS, user, TOOL, ai_cfg.get("max_tokens", 8000))
+            client, provider, model, INSTRUCTIONS, user, TOOL, ai_cfg.get("max_tokens", 8000),
+            disable_reasoning=ai_cfg.get("disable_reasoning", False))
     finally:
         await llm_providers.close_client(client)
 
@@ -157,7 +158,12 @@ def run(P, sel, ai_cfg=None, skip_ai=False, reporter=NULL):
     all_rows = list(csv.DictReader(open(P.runtable_all_csv, encoding="utf-8")))
     cand_values = [c["value"] if isinstance(c, dict) else c for c in payload.get("candidates", [])]
     target = payload.get("target", sel.get("canonical", ""))
-    aliases = payload.get("target_aliases", [])
+    aliases = list(payload.get("target_aliases", []))
+    # also recognize the spellings merged by the pre-select consolidation (deepdive_select.consolidate)
+    for a in (sel.get("aliases") or []):
+        if a and a not in aliases:
+            aliases.append(a)
+    payload["target_aliases"] = aliases     # so the AI agent (_classify_async) sees them too
     cl_cols = payload.get("cellline_columns", [])
 
     reporter.set_total(1)

@@ -20,6 +20,14 @@ import re
 
 GEMINI_OPENAI_BASE = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
+# OpenAI-compatible switch to turn OFF a reasoning model's chain-of-thought (e.g. Xiaomi MiMo, whose
+# "thinking" can consume the whole max_tokens budget and truncate the tool call -> empty results).
+# Sent via extra_body ONLY when the user opts into "disable reasoning" — standard OpenAI/Gemini reject
+# unknown body fields with a 400. Both forms are accepted by MiMo's hosted API and a self-hosted vLLM
+# (--reasoning-parser mimo), so we send both for portability across reasoning-model hosts.
+NO_REASONING_BODY = {"thinking": {"type": "disabled"},
+                     "chat_template_kwargs": {"enable_thinking": False}}
+
 PROVIDERS = ("anthropic", "openai", "gemini")
 PROVIDER_LABEL = {"anthropic": "Anthropic (Claude)", "openai": "OpenAI (ChatGPT)",
                   "gemini": "Google Gemini"}
@@ -107,8 +115,13 @@ def _extract_results(text):
     return obj if isinstance(obj, list) else []
 
 
-async def classify(client, provider, model, system_text, user_obj, tool, max_tokens=8000):
-    """Run one structured batch. Returns (results_list, usage_dict)."""
+async def classify(client, provider, model, system_text, user_obj, tool, max_tokens=8000,
+                   disable_reasoning=False):
+    """Run one structured batch. Returns (results_list, usage_dict).
+
+    disable_reasoning: for the openai/gemini path, send the OpenAI-compatible "turn thinking off"
+    body (NO_REASONING_BODY) so a reasoning model (MiMo etc.) doesn't burn the token budget on
+    chain-of-thought and truncate the tool call. Ignored for anthropic (claude-haiku doesn't think)."""
     name = tool["name"]
     user_content = json.dumps(user_obj, ensure_ascii=False)
 
@@ -141,6 +154,8 @@ async def classify(client, provider, model, system_text, user_obj, tool, max_tok
         tool_choice=({"type": "function", "function": {"name": name}}
                      if provider == "openai" else "required"),
     )
+    if disable_reasoning:
+        kwargs["extra_body"] = NO_REASONING_BODY
     resp = await client.chat.completions.create(**kwargs)
     choice = resp.choices[0].message
     results = []

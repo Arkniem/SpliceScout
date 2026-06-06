@@ -46,6 +46,8 @@ class Paths:
 
         # stage 7 also persists a per-cell-line index (full studies + GSMs, no truncation)
         self.cellline_index = self._p("cellline_index.json")
+        # stage 8 pre-step: merge map for the deterministic cell-line name-variant consolidation
+        self.cellline_merge = self._p("cellline_merge.json")
 
         # stages 8-12: deep dive (Run Selector metadata for the single best cell line)
         self.runtable_dir = self._p("runtable")

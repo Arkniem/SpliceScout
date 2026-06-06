@@ -29,18 +29,39 @@ mkdir -p "$BAM_OUT" "$LOG_DIR" || { echo "[star] $SAMPLE: cannot mkdir output di
 
 if star_bam_ok "$SAMPLE"; then echo "[star] $SAMPLE: BAM present & valid -> skip"; exit 0; fi
 
-avail_gb() { df -P --block-size=1G "$1" 2>/dev/null | awk 'NR==2{print $4+0}'; }
+avail_gb() {                       # available GB on the fs holding $1 (0 if df fails)
+  ls -d "$1" >/dev/null 2>&1        # warm a possibly-cold NFS automount before df reads it
+  df -P --block-size=1G "$1" 2>/dev/null | awk 'NR==2{print $4+0}'
+}
+# Real writability test BY ACTION. `[ -w ]` is unreliable on this NFS from compute nodes -- it can
+# report not-writable on a dir where mkdir/touch actually succeed (the original "no workspace" + the
+# first fix both died on this). So we just try to create a probe dir.
+can_write() { local d="$1/.wtest.$$"; mkdir -p "$d" 2>/dev/null && { rmdir "$d" 2>/dev/null; return 0; }; return 1; }
 
-# pick a workspace with room: node-local TMPDIR, else SCRATCH, else BAM_OUT volume
+# Workspace for staging + STAR 2-pass temp. Prefer a FAST dir (node-local TMPDIR, then SCRATCH) when
+# it has room; otherwise fall back to a dedicated folder ON THE PIPELINE_ROOT VOLUME (where the BAMs
+# already land, so it's guaranteed usable). The PIPELINE_ROOT fallback is taken even if df is flaky --
+# a genuinely-full volume just fails staging and a resubmit retries -- so a full /scratch (or a flaky
+# df / lying [ -w ]) can never block alignment.
+WORK_FALLBACK="${STAR_WORK_DIR:-$PIPELINE_ROOT/_workspace}"
 WORKBASE=""; WORKBASE_AVAIL=0
-for cand in "${TMPDIR:-}" "$SCRATCH" "$(dirname "$BAM_OUT")"; do
+for cand in "${TMPDIR:-}" "$SCRATCH" "$WORK_FALLBACK"; do
   [ -n "$cand" ] || continue
   mkdir -p "$cand" 2>/dev/null || continue
-  [ -w "$cand" ] || continue
-  a=$(avail_gb "$cand"); [ -n "$a" ] || continue
+  can_write "$cand" || continue
+  a=$(avail_gb "$cand"); [ -n "$a" ] || a=0
   if [ "$a" -ge "$MIN_WORK_GB" ]; then WORKBASE="$cand"; WORKBASE_AVAIL="$a"; break; fi
 done
-[ -n "$WORKBASE" ] || { echo "[star] $SAMPLE: no workspace with >=${MIN_WORK_GB}G free (scratch full?)" >&2; exit 1; }
+# Guaranteed last resort: the PIPELINE_ROOT volume, used whenever it's writable-by-action (ignore df).
+if [ -z "$WORKBASE" ] && mkdir -p "$WORK_FALLBACK" 2>/dev/null && can_write "$WORK_FALLBACK"; then
+  WORKBASE="$WORK_FALLBACK"; WORKBASE_AVAIL="$(avail_gb "$WORK_FALLBACK")"; WORKBASE_AVAIL="${WORKBASE_AVAIL:-0}"
+  echo "[star] $SAMPLE: no fast workspace >=${MIN_WORK_GB}G free; using PIPELINE_ROOT volume -> $WORK_FALLBACK (${WORKBASE_AVAIL}G)" >&2
+fi
+[ -n "$WORKBASE" ] || { echo "[star] $SAMPLE: no usable workspace ($WORK_FALLBACK not creatable)" >&2; exit 1; }
+# Staging (copying the FASTQs into the workspace) only pays off on genuinely FAST local disk
+# (node-local TMPDIR / SCRATCH). The PIPELINE_ROOT fallback is the SAME NFS volume as the by_study
+# FASTQs, so copying there is pure waste -> mark it "not fast" and read the FASTQs in place instead.
+WORKBASE_FAST=0; [ "$WORKBASE" != "$WORK_FALLBACK" ] && WORKBASE_FAST=1
 
 WORK="$WORKBASE/star_${SAMPLE}_${LSB_JOBID:-$$}"
 mkdir -p "$WORK" || { echo "[star] $SAMPLE: cannot mkdir WORK=$WORK" >&2; exit 1; }
@@ -58,7 +79,7 @@ inputs_gb() {
 }
 NEED=$(inputs_gb "$FASTQ1" "$FASTQ2")
 DO_STAGE=0
-[ "$WORKBASE_AVAIL" -ge "$((NEED + STAGE_HEADROOM_GB))" ] && DO_STAGE=1
+[ "$WORKBASE_FAST" -eq 1 ] && [ "$WORKBASE_AVAIL" -ge "$((NEED + STAGE_HEADROOM_GB))" ] && DO_STAGE=1
 
 stage() {                          # stage one .gz; retry until cp ok AND gzip -t ok
   local src="$1" dst i=0

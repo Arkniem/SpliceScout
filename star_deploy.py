@@ -122,18 +122,23 @@ def _star_launch_sh(download_root, star_tag, check_min=30):
         'if [ -f "$DL_ROOT/STAR_bams/PIPELINE_COMPLETE.txt" ] || [ -f "$DL_ROOT/STAR_bams/PIPELINE_STALLED.txt" ]; then\n'
         '  echo "[star_launch] STAR already finalized -> stop"; exit 0\n'
         "fi\n"
-        "# download finished (or stalled -> align whatever downloaded) -> launch STAR once, then stop\n"
+        "# download finished (or stalled -> align whatever downloaded) -> TRY to launch STAR. If the launch\n"
+        "# (setup / index resolve / sample-list) FAILS -- e.g. a transient cluster hiccup -- DON'T give up:\n"
+        "# fall through to reschedule + retry next pass (run_star_pipeline.sh is idempotent). Stop only on success.\n"
         'if [ -f "$DL_ROOT/PIPELINE_COMPLETE.txt" ] || [ -f "$DL_ROOT/PIPELINE_STALLED.txt" ]; then\n'
         '  echo "[star_launch] download finished -> launching STAR pipeline"\n'
-        '  exec bash "$HERE/run_star_pipeline.sh"\n'
+        '  if bash "$HERE/run_star_pipeline.sh"; then\n'
+        '    echo "[star_launch] STAR pipeline launched -> stop"; exit 0\n'
+        "  fi\n"
+        '  echo "[star_launch] run_star_pipeline.sh FAILED -> will retry in $CHECK_MIN min" >&2\n'
         "fi\n"
-        "# not yet -> reschedule THIS launcher for +CHECK_MIN minutes (bsub -b), then exit\n"
+        "# download not done yet, OR a launch attempt just failed -> reschedule THIS launcher (+CHECK_MIN), then exit\n"
         "when=$(date -d \"+$CHECK_MIN min\" '+%Y:%m:%d:%H:%M' 2>/dev/null) || "
         "when=$(date -v+\"${CHECK_MIN}\"M '+%Y:%m:%d:%H:%M' 2>/dev/null)\n"
         'bsub -L /bin/bash -n 1 -M 1000 -W 120 -b "$when" -J "${JT}_launch" \\\n'
         '     -o "$DL_ROOT/star/launch.out" -e "$DL_ROOT/star/launch.err" \\\n'
         '     "$HERE/star_launch.sh" >/dev/null 2>&1\n'
-        'echo "[star_launch] download still running -> next check scheduled for $when"\n'
+        'echo "[star_launch] not done / will retry -> next check scheduled for $when"\n'
     )
 
 

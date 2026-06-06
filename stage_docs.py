@@ -80,12 +80,14 @@ STAGE_DOCS = {
     },
     "select": {
         "title": "Select best cell line",
-        "what": "Picks the single best REAL cell line to deep-dive (Sample Type 'Cell line' only — "
+        "what": "First merges cell-line NAME variants (A549 / A-549 / 'A549 cells' -> one line) so a "
+                "line split across spellings isn't under-counted, then picks the single best REAL cell "
+                "line to deep-dive (Sample Type 'Cell line' only — "
                 "never UNRESOLVED / Patient / Organoid buckets), ranked by number of unique compounds, "
                 "then total reads. Auto-mode takes rank 1; manual mode pauses the run so you can choose "
                 "from the ranked list.",
         "inputs": "cellline_index.json",
-        "outputs": "runtable/cellline_selection.json",
+        "outputs": "cellline_merge.json, runtable/cellline_selection.json",
     },
     "runtable_fetch": {
         "title": "Fetch run metadata (SRA XML)",
