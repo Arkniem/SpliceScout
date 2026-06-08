@@ -12,7 +12,7 @@ the tables. It then "deep-dives" the most promising cell line into the exact SRA
 and a flat `SraAccList.txt` ready for `prefetch`.
 
 With the **Bulk RNA-seq (STAR)** module + an autonomous cluster, it goes all the way: download the
-reads, then **automatically STAR-align them to BAMs** on the cluster — and because that chain lives
+reads, **STAR-align them to BAMs**, then **convert to AltAnalyze junction/exon BEDs** on the cluster — and because that chain lives
 entirely on the cluster, you can close SpliceScout afterward (downloads can take days). The analysis
 module is a pluggable concept: it drives both the library-prep filter and the downstream aligner, so
 more assays (single-cell, etc.) can be added later.
@@ -55,9 +55,11 @@ library (`vendor/plotly.min.js`, for the Plots tab) on first run if it's missing
 ### Running concurrent projects (multiple instances)
 **Launch a launch file again — or run `python server.py` again — to start another instance.** Each
 instance grabs its own free port (8765, 8766, 8767, …) and opens its own browser tab, so you can run
-several projects at the same time. Each one is also assigned a cluster **`JOB_TAG`** of `sra1`,
-`sra2`, `sra3`, … (shown as a badge in its UI header) so concurrent cluster downloads never collide.
-Closing an instance frees its number for the next launch to reuse.
+several projects at the same time. At launch the window **prompts you to name the instance** (e.g.
+`A549`, `MDAMB231`); that name becomes its cluster **`JOB_TAG`** (shown as a badge in its UI header)
+so concurrent cluster downloads never collide. Leave the name blank and it auto-picks the next free
+`sra1`, `sra2`, `sra3`, … instead. Names are made cluster-safe automatically, and if two live
+instances pick the same name the second gets a `-2` suffix. Closing an instance frees its name.
 
 ---
 
@@ -217,9 +219,10 @@ Each run is **isolated** in its own per-cell-line subfolder under `PIPELINE_ROOT
 `/data/mylab/sra/A549`), so runs never mix. The bundle ships **per-study** `by_study/<GSE>/` lists
 (never a single combined list) so each study is downloaded and converted independently.
 
-The cluster **`JOB_TAG`** (which namespaces this project's LSF job names) is set automatically per
-running instance — `sra1`, `sra2`, `sra3`, … — so two projects downloading at the same time on the
-same cluster account don't clash. You can still override it in *Advanced cluster settings*.
+The cluster **`JOB_TAG`** (which namespaces this project's LSF job names) comes from the **instance
+name you're prompted for at launch** (e.g. `A549`); leave it blank and it auto-picks the next free
+`sra1`, `sra2`, `sra3`, … instead — so two projects downloading at the same time on the same cluster
+account don't clash. You can still override it in *Advanced cluster settings*.
 
 **Cleanup on success.** When the cluster pipeline finishes, it deletes the transient clutter (job
 logs, generated `.lsf` scripts, leftover `.sra`/temp files, empty folders, and — by default — even its
@@ -274,6 +277,21 @@ directly. Leave it blank and SpliceScout resolves one by organism (auto-detected
 a registry (`star_index_registry.json`) → a previously built index → a one-time `genomeGenerate` build
 job. Fill the registry's `organisms` entry (or the field) with your reference's index to skip the
 ~1–2 h build for the common case.
+
+**Then BAM → BED (AltAnalyze junction/exon).** After STAR finishes, a third auto-chained stage converts
+each BAM into AltAnalyze BED files (the inputs for splicing analysis): `<sample>__junction.bed` always, plus —
+per the **BED mode** — `__intronJunction.bed` (intron-retention, the default), `__exon.bed` (exon counts), or
+both. It's **all-in-one**: the AltAnalyze BAM→BED scripts **and** the exon reference are *shipped with the
+bundle* (vendored `bed_template/altanalyze/`), so the cluster needs **no AltAnalyze install** — just the stock
+`python/2.7.5` (which provides `pysam`) + `samtools` modules. Like STAR it self-drives (reschedule-first
+watchdog, idempotent, resubmits failures) and fires the instant STAR completes. Turn it off, pick the BED mode,
+or set the species (auto-detected from the run's organism: Hs/Mm/Rn/Dr/Ss/Ma), under the Bulk RNA-seq options.
+
+**Run only part of the pipeline.** A vertical two-handle slider on the left of the Run tab picks the START and
+END phase (Fetch · Extract · AI+tables · Select · Run table · Download · STAR · BAM→BED). Drag the top handle
+down to skip early phases — the form then asks for the artifacts those phases would have produced (e.g. an
+existing `by_study/` FASTQ folder to start at STAR, or a BAM folder to start at BAM→BED) — and drag the bottom
+handle up to stop early. Handy when you already have intermediate outputs and don't want to redo the whole run.
 
 ---
 

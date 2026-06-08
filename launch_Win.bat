@@ -84,6 +84,18 @@ if errorlevel 1 (
   %PY% -m pip install pystray Pillow >nul 2>&1
 )
 
+REM ---- 3d) Name this instance -> its cluster JOB_TAG (namespaces this project's LSF jobs) ----
+REM      Asked here (this window has a console) because the tray launch below is windowless and
+REM      cannot prompt. Passed down via the environment variable SPLICESCOUT_INSTANCE.
+set "SPLICESCOUT_INSTANCE="
+set /p "SPLICESCOUT_INSTANCE=Name this instance (e.g. A549, MDAMB231) [blank = auto sra1/sra2/...]: "
+if defined SPLICESCOUT_INSTANCE (
+  echo Using instance name "%SPLICESCOUT_INSTANCE%" as the cluster JOB_TAG.
+) else (
+  echo No name given - this instance will auto-pick the next free tag ^(sra1, sra2, ...^).
+)
+echo.
+
 REM ---- 4) Launch: prefer the system tray (no console window); fall back to a console window ----
 set "PYW=pythonw"
 if /I "%PY%"=="py" set "PYW=pyw"
@@ -91,7 +103,7 @@ if /I "%PY%"=="py" set "PYW=pyw"
 if errorlevel 1 (
   echo Starting the web UI in this window ^(tray libraries unavailable^).
   echo Keep this window open while you work; close it ^(or press Ctrl+C^) to stop.
-  echo TIP: run launch_Win.bat again for ANOTHER instance ^(its own port + JOB_TAG sra1/sra2/...^).
+  echo TIP: run launch_Win.bat again for ANOTHER instance ^(it prompts for its own name + own port^).
   echo.
   %PY% server.py
   if errorlevel 1 (
@@ -103,7 +115,7 @@ if errorlevel 1 (
 ) else (
   echo Starting SpliceScout in the system tray - look for the blue "S" icon near the clock.
   echo Right-click it for Open / Quit. You can close this window. Run launch_Win.bat again for
-  echo another concurrent instance ^(its own port + JOB_TAG sra1/sra2/...^).
+  echo another concurrent instance ^(it prompts for its own name + own port^).
   start "SpliceScout" %PYW% "%~dp0tray.py"
   timeout /t 4 >nul
 )

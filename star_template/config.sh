@@ -58,7 +58,7 @@ RUNTABLE=""
 SCRATCH="/scratch/$USER"
 
 # 7) STAR / RESOURCES.
-THREADS=6                         # --runThreadN AND the LSF slot request (-n); keep equal
+THREADS=5                         # --runThreadN AND the LSF slot request (-n); keep equal. 5 packs 16-core nodes 3-up & divides a 125-slot cap evenly (25 jobs).
 SORT_RAM=20000000000              # --limitBAMsortRAM in BYTES; keep WELL under MEM_MB
 STAR_EXTRA_ARGS=""                # raw extra args appended to the STAR command line
 
@@ -72,6 +72,15 @@ LSF_QUEUE=""                      # "" = cluster default queue; else e.g. "norma
 JOB_TAG="star"                    # namespaces this run's LSF job names (make it unique per run)
 WATCHDOG_INTERVAL_MIN=30          # how often the self-driving watchdog re-checks
 MAX_STALL_PASSES=2                # consecutive no-progress passes before giving up (STALLED)
+ABSOLUTE_MAX_PASSES=960           # HARD backstop: STALL after this many watchdog passes no matter what
+MAX_WALL_HOURS=336                # HARD backstop: STALL after this many wall-clock hours (generous; ~14d)
+
+# 9b) RELIABILITY + CLEANUP (free disk as the pipeline progresses; cleanup defaults ON, set 0 to keep).
+DELETE_FASTQ_AFTER_BAM=1          # delete a sample's source FASTQ(s) once its BAM is published+verified
+CLEANUP_TOOLS_WHEN_DONE=1         # on COMPLETE, remove the uploaded tooling (download scripts, empty by_study)
+STRICT_BAM_CHECK=1               # a "done" BAM must also have >0 mapped reads + a QC log (not just quickcheck)
+MIN_MAPPED_FRAC=0.01            # refuse to delete a source FASTQ if uniquely-mapped fraction < this (suspect)
+VERIFY_FASTQ_DIRECT=1           # gzip -t the source FASTQ on the read-in-place path (catch a truncated NFS read)
 
 # 10) SOFTWARE MODULES.  Set to "" if the tool is already on PATH (skips 'module load').
 STAR_MODULE="STAR/2.7.10b"
@@ -93,7 +102,9 @@ REGISTRY_FILE="$SCRIPTS_DIR/star_index_registry.json"            # organism -> p
 
 export FASTQ_INPUT_DIR BAM_OUT GENOME_DIR SJDB_GTF SJDB_OVERHANG RUNTABLE SCRATCH \
        THREADS SORT_RAM STAR_EXTRA_ARGS MEM_MB MEM_RUSAGE WALL LSF_QUEUE \
-       JOB_TAG WATCHDOG_INTERVAL_MIN MAX_STALL_PASSES STAR_MODULE SAMTOOLS_MODULE \
+       JOB_TAG WATCHDOG_INTERVAL_MIN MAX_STALL_PASSES ABSOLUTE_MAX_PASSES MAX_WALL_HOURS \
+       DELETE_FASTQ_AFTER_BAM CLEANUP_TOOLS_WHEN_DONE STRICT_BAM_CHECK MIN_MAPPED_FRAC VERIFY_FASTQ_DIRECT \
+       STAR_MODULE SAMTOOLS_MODULE \
        ORGANISM STAR_INDEX_ROOT REF_FASTA_URL REF_GTF_URL \
        BUILD_THREADS BUILD_MEM_MB BUILD_MEM_RUSAGE BUILD_WALL REGISTRY_FILE \
        SCRIPTS_DIR PIPELINE_ROOT LOG_DIR SAMPLE_LIST

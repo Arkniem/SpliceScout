@@ -21,6 +21,7 @@ from datetime import datetime
 
 from pipeline_paths import Paths
 from progress import NULL
+import progress
 import llm_providers
 import fetch_5000_ncbi
 import structured_extract
@@ -31,6 +32,64 @@ import build_final
 DEFAULT_QUERY = "rna-seq[Description] AND human[Organism] AND drug"
 STAGES = ["fetch", "extract", "prep", "ai_compounds", "ai_samples", "merge", "build"]
 _AI_RATE_RETRY_SECS = 30   # on an AI rate-limit (429), wait this long and re-submit, instead of pausing
+
+# Canonical 18-stage order (the phase-range slider works over progress.STAGES, not the 7-stage list above).
+_STAGE_ORDER = [k for k, _ in progress.STAGES]
+
+
+def _idx(stage):
+    try:
+        return _STAGE_ORDER.index(stage)
+    except ValueError:
+        return -1
+
+
+def _resolve_inject_dest(dest, P):
+    """Map a progress.CHECKPOINTS input `dest` to an on-disk path inside the run dir."""
+    if dest == "runtable_filtered_csv":          # needs the cell-line slug from cellline_selection.json
+        import cluster_deploy
+        try:
+            sel = json.load(open(P.cellline_selection, encoding="utf-8"))
+        except Exception:
+            sel = {}
+        name = sel.get("canonical") or sel.get("cell_line") or sel.get("name") or "line"
+        return P.runtable_filtered_csv(cluster_deploy._slug(name))
+    return getattr(P, dest)
+
+
+def _inject_start_artifacts(cfg, P, state, start_i):
+    """Mid-pipeline START: copy each user-supplied artifact into the run dir at its Paths location,
+    then pre-mark every stage BEFORE start_stage 'done' so begin() skips it. Raises on a missing
+    REQUIRED input. Idempotent -> safe on resume. cellline_selection is listed first in CHECKPOINTS
+    so dests that need its slug (runtable_filtered_csv) resolve after it is staged."""
+    import shutil
+    start = getattr(cfg, "start_stage", "fetch") or "fetch"
+    supplied = getattr(cfg, "supplied_inputs", None) or {}
+    cp = next((c for c in progress.CHECKPOINTS if c["stage"] == start), None)
+    if cp:
+        for spec in cp.get("inputs", []):
+            dest = _resolve_inject_dest(spec["dest"], P)
+            src = str(supplied.get(spec["field"]) or "").strip()
+            if not src:
+                # nothing supplied -> fine if already in the run dir (resume) or the input is optional
+                if os.path.exists(dest) or spec.get("optional"):
+                    continue
+                raise RuntimeError("start stage %r needs input %r (%s) but none was supplied"
+                                   % (start, spec["field"], spec.get("label", spec["field"])))
+            src = os.path.abspath(os.path.expanduser(src))
+            if not os.path.exists(src):
+                raise RuntimeError("supplied input %r not found: %s" % (spec["field"], src))
+            parent = os.path.dirname(dest)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            if spec.get("kind") == "dir":
+                shutil.copytree(src, dest, dirs_exist_ok=True)
+            else:
+                shutil.copyfile(src, dest)
+            print(f"[start] supplied {spec['field']} -> {dest}")
+    for k in _STAGE_ORDER[:start_i]:
+        state[k] = "done"
+    _save_state(P, state)
 
 
 @dataclass
@@ -51,6 +110,12 @@ class RunConfig:
     cluster_mode: str = "off"  # "off" | "manual" (build bundle) | "autonomous" (build + upload/launch)
     cluster_cfg: dict = None   # config.sh values + ssh host/port/user/key (NO password — that's a secret)
     star_cfg: dict = None      # STAR config.sh values (genome index, organism, build resources) for bulk_rna_seq
+    bed_cfg: dict = None       # BAM->BED config.sh values (AltAnalyze species/resources; 'enabled' toggle) for bulk_rna_seq
+    psi_cfg: dict = None       # AltAnalyze (PSI) config.sh values + 'enabled' toggle + ALTANALYZE_LOCAL for bulk_rna_seq
+    group_cfg: dict = None     # user-defined comparison groups (Phase B); None => default treated-vs-control
+    start_stage: str = "fetch"        # phase range: first stage to run (a progress.STAGES key)
+    end_stage: str = "psi_submit"     # phase range: last stage to run; stages outside [start,end] are skipped
+    supplied_inputs: dict = None      # {input-field: local path} to stage in for a mid-pipeline START (progress.CHECKPOINTS)
 
 
 def _ask(prompt, default=None, secret=False):
@@ -99,6 +164,10 @@ def main():
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--skip-ai", action="store_true", help="run deterministic stages only")
     ap.add_argument("--no-deep-dive", action="store_true", help="skip the cell-line metadata deep dive")
+    ap.add_argument("--start-stage", default="fetch",
+                    help="phase range: first stage to run (a progress.STAGES key); earlier stages' outputs must already exist in the run dir")
+    ap.add_argument("--end-stage", default="bed_submit",
+                    help="phase range: last stage to run; later stages are skipped")
     ap.add_argument("--module", default=None, help="analysis module (e.g. bulk_rna_seq) — drives filter + alignment")
     ap.add_argument("--star-genome-dir", default=None, help="prebuilt STAR genome index dir (bulk_rna_seq module)")
     ap.add_argument("--star-gtf", default=None, help="GTF for STAR splice junctions (optional)")
@@ -180,7 +249,8 @@ def main():
                         concurrency=a.concurrency, run_dir=P.run_dir,
                         skip_ai=a.skip_ai, deep_dive=not a.no_deep_dive, pick_mode=pick_mode,
                         cluster_mode=a.cluster_mode, cluster_cfg=_cluster_cfg_from_args(a),
-                        star_cfg=_star_cfg_from_args(a))
+                        star_cfg=_star_cfg_from_args(a),
+                        start_stage=(a.start_stage or "fetch"), end_stage=(a.end_stage or "bed_submit"))
         json.dump(asdict(cfg), open(P.config, "w", encoding="utf-8"), indent=2)
 
     # provider API key into env (CLI: prompt if missing)
@@ -533,6 +603,103 @@ def _star_summary(P):
     return out or None
 
 
+def _save_bed_status(P, cfg, built, submit_res):
+    """Record what the BAM->BED stage actually did (survives resume / page reload)."""
+    if built is None and submit_res is None and os.path.exists(P.bed_status):
+        return  # resume that didn't re-run BED -> keep prior status
+    status = {"mode": cfg.cluster_mode, "built": bool(built),
+              "attempted": cfg.cluster_mode == "autonomous" and submit_res is not None,
+              "submitted": bool(submit_res and submit_res.get("submitted"))}
+    if built:
+        status.update({k: built.get(k) for k in ("species", "organism", "bam_input", "job_tag", "bed_mode") if built.get(k)})
+    if submit_res and not submit_res.get("submitted") and submit_res.get("reason"):
+        status["reason"] = submit_res.get("reason")
+    try:
+        json.dump(status, open(P.bed_status, "w", encoding="utf-8"))
+    except Exception:
+        pass
+
+
+def _bed_summary(P):
+    """Compact BED-handoff summary for the UI (read from files; robust to resume)."""
+    if not os.path.exists(P.bed_bundle_zip) and not os.path.exists(P.bed_status):
+        return None
+    out = {}
+    if os.path.exists(P.bed_bundle_zip):
+        out["bundle"] = True
+        out["zip"] = os.path.basename(P.bed_bundle_zip)
+    if os.path.exists(P.bed_status):
+        try:
+            st = json.load(open(P.bed_status, encoding="utf-8"))
+            for k in ("mode", "built", "attempted", "submitted", "species", "organism", "bam_input", "job_tag", "bed_mode", "reason"):
+                if k in st:
+                    out[k] = st.get(k)
+        except Exception:
+            pass
+    return out or None
+
+
+def _save_psi_status(P, cfg, built, submit_res):
+    """Record what the AltAnalyze (PSI) stage actually did (survives resume / page reload)."""
+    if built is None and submit_res is None and os.path.exists(P.psi_status):
+        return  # resume that didn't re-run PSI -> keep prior status
+    status = {"mode": cfg.cluster_mode, "built": bool(built),
+              "attempted": cfg.cluster_mode == "autonomous" and submit_res is not None,
+              "submitted": bool(submit_res and submit_res.get("submitted"))}
+    if built:
+        status.update({k: built.get(k) for k in
+                       ("species", "organism", "bed_input", "job_tag", "psi_root", "grouped", "altanalyze_home")
+                       if built.get(k) is not None})
+    if submit_res:
+        for k in ("altanalyze_home", "altanalyze_found"):
+            if submit_res.get(k) is not None:
+                status[k] = submit_res.get(k)
+        if not submit_res.get("submitted") and submit_res.get("reason"):
+            status["reason"] = submit_res.get("reason")
+    try:
+        json.dump(status, open(P.psi_status, "w", encoding="utf-8"))
+    except Exception:
+        pass
+
+
+def _psi_summary(P):
+    """Compact PSI-handoff summary for the UI (read from files; robust to resume)."""
+    if not os.path.exists(P.psi_bundle_zip) and not os.path.exists(P.psi_status):
+        return None
+    out = {}
+    if os.path.exists(P.psi_bundle_zip):
+        out["bundle"] = True
+        out["zip"] = os.path.basename(P.psi_bundle_zip)
+    if os.path.exists(P.psi_status):
+        try:
+            st = json.load(open(P.psi_status, encoding="utf-8"))
+            for k in ("mode", "built", "attempted", "submitted", "species", "organism", "bed_input",
+                      "job_tag", "psi_root", "grouped", "altanalyze_home", "altanalyze_found", "reason"):
+                if k in st:
+                    out[k] = st.get(k)
+        except Exception:
+            pass
+    return out or None
+
+
+def _psi_group_inputs(P, cfg, sel, reporter=NULL):
+    """Phase B hook: if the user defined comparison groups, classify samples (deterministic code + AI) into
+    a `group` column and return (group_col, labelmap) for psi_deploy; else (None, None) -> psi_deploy's
+    default treated-vs-control split. Degrades to (None, None) on any failure."""
+    gc = getattr(cfg, "group_cfg", None)
+    if not gc:
+        return None, None
+    try:
+        import group_assign
+    except Exception:
+        return None, None
+    try:
+        return group_assign.assign(P, cfg, sel, reporter=reporter)
+    except Exception as e:
+        print(f"  PSI: group assignment failed ({e}) -> default treated-vs-control")
+        return None, None
+
+
 def _persist_cfg(P, cfg):
     """Save the (non-secret) RunConfig to config.json so a --resume uses any corrected values."""
     try:
@@ -615,6 +782,20 @@ def run_pipeline(cfg, P, reporter=NULL, select_fn=None, secrets=None, cluster_fi
         reporter.skip_stage("ai_compounds")
         reporter.skip_stage("ai_samples")
 
+    # Phase range: run only stages in [start_stage, end_stage]; everything outside is skipped.
+    start_i = _idx(getattr(cfg, "start_stage", "fetch") or "fetch")
+    end_i = _idx(getattr(cfg, "end_stage", "bed_submit") or "bed_submit")
+    if start_i < 0:
+        start_i = 0
+    if end_i < 0:
+        end_i = len(_STAGE_ORDER) - 1
+    if start_i >= _idx("select"):
+        cfg.deep_dive = True   # starting at/after 'select' needs the deep-dive branch to load `deep`
+
+    def in_range(key):
+        i = _idx(key)
+        return i >= 0 and start_i <= i <= end_i
+
     def done(stage):
         return state.get(stage) == "done"
 
@@ -623,9 +804,16 @@ def run_pipeline(cfg, P, reporter=NULL, select_fn=None, secrets=None, cluster_fi
         _save_state(P, state)
 
     def begin(key):
-        """Begin a stage; return True if it still needs to run (not already done)."""
+        """Begin a stage; return True if it still needs to run (in range AND not already done)."""
+        if not in_range(key):
+            reporter.skip_stage(key)
+            return False
         reporter.begin_stage(key)
         return not done(key)
+
+    # Mid-pipeline START: stage in the artifacts the skipped earlier stages would have produced,
+    # and mark those stages done so begin() skips them (must run BEFORE the AI preflight below).
+    _inject_start_artifacts(cfg, P, state, start_i)
 
     print(f"\n=== PIPELINE run_dir={P.run_dir} ===")
     print(f"query={cfg.query!r} cap={cfg.cap} model={cfg.model} skip_ai={cfg.skip_ai}\n")
@@ -675,11 +863,15 @@ def run_pipeline(cfg, P, reporter=NULL, select_fn=None, secrets=None, cluster_fi
         mark("merge")
     reporter.complete_stage("merge")
 
-    # 7 BUILD (always re-runs; idempotent — rewrites the tables + cellline_index.json)
-    reporter.begin_stage("build")
-    summary = build_final.build_all(P, module=getattr(cfg, "module", "bulk_rna_seq") or "bulk_rna_seq")
-    mark("build")
-    reporter.complete_stage("build")
+    # 7 BUILD (idempotent — rewrites the tables + cellline_index.json)
+    summary = None
+    if in_range("build"):
+        reporter.begin_stage("build")
+        summary = build_final.build_all(P, module=getattr(cfg, "module", "bulk_rna_seq") or "bulk_rna_seq")
+        mark("build")
+        reporter.complete_stage("build")
+    else:
+        reporter.skip_stage("build")
 
     print(f"\n=== Tables in {P.tables_dir} ===  Headline: ncbi_final_splicing.csv")
 
@@ -687,8 +879,10 @@ def run_pipeline(cfg, P, reporter=NULL, select_fn=None, secrets=None, cluster_fi
     _DEEP = ("runtable_fetch", "runtable_build", "cellline_match", "runtable_annotate")
     _CLUSTER = ("cluster_bundle", "cluster_submit")
     _STAR = ("star_bundle", "star_submit")
+    _BED = ("bed_bundle", "bed_submit")
+    _PSI = ("psi_bundle", "psi_submit")
     if not cfg.deep_dive:
-        for k in ("select",) + _DEEP + _CLUSTER + _STAR:
+        for k in ("select",) + _DEEP + _CLUSTER + _STAR + _BED:
             reporter.skip_stage(k)
     else:
         import deepdive_select
@@ -715,7 +909,7 @@ def run_pipeline(cfg, P, reporter=NULL, select_fn=None, secrets=None, cluster_fi
         reporter.complete_stage("select")
 
         if deep is None:
-            for k in _DEEP + _CLUSTER + _STAR:
+            for k in _DEEP + _CLUSTER + _STAR + _BED:
                 reporter.skip_stage(k)
         else:
             if begin("runtable_fetch"):
@@ -743,6 +937,8 @@ def run_pipeline(cfg, P, reporter=NULL, select_fn=None, secrets=None, cluster_fi
             reporter.complete_stage("runtable_annotate")
 
             # 13-14 CLUSTER HANDOFF (gated on cluster_mode)
+            submit_res = None
+            star_submit_res = None
             if cfg.cluster_mode == "off":
                 for k in _CLUSTER:
                     reporter.skip_stage(k)
@@ -786,17 +982,130 @@ def run_pipeline(cfg, P, reporter=NULL, select_fn=None, secrets=None, cluster_fi
                 star_submit_res = None
                 bundle_ready = (star_built is not None
                                 or os.path.exists(os.path.join(P.star_dir, "config.sh")))
+                # T5.1: the STAR launcher polls <download_root>/PIPELINE_COMPLETE.txt. Arm it only if the
+                # upstream download actually went (submitted) OR was DELIBERATELY skipped by the phase range
+                # (then we pre-touch the sentinel). If the download submit was attempted in-range and
+                # FAILED, arming the launcher would poll forever -> skip STAR submit instead.
+                download_go = (not in_range("cluster_submit")) or bool((submit_res or {}).get("submitted"))
                 if not bundle_ready:
                     reporter.skip_stage("star_submit")
+                elif not download_go:
+                    reporter.skip_stage("star_submit")
+                    print("  STAR SUBMIT: skipped — the upstream download submit failed, so not arming a "
+                          "launcher that would poll a sentinel that never appears (fix the download, then resume).")
+                    reporter.set_detail("STAR submit skipped — download submit failed")
                 elif cfg.cluster_mode == "autonomous":
                     if begin("star_submit"):
                         star_submit_res = star_deploy.submit_star_over_ssh(
-                            P, cfg.cluster_cfg, secrets, download_root, reporter=reporter)
+                            P, cfg.cluster_cfg, secrets, download_root, reporter=reporter,
+                            prior_skipped=not in_range("cluster_submit"))
                         mark("star_submit")
                     reporter.complete_stage("star_submit")
                 else:
                     reporter.skip_stage("star_submit")
                 _save_star_status(P, cfg, star_built, star_submit_res)
+
+            # 17-18 BAM->BED (AltAnalyze junction/exon; auto-chained AFTER STAR; on by default for bulk_rna_seq)
+            bed_on = (getattr(cfg, "module", "bulk_rna_seq") == "bulk_rna_seq"
+                      and cfg.cluster_mode != "off"
+                      and str((getattr(cfg, "bed_cfg", None) or {}).get("enabled", "1")).lower()
+                          not in ("0", "off", "false", "no"))
+            if not bed_on:
+                for k in _BED:
+                    reporter.skip_stage(k)
+            else:
+                import cluster_deploy
+                import bed_deploy
+                download_root = (cluster_deploy._read_config_root(P)
+                                 or cluster_deploy._effective_root(cfg.cluster_cfg, deep))
+                dl_tag = (cfg.cluster_cfg or {}).get("JOB_TAG", "sra")
+                bam_out_root = f"{download_root.rstrip('/')}/STAR_bams"
+                star_tag = f"{dl_tag}_star"
+                bed_built = None
+                if begin("bed_bundle"):
+                    bed_built = bed_deploy.build_bed_bundle(
+                        P, deep, bam_out_root, getattr(cfg, "bed_cfg", None),
+                        star_job_tag=star_tag, reporter=reporter)
+                    mark("bed_bundle")
+                reporter.complete_stage("bed_bundle")
+
+                bed_submit_res = None
+                bed_ready = (bed_built is not None
+                             or os.path.exists(os.path.join(P.bed_dir, "config.sh")))
+                # T5.1: arm the BED launcher only if STAR actually went (submitted) OR was deliberately
+                # phase-range skipped (then pre-touch the sentinel). A failed in-range STAR submit cascades
+                # the skip to BED rather than arming a launcher that polls forever.
+                star_go = (not in_range("star_submit")) or bool((star_submit_res or {}).get("submitted"))
+                if not bed_ready:
+                    reporter.skip_stage("bed_submit")
+                elif not star_go:
+                    reporter.skip_stage("bed_submit")
+                    print("  BED SUBMIT: skipped — the upstream STAR submit failed, so not arming a launcher "
+                          "that would poll a sentinel that never appears (fix STAR, then resume).")
+                    reporter.set_detail("BED submit skipped — STAR submit failed")
+                elif cfg.cluster_mode == "autonomous":
+                    if begin("bed_submit"):
+                        bed_submit_res = bed_deploy.submit_bed_over_ssh(
+                            P, cfg.cluster_cfg, secrets, bam_out_root, reporter=reporter,
+                            prior_skipped=not in_range("star_submit"))
+                        mark("bed_submit")
+                    reporter.complete_stage("bed_submit")
+                else:
+                    reporter.skip_stage("bed_submit")
+                _save_bed_status(P, cfg, bed_built, bed_submit_res)
+
+            # 19-20 AltAnalyze splicing (PSI; auto-chained AFTER BAM->BED; on by default for bulk_rna_seq)
+            psi_on = (getattr(cfg, "module", "bulk_rna_seq") == "bulk_rna_seq"
+                      and cfg.cluster_mode != "off"
+                      and str((getattr(cfg, "psi_cfg", None) or {}).get("enabled", "1")).lower()
+                          not in ("0", "off", "false", "no"))
+            if not psi_on:
+                for k in _PSI:
+                    reporter.skip_stage(k)
+            else:
+                import cluster_deploy
+                import psi_deploy
+                download_root = (cluster_deploy._read_config_root(P)
+                                 or cluster_deploy._effective_root(cfg.cluster_cfg, deep))
+                dl_tag = (cfg.cluster_cfg or {}).get("JOB_TAG", "sra")
+                bam_out_root = f"{download_root.rstrip('/')}/STAR_bams"
+                # Phase B: if the user defined comparison groups, assign samples (fixed code + AI) and ship
+                # that `group` column; else build_psi_bundle defaults to the treated-vs-control split.
+                group_col, labelmap = _psi_group_inputs(P, cfg, deep, reporter)
+                psi_built = None
+                if begin("psi_bundle"):
+                    psi_built = psi_deploy.build_psi_bundle(
+                        P, deep, bam_out_root, getattr(cfg, "psi_cfg", None),
+                        download_job_tag=dl_tag, reporter=reporter,
+                        group_col=group_col, labelmap=labelmap)
+                    mark("psi_bundle")
+                reporter.complete_stage("psi_bundle")
+
+                psi_submit_res = None
+                psi_ready = (psi_built is not None
+                             or os.path.exists(os.path.join(P.psi_dir, "config.sh")))
+                # T5.1: arm the PSI launcher only if BED actually went (submitted) OR was deliberately
+                # phase-range skipped (then pre-touch the BED sentinel). A failed in-range BED submit
+                # cascades the skip to PSI rather than arming a launcher that polls forever.
+                _bed_res = locals().get("bed_submit_res")
+                bed_go = (not in_range("bed_submit")) or bool((_bed_res or {}).get("submitted"))
+                if not psi_ready:
+                    reporter.skip_stage("psi_submit")
+                elif not bed_go:
+                    reporter.skip_stage("psi_submit")
+                    print("  PSI SUBMIT: skipped — the upstream BED submit failed, so not arming a launcher "
+                          "that would poll a sentinel that never appears (fix BED, then resume).")
+                    reporter.set_detail("PSI submit skipped — BED submit failed")
+                elif cfg.cluster_mode == "autonomous":
+                    if begin("psi_submit"):
+                        psi_submit_res = psi_deploy.submit_psi_over_ssh(
+                            P, cfg.cluster_cfg, secrets, bam_out_root, reporter=reporter,
+                            prior_skipped=not in_range("bed_submit"))
+                        mark("psi_submit")
+                    reporter.complete_stage("psi_submit")
+                else:
+                    reporter.skip_stage("psi_submit")
+                _save_psi_status(P, cfg, psi_built, psi_submit_res)
 
     deep_dive = _deep_summary(P)
     if deep_dive:
@@ -819,6 +1128,22 @@ def run_pipeline(cfg, P, reporter=NULL, select_fn=None, secrets=None, cluster_fi
                   f"BAMs -> {star.get('bam_out')}) ===")
         elif star.get("bundle"):
             print(f"=== STAR BUNDLE -> {P.star_bundle_zip} (organism {star.get('organism')}) ===")
+    bed = _bed_summary(P)
+    if bed:
+        summary = dict(summary or {}, bed=bed)
+        if bed.get("submitted"):
+            print(f"=== BED: BAM->BED auto-chained on the cluster (species {bed.get('species')}; "
+                  f"BEDs -> {bed.get('bam_input')}) ===")
+        elif bed.get("bundle"):
+            print(f"=== BED BUNDLE -> {P.bed_bundle_zip} (species {bed.get('species')}) ===")
+    psi = _psi_summary(P)
+    if psi:
+        summary = dict(summary or {}, psi=psi)
+        if psi.get("submitted"):
+            print(f"=== PSI: AltAnalyze splicing auto-chained on the cluster (species {psi.get('species')}; "
+                  f"{'grouped dPSI' if psi.get('grouped') else 'groupless PSI'}) ===")
+        elif psi.get("bundle"):
+            print(f"=== PSI BUNDLE -> {P.psi_bundle_zip} (species {psi.get('species')}) ===")
 
     print(f"\n=== DONE. run_dir={P.run_dir} ===")
     files = _list_outputs(P)

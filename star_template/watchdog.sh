@@ -25,23 +25,52 @@ say() { echo "[$(ts)] $*" >> "$LOG"; }
 # (e.g. bsub blocked on the LSF pending-job threshold) can NEVER break the self-driving chain.
 # finalize() cancels the successor once the pipeline is actually done.
 WATCHDOG_NEXT_JID=""
+RESCHED_RC=0
 reschedule() {
-  local when
+  local when out
   when=$(date -d "+$WATCHDOG_INTERVAL_MIN min" '+%Y:%m:%d:%H:%M' 2>/dev/null) ||
   when=$(date -v+"${WATCHDOG_INTERVAL_MIN}"M '+%Y:%m:%d:%H:%M' 2>/dev/null)
   star_qopt
-  WATCHDOG_NEXT_JID=$(bsub -L /bin/bash -n 1 -M 1000 -W 20 -b "$when" -J "${JOB_TAG}_watchdog" \
+  # capture bsub's OWN exit status (not the pipeline-tail rc of star_jobid) so the safety-net can tell a
+  # genuine submit FAILURE (re-arm) from a successful submit whose id just failed to parse (do NOT re-arm,
+  # else two parallel watchdog chains). RESCHED_RC drives both decisions.
+  out=$(bsub -L /bin/bash -n 1 -M 1000 -W 20 -b "$when" -J "${JOB_TAG}_watchdog" \
        -o "$LOG_DIR/watchdog.out" -e "$LOG_DIR/watchdog.err" \
-       ${QOPT[@]+"${QOPT[@]}"} "$SCRIPTS_DIR/watchdog.sh" 2>/dev/null | star_jobid)
-  say "next pass scheduled for $when (job ${WATCHDOG_NEXT_JID:-?})"
+       ${QOPT[@]+"${QOPT[@]}"} "$SCRIPTS_DIR/watchdog.sh" 2>&1)
+  RESCHED_RC=$?
+  WATCHDOG_NEXT_JID=$(printf '%s' "$out" | star_jobid)
+  say "next pass scheduled for $when (job ${WATCHDOG_NEXT_JID:-?}, rc=$RESCHED_RC)"
 }
 
 finalize() {                            # $1 = COMPLETE | STALLED
   local status="$1" label rest
   local rep="$PIPELINE_ROOT/PIPELINE_${status}.txt"   # SEPARATE line: bash 4.2 + set -u can't see $status declared in the SAME `local`
-  [ -n "${WATCHDOG_NEXT_JID:-}" ] && bkill "$WATCHDOG_NEXT_JID" >/dev/null 2>&1   # cancel queued successor
+  # EXACTLY-ONCE (T2.3): an atomic mkdir claim survives NFS flock degradation -- only the first racer
+  # past this does the destructive cleanup + chain kick; a concurrent pass returns harmlessly.
+  star_finalize_once || { say "finalize already claimed by a concurrent pass -> skip"; return 0; }
+  # Cancel ALL queued/duplicate watchdog successors except THIS job -- a double-armed or nudged successor
+  # would otherwise re-spawn the chain after we stop (T2.4/T6).
+  local _self _wj
+  _self="${LSB_JOBID:-}"
+  for _wj in $(bjobs -noheader -o jobid -J "${JOB_TAG}_watchdog" 2>/dev/null); do
+    [ "$_wj" = "$_self" ] && continue
+    bkill "$_wj" >/dev/null 2>&1
+  done
+  # PARTIAL run (T1.1): disable destructive cleanup/FASTQ purge + write an HONEST marker whenever the
+  # dataset may be incomplete. Detected WITHOUT relying on the launcher-written PIPELINE_INCOMPLETE_UPSTREAM
+  # marker (that marker's writer is the deploy-generated launcher, which a SCRIPT-ONLY hot-patch does NOT
+  # replace) -- the robust signal is the upstream DOWNLOAD's own POSITIVE completion marker. partial=1 if
+  # this stage STALLED, OR the incomplete-upstream marker exists, OR the download did NOT write
+  # $dlroot/PIPELINE_COMPLETE.txt. The by_study purge below is thus gated on the download's POSITIVE success.
+  local partial=0 dlroot
+  dlroot="$(cd "$BAM_OUT/.." 2>/dev/null && pwd)"
+  if [ "$status" = "STALLED" ] || [ -f "$PIPELINE_ROOT/PIPELINE_INCOMPLETE_UPSTREAM.txt" ] \
+     || { [ -n "${dlroot:-}" ] && [ ! -f "$dlroot/PIPELINE_COMPLETE.txt" ]; }; then
+    partial=1
+  fi
   {
     echo "STAR alignment pipeline $status at $(ts)"
+    [ "$partial" = "1" ] && echo "*** PARTIAL: upstream incomplete and/or this stage STALLED -- NOT all samples aligned; cleanup/deletion DISABLED ***"
     echo "Aligned: $done_n / $exp_n samples"
     echo "BAM dir: $BAM_OUT  ($(du -sh "$BAM_OUT" 2>/dev/null | cut -f1) used)"
     echo
@@ -62,52 +91,159 @@ finalize() {                            # $1 = COMPLETE | STALLED
       done < "$SAMPLE_LIST"
     fi
   } > "$rep"
-  say "FINALIZED ($status) -> $rep  (watchdog stopping)"
+  # honest partial marker (surfaced by the SpliceScout status probe)
+  [ "$partial" = "1" ] && echo "PARTIAL run at $(ts): $done_n/$exp_n aligned. Upstream incomplete and/or STALLED; destructive cleanup + FASTQ purge were DISABLED. Inspect before deleting inputs." \
+      > "$PIPELINE_ROOT/PIPELINE_COMPLETE_PARTIAL.txt"
+  # SpliceScout BED auto-chain: kick the BED launcher (it self-marks partial if WE stalled). Kick on
+  # COMPLETE or STALLED so partial data still flows; bed_launch + BED finalize enforce the partial safety.
+  if [ -f "$PIPELINE_ROOT/bed/bed_launch.sh" ]; then
+    star_qopt
+    bsub -L /bin/bash -n 1 -M 1000 -W 120 -J "${JOB_TAG}_bed_launch" \
+         -o "$PIPELINE_ROOT/bed/launch.out" -e "$PIPELINE_ROOT/bed/launch.err" \
+         ${QOPT[@]+"${QOPT[@]}"} "$PIPELINE_ROOT/bed/bed_launch.sh" >/dev/null 2>&1
+    say "kicked BED launcher -> $PIPELINE_ROOT/bed/bed_launch.sh"
+  fi
+  # Tool cleanup (free disk): ONLY on a clean (non-partial) COMPLETE, and ONLY when a FRESH bjobs snapshot
+  # confirms no work job is still live (T1.3 -- never rm out from under a still-running resubmit). If the
+  # snapshot is unreliable, KEEP the tools (a missed disk-free is harmless; deleting a live job's inputs is not).
+  local freshlive _frc
+  if [ "$status" = "COMPLETE" ] && [ "$partial" = "0" ] && [ "${CLEANUP_TOOLS_WHEN_DONE:-1}" = "1" ]; then
+    freshlive="$(star_snapshot)"; _frc=$?
+    if [ "$_frc" -eq 0 ] && [ -n "$(printf '%s' "$freshlive" | tr -d '[:space:]')" ] \
+       && ! printf '%s\n' "$freshlive" | grep -qE "^${JOB_TAG}_star_"; then
+      # dlroot was resolved above (partial gate). tighter path guard (T1.3): a genuine download root
+      # contains STAR_bams AND is >=3 path components
+      # deep -- so a misconfigured/shallow BAM_OUT can't widen the rm target to a shared parent.
+      if [ -n "${dlroot:-}" ] && [ "$dlroot" != "/" ] && [ -d "$dlroot/STAR_bams" ] \
+         && [ "$(printf '%s' "$dlroot" | awk -F/ '{print NF-1}')" -ge 3 ]; then
+        rm -rf "$dlroot/by_study" 2>/dev/null
+        rm -f "$dlroot"/*.sh "$dlroot"/*.py 2>/dev/null
+        say "cleanup: removed by_study + download bundle scripts under $dlroot"
+      else
+        say "cleanup: SKIPPED -- dlroot '${dlroot:-}' failed the run-root safety guard (kept tools)"
+      fi
+    else
+      say "cleanup: SKIPPED -- a work job is still live or bjobs is unreliable (kept tools, no risky rm)"
+    fi
+  fi
+  say "FINALIZED ($status; partial=$partial) -> $rep  (watchdog stopping)"
 }
 
 say "=== watchdog pass start ==="
 if [ -f "$PIPELINE_ROOT/PIPELINE_COMPLETE.txt" ] || [ -f "$PIPELINE_ROOT/PIPELINE_STALLED.txt" ]; then
   say "already finalized -> stop"; exit 0
 fi
+# Reclaim a STALE finalize lock: we only reach here when NO PIPELINE_*.txt marker exists, so if
+# .finalized.lock is present a prior finalize was killed BEFORE writing its marker -- otherwise it would
+# wedge every future finalize (the lock is never otherwise removed). Safe to clear now.
+[ -d "$PIPELINE_ROOT/.finalized.lock" ] && rmdir "$PIPELINE_ROOT/.finalized.lock" 2>/dev/null
 [ -f "$SAMPLE_LIST" ] || { say "no sample list at $SAMPLE_LIST -- stopping"; exit 1; }
-reschedule                       # queue the NEXT pass FIRST (survives a mid-pass walltime kill)
-LIVE="$(star_live_names)"
 
-# 1) resubmit missing/invalid samples that have no live job
+# SINGLE-FLIGHT (T2.3): only ONE watchdog pass runs at a time. A nudged successor colliding with a timed
+# one (or a double-arm) would otherwise resubmit the same sample twice and double-kick the chain. Hold a
+# dedicated lock for the whole pass; a loser just exits (the winner already reschedule-first'd a successor).
+exec 8>"$PIPELINE_ROOT/.watchdog.run.lock" 2>/dev/null || true
+if command -v flock >/dev/null 2>&1; then
+  flock -n 8 2>/dev/null || { say "another watchdog pass holds the run lock -> exit"; exit 0; }
+fi
+
+reschedule                       # queue the NEXT pass FIRST (survives a mid-pass walltime kill)
+
+# ABSOLUTE BACKSTOP (T2.2), bjobs-INDEPENDENT: a permanently-PENDING job keeps nlive>=1 so the normal
+# STALL never fires, and an overloaded cluster can break bjobs every pass (skip-forever). Either way, cap
+# the run by pass-count AND wall-clock so it can never loop/skip silently with no human signal.
+_now=$(date +%s)
+[ -f "$STATE.firstpass" ] || echo "$_now" > "$STATE.firstpass"
+_first=$(cat "$STATE.firstpass" 2>/dev/null || echo "$_now")
+_passes=$(( $(cat "$STATE.passes" 2>/dev/null || echo 0) + 1 )); echo "$_passes" > "$STATE.passes"
+if [ "$_passes" -ge "${ABSOLUTE_MAX_PASSES:-960}" ] || [ "$(( _now - _first ))" -ge "$(( ${MAX_WALL_HOURS:-336} * 3600 ))" ]; then
+  exp_n=$(star_expected_count); done_n=$(star_done_count); nlive=0
+  say "BACKSTOP: passes=$_passes wall=$(( _now - _first ))s exceeded the cap -> STALLED (inspect stuck/PENDING jobs)"
+  finalize "STALLED"; exit 0
+fi
+
+# SNAPSHOT WITH RC (T2.1): bjobs FAILED (rc!=0) or returned EMPTY -> unreliable this instant. Acting on it
+# would resubmit running jobs and/or falsely finalize, so skip the WHOLE pass (the queued successor retries).
+LIVE="$(star_snapshot)"; STAR_SNAP_RC=$?     # capture bjobs rc in the PARENT (command-subst is a subshell)
+if [ "$STAR_SNAP_RC" -ne 0 ] || [ -z "$(printf '%s' "$LIVE" | tr -d '[:space:]')" ]; then
+  say "WARNING: bjobs failed/empty (rc=$STAR_SNAP_RC) -- skipping resubmit + completion this pass"
+  exit 0
+fi
+# reuse the SAME snapshot for the live-work count (a 2nd bjobs could disagree). PURE-BASH count -- grep -c
+# returns empty on this cluster's compute nodes, which wedged the gate (hit LIVE on the BED stage).
+nlive=$(star_count_work "$LIVE")
+exp_n=$(star_expected_count)
+done_n=$(star_done_count)
+
+# SANITY FLOOR (T2.1): if live-work COLLAPSED >50% vs last pass with NO new BAMs, the snapshot is a
+# suspected partial bjobs -> skip resubmit+finalize this pass (don't resubmit jobs that are really alive).
+_prev_nlive=$(cat "$STATE.nlive" 2>/dev/null || echo -1)
+_prev_done=$(cat "$STATE.donen" 2>/dev/null || echo -1)
+echo "$nlive" > "$STATE.nlive"; echo "$done_n" > "$STATE.donen"
+if [ "$_prev_nlive" -gt 1 ] && [ "$nlive" -lt "$(( _prev_nlive / 2 ))" ] && [ "$done_n" -le "$_prev_done" ]; then
+  say "WARNING: live work jobs collapsed $_prev_nlive->$nlive with no new BAMs (suspect partial bjobs) -- skipping this pass"
+  exit 0
+fi
+
+# 1) resubmit missing/invalid samples that have no live job -- gated by the bulk snapshot AND a targeted
+#    per-name re-check (a partial bulk snapshot can't fool the targeted bjobs), plus a missing-FASTQ guard.
 resub=0
 while IFS=$'\t' read -r label f1 f2; do
   [ -n "$label" ] || continue
   star_bam_ok "$label" && continue
-  star_has_live "$(star_jobname "$label")" "$LIVE" && continue
+  jn="$(star_jobname "$label")"
+  star_has_live "$jn" "$LIVE" && continue
+  star_job_is_live "$jn" && continue        # targeted re-verify (T2.1): fail-closed against partial snapshots
+  if [ "${f1:-NA}" != "NA" ] && [ -n "${f1:-}" ] && ! star_fastq_exists "$f1"; then
+    say "UNRECOVERABLE: $label has no valid BAM and its source FASTQ is gone ($f1) -- cannot re-align (re-download needed)"
+    continue
+  fi
   star_submit_sample "$label" "$f1" "${f2:-NA}" >/dev/null && resub=$((resub+1))
 done < "$SAMPLE_LIST"
 [ "$resub" -gt 0 ] && say "resubmitted $resub missing/invalid sample(s)"
-
-# 2) progress accounting (denominator FIXED at launch)
-exp_n=$(star_expected_count)
-done_n=$(star_done_count)
-nlive=$(star_live_work_count)
 say "progress: $done_n/$exp_n aligned ; $nlive live work job(s) ; $resub resubmitted this pass"
 
-# 3) completion: every sample done AND no live work job
+# 2) completion: every sample done AND no live work job
 if [ "$done_n" -ge "$exp_n" ] && [ "$nlive" -eq 0 ]; then
   finalize "COMPLETE"; exit 0
 fi
 
-# 4) stall: no live jobs AND no forward progress for MAX_STALL_PASSES passes.
-#    (Gated on NO PROGRESS, not "nothing resubmitted" -- a genuinely-bad sample
-#    is resubmitted every idle pass, so this is what makes it converge instead
-#    of looping forever.)
+# 3) stall: no live jobs AND no forward progress for MAX_STALL_PASSES passes; OR no-churn (done_n AND the
+#    live-work-name SET both unchanged) for 4x MAX_STALL_PASSES (catches a permanently-PENDING/looping job
+#    that keeps nlive>=1 forever).
+_hash=$(star_live_work_hash "$LIVE")
+_prev_hash=$(cat "$STATE.hash" 2>/dev/null || echo "")
+echo "$_hash" > "$STATE.hash"
 if [ "$nlive" -eq 0 ]; then
   prev=$(cat "$STATE" 2>/dev/null || echo -1)
   stall=0
   [ "$done_n" = "$prev" ] && stall=$(( $(cat "$STATE.stall" 2>/dev/null || echo 0) + 1 ))
-  echo "$done_n" > "$STATE"; echo "$stall" > "$STATE.stall"
-  if [ "$stall" -ge "$MAX_STALL_PASSES" ]; then finalize "STALLED"; exit 0; fi
+  echo "$done_n" > "$STATE"; echo "$stall" > "$STATE.stall"; echo 0 > "$STATE.nochurn"
+  if [ "$stall" -ge "${MAX_STALL_PASSES:-2}" ]; then finalize "STALLED"; exit 0; fi
 else
   echo "$done_n" > "$STATE"; echo 0 > "$STATE.stall"
+  if [ "$done_n" = "$(cat "$STATE.ncdone" 2>/dev/null || echo -1)" ] && [ "$_hash" = "$_prev_hash" ]; then
+    nc=$(( $(cat "$STATE.nochurn" 2>/dev/null || echo 0) + 1 )); echo "$nc" > "$STATE.nochurn"
+    if [ "$nc" -ge "$(( ${MAX_STALL_PASSES:-2} * 4 ))" ]; then
+      say "no-churn: done_n=$done_n and the live job set unchanged for $nc passes -> STALLED (stuck/PENDING jobs)"
+      finalize "STALLED"; exit 0
+    fi
+  else
+    echo 0 > "$STATE.nochurn"
+  fi
+  echo "$done_n" > "$STATE.ncdone"
 fi
 
-# Safety net: a successor is normally queued at pass start; reschedule now if that bsub didn't take.
-[ -n "${WATCHDOG_NEXT_JID:-}" ] || reschedule
+# Safety net (T2.4): re-arm ONLY if the pass-start reschedule actually FAILED (rc!=0) with no successor id
+# -- never on a successful-but-unparsed submit (that would double-arm two chains). If it fails twice, write
+# an ORPHAN marker so the dead chain is detectable instead of silently stopping with work pending.
+if [ "${RESCHED_RC:-0}" -ne 0 ] && [ -z "${WATCHDOG_NEXT_JID:-}" ]; then
+  reschedule
+  if [ "${RESCHED_RC:-0}" -ne 0 ] && [ -z "${WATCHDOG_NEXT_JID:-}" ]; then
+    say "ORPHAN: could not queue a successor twice (bsub failing at the PEND cap?) -- chain may stop"
+    { echo "STAR watchdog could not reschedule at $(ts): bsub failed twice (likely the LSF pending-job cap)."
+      echo "Re-arm manually:  bsub -L /bin/bash -n 1 -M 1000 -W 20 -J ${JOB_TAG}_watchdog $SCRIPTS_DIR/watchdog.sh"
+    } > "$PIPELINE_ROOT/PIPELINE_ORPHANED.txt"
+  fi
+fi
 say "pass end -> next pass queued (job ${WATCHDOG_NEXT_JID:-?})"

@@ -15,7 +15,7 @@ fi
 
 echo "live jobs (this run):"
 bjobs -noheader -o "job_name stat" 2>/dev/null | grep "^${JOB_TAG}_" | awk '{print $2}' | sort | uniq -c | sed 's/^/  /'
-echo "  STAR running: $(bjobs -noheader -o 'job_name stat' 2>/dev/null | grep -cE "^${JOB_TAG}_star_.*RUN")"
+echo "  STAR running: $(bjobs -noheader -o 'job_name stat' 2>/dev/null | grep -E "^${JOB_TAG}_star_.*RUN" | wc -l)"
 
 echo "recent failures (EXIT, excluding cancellations):"
 f=$(bjobs -a -noheader -o "jobid job_name stat exit_reason delimiter='|'" 2>/dev/null \

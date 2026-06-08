@@ -13,6 +13,14 @@ source "$HERE/lib_star.sh"
 set -u
 star_require_bsub
 
+# SINGLE-FLIGHT (T2.3/T3.2): the download watchdog kicks this launcher while the launcher ALSO self-polls,
+# so two run_star_pipeline.sh can start at once and race build_sample_list (the BUILD-ONCE denominator)
+# and submit_all. Hold a lock for the whole launch; a loser just exits (the winner is setting the run up).
+mkdir -p "$PIPELINE_ROOT" 2>/dev/null || true
+if command -v flock >/dev/null 2>&1 && { exec 9>"$PIPELINE_ROOT/.launch.lock"; } 2>/dev/null; then
+  flock -n 9 2>/dev/null || { echo "another run_star_pipeline.sh launch is in progress -- exiting"; exit 0; }
+fi
+
 echo ">> [1/5] setup"
 bash "$HERE/setup.sh" || { echo "setup failed -- fix config.sh and retry" >&2; exit 1; }
 

@@ -3,8 +3,9 @@
 
 launch_Win.bat starts this with pythonw (windowless); a tray icon gives Open / Quit. If the tray
 libraries (pystray + Pillow) aren't importable, it falls back to the plain console server, so this is
-always safe to run. Reuses server.py's instance-slot + free-port machinery (so the tray app still gets
-its own sraN instance + port, exactly like `python server.py`).
+always safe to run. Reuses server.py's instance-tag + free-port machinery (so the tray app still gets
+its own cluster JOB_TAG -- the $SPLICESCOUT_INSTANCE name from the launcher, else an auto sraN -- plus
+its own port, exactly like `python server.py`).
 """
 import os
 import threading
@@ -16,8 +17,7 @@ def _start_server():
     import atexit
     import server
     os.chdir(os.path.dirname(os.path.abspath(server.__file__)))
-    server._INSTANCE_SLOT, server._INSTANCE_LOCK_PATH = server._claim_instance_slot()
-    server._INSTANCE_TAG = "sra%d" % server._INSTANCE_SLOT
+    server._INSTANCE_TAG, server._INSTANCE_LOCK_PATH = server._claim_instance_slot(server._resolve_instance_name())
     atexit.register(server._release_instance_slot)
     httpd, port = server._bind_server("127.0.0.1", 8765)
     url = "http://127.0.0.1:%d/" % port

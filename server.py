@@ -17,10 +17,12 @@ Runs ONE pipeline at a time; the UI blocks starting a second run while one is ac
 """
 import argparse
 import atexit
+import hmac
 import io
 import json
 import os
 import re
+import secrets as pysecrets
 import sys
 import threading
 import traceback
@@ -32,6 +34,7 @@ from urllib.parse import urlparse, parse_qs
 
 from pipeline_paths import Paths
 from progress import RunReporter
+import progress
 import pipeline
 import llm_providers
 import cluster_deploy
@@ -46,17 +49,51 @@ _REPORTER = None     # current/last RunReporter
 _WORKER = None       # current worker thread
 _RUN_DIR = None      # current/last run dir (download root)
 
-# ---- per-instance identity: each launched server claims sra1 / sra2 / sra3 ... ----
-# So you can run several instances at once (concurrent projects) and their cluster JOB_TAGs
-# never collide. The slot is the lowest free number among LIVE instances (a closed/dead
-# instance frees its number), claimed atomically in a cross-process lock directory.
-_INSTANCE_SLOT = 1
+# ---- access control (the server is a remote-control plane: /api/start launches cluster runs) ----
+# On the default 127.0.0.1 bind, only the CSRF Origin check applies (blocks drive-by browser POSTs).
+# On a non-loopback bind (--host 0.0.0.0 / a LAN IP) a random token is REQUIRED on every request: the
+# banner prints the URL with ?token=..., the served page embeds it, and /api/* verify it.
+_AUTH_TOKEN = ""     # "" => loopback bind, no token required
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]", "0.0.0.0"}
+
+
+def _host_of(value):
+    """Extract the bare host from a URL / Origin / Host header (no scheme, port, path, or userinfo)."""
+    h = (value or "").strip().lower()
+    if "//" in h:
+        h = h.split("//", 1)[1]
+    h = h.rsplit("@", 1)[-1]
+    h = h.split("/", 1)[0]
+    if h.startswith("["):                       # bracketed IPv6
+        return h.split("]", 1)[0] + "]"
+    return h.split(":", 1)[0]
+
+# ---- per-instance identity: each launched server claims a cluster JOB_TAG ----
+# The launcher prompts for an instance NAME and exports it as $SPLICESCOUT_INSTANCE; that name
+# becomes this instance's cluster JOB_TAG, so concurrent projects' LSF jobs never collide. With no
+# name given it falls back to the lowest free sra1 / sra2 / sra3 ... among LIVE instances (a
+# closed/dead instance frees its tag). The tag is claimed atomically via a per-tag lock file.
 _INSTANCE_TAG = "sra1"
 _INSTANCE_LOCK_PATH = None
 
 
 def _instances_dir():
     return os.path.join(os.path.expanduser("~"), ".geo_pipeline_instances")
+
+
+def _sanitize_tag(s):
+    """Make a user-supplied instance name safe both as an LSF job-name prefix AND as a literal inside
+    the `grep -E "^<tag>_..."` patterns the cluster scripts use: keep [A-Za-z0-9_], collapse any run
+    of other characters to a single '_', trim leading/trailing '_', cap length. '' if nothing usable."""
+    import re
+    return re.sub(r"[^A-Za-z0-9_]+", "_", str(s or "")).strip("_")[:24]
+
+
+def _resolve_instance_name():
+    """The user-chosen instance name from the launcher (env var $SPLICESCOUT_INSTANCE), or None for
+    the automatic sraN fallback. The launcher prompts and exports it because server.py may run
+    windowless (under the system tray) and so must never block on input()."""
+    return (os.environ.get("SPLICESCOUT_INSTANCE") or "").strip() or None
 
 
 def _pid_alive(pid):
@@ -91,15 +128,23 @@ def _pid_alive(pid):
         return True
 
 
-def _claim_instance_slot():
-    """Claim the lowest free sraN slot among actively-running instances. Returns (n, lock_path)."""
+def _claim_instance_slot(preferred=None):
+    """Claim a unique instance identity (an atomic lock file in ~/.geo_pipeline_instances) and return
+    (tag, lock_path). With `preferred` (a user-chosen name) the tag is that sanitized name — or
+    name-2 / name-3 / ... if a LIVE instance already holds it; with no name it's the lowest free
+    sra1 / sra2 / sra3 ... among live instances. A dead instance's tag is reclaimed."""
     regdir = _instances_dir()
+    base = _sanitize_tag(preferred) if preferred else ""
     try:
         os.makedirs(regdir, exist_ok=True)
     except Exception:
-        return 1, None
-    for n in range(1, 1000):
-        path = os.path.join(regdir, f"sra{n}.lock")
+        return (base or "sra1"), None
+    if base:
+        candidates = (base if i == 1 else f"{base}-{i}" for i in range(1, 1000))
+    else:
+        candidates = (f"sra{n}" for n in range(1, 1000))
+    for tag in candidates:
+        path = os.path.join(regdir, f"{tag}.lock")
         if os.path.exists(path):
             alive = True
             try:
@@ -107,7 +152,7 @@ def _claim_instance_slot():
             except Exception:
                 alive = False
             if alive:
-                continue                 # slot held by a live instance
+                continue                 # tag held by a live instance
             try:
                 os.remove(path)          # stale (instance died) -> reclaim it
             except Exception:
@@ -117,14 +162,14 @@ def _claim_instance_slot():
         except FileExistsError:
             continue                     # another instance grabbed it a moment ago
         except Exception:
-            return n, None
+            return tag, None
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump({"pid": os.getpid(), "slot": n}, f)
+                json.dump({"pid": os.getpid(), "tag": tag}, f)
         except Exception:
             pass
-        return n, path
-    return 1, None
+        return tag, path
+    return (base or "sra1"), None
 
 
 def _release_instance_slot():
@@ -207,6 +252,24 @@ def _worker(cfg, P, reporter, secrets=None):
         sys.stdout, sys.stderr = old_out, old_err
 
 
+# Reject values that could break out of remote-shell quoting before they reach the cluster. shq()
+# already neutralizes these in command lines, but a boundary check gives the user a clear 400 instead
+# of a mangled remote command, and defends the config.sh / generated-script paths too. Permits $USER,
+# spaces and ordinary path chars; blocks quotes, backtick, ; | & < > \ newline and $( command-subst.
+_SHELL_META_RE = re.compile(r"""[`;|&<>'"\\\n\r]|\$\(""")
+
+
+def _reject_shell_meta(named):
+    """named: iterable of (label, value). Returns (400, {...}) if any value carries shell
+    metacharacters that could escape remote-command quoting; else None."""
+    for label, val in named:
+        s = str(val or "")
+        if _SHELL_META_RE.search(s):
+            return 400, {"error": "%s may not contain quotes, backtick, ; | & < > \\ newline or $( ) "
+                                  "shell characters." % label}
+    return None
+
+
 def _start_run(body):
     """Validate the posted config, create a run dir, and launch the worker."""
     global _REPORTER, _WORKER, _RUN_DIR
@@ -240,8 +303,37 @@ def _start_run(body):
         pick_mode = "manual" if (body.get("pick_mode") == "manual") else "auto"
         module = (body.get("module") or "bulk_rna_seq").strip() or "bulk_rna_seq"
         star_in = body.get("star") or {}
-        _sk = ("GENOME_DIR", "SJDB_GTF", "STAR_INDEX_ROOT", "ORGANISM", "THREADS", "MEM_MB", "WALL")
+        _sk = ("GENOME_DIR", "SJDB_GTF", "STAR_INDEX_ROOT", "ORGANISM", "THREADS", "MEM_MB", "WALL", "DELETE_FASTQ_AFTER_BAM")
         star_cfg = {k: str(star_in.get(k)).strip() for k in _sk if str(star_in.get(k) or "").strip()} or None
+        bed_in = body.get("bed") or {}
+        _bk = ("ALTANALYZE_DIR", "SPECIES", "ORGANISM", "MEM_MB", "WALL", "enabled", "BED_MODE", "DELETE_BAM_AFTER_BED")
+        bed_cfg = {k: str(bed_in.get(k)).strip() for k in _bk if str(bed_in.get(k) or "").strip()} or None
+        psi_in = body.get("psi") or {}
+        _pk = ("ALTANALYZE_HOME", "ALTANALYZE_DB", "ALTANALYZE_LOCAL", "SPECIES", "ORGANISM", "EXPNAME",
+               "MEM_MB", "WALL", "RUN_GOELITE", "enabled")
+        psi_cfg = {k: str(psi_in.get(k)).strip() for k in _pk if str(psi_in.get(k) or "").strip()} or None
+        # user-defined comparison groups (Phase B): [{name, control?, match:[...]}, ...] + compared pair
+        group_in = body.get("groups") if isinstance(body.get("groups"), dict) else None
+        group_cfg = group_in or None
+        # phase range: validate start/end against the canonical stage order + check supplied inputs exist
+        _order = [k for k, _ in progress.STAGES]
+        start_stage = (body.get("start_stage") or "fetch").strip() or "fetch"
+        end_stage = (body.get("end_stage") or "psi_submit").strip() or "psi_submit"
+        if start_stage not in _order or end_stage not in _order:
+            return 400, {"error": "unknown start/end stage"}
+        if _order.index(start_stage) > _order.index(end_stage):
+            return 400, {"error": "start stage is after end stage"}
+        supplied_inputs = body.get("supplied_inputs") if isinstance(body.get("supplied_inputs"), dict) else {}
+        _scp = next((c for c in progress.CHECKPOINTS if c["stage"] == start_stage), None)
+        if _scp:
+            for _spec in _scp.get("inputs", []):
+                _p = str(supplied_inputs.get(_spec["field"]) or "").strip()
+                if not _p:
+                    if _spec.get("optional"):
+                        continue
+                    return self._send_json(400, {"error": "start at '%s' needs %s" % (_scp["label"], _spec["label"])})
+                if not os.path.exists(os.path.expanduser(_p)):
+                    return self._send_json(400, {"error": "supplied path not found: %s" % _p})
         try:
             concurrency = max(1, min(99, int(body.get("concurrency", 8))))
         except Exception:
@@ -274,9 +366,42 @@ def _start_run(body):
             cluster_cfg = {k: str(cluster_in.get(k)).strip()
                            for k in keys if str(cluster_in.get(k) or "").strip()}
             cluster_cfg.setdefault("JOB_TAG", _INSTANCE_TAG)   # auto per-instance tag if left blank
+            # boundary check: these flow into remote ssh/bsub command lines + the generated config.sh
+            _bad = _reject_shell_meta(
+                [("Cluster PIPELINE_ROOT", cluster_cfg.get("PIPELINE_ROOT")),
+                 ("Job tag", cluster_cfg.get("JOB_TAG")),
+                 ("LSF queue", cluster_cfg.get("LSF_QUEUE")),
+                 ("Scratch dir", cluster_cfg.get("SCRATCH_DIR")),
+                 ("SRA toolkit module", cluster_cfg.get("SRATOOLKIT_MODULE")),
+                 ("Aspera module", cluster_cfg.get("ASPERA_MODULE")),
+                 ("SSH host", cluster_cfg.get("ssh_host")),
+                 ("SSH user", cluster_cfg.get("ssh_user")),
+                 ("SSH key path", cluster_cfg.get("ssh_key"))]
+                + [("STAR " + k, (star_cfg or {}).get(k)) for k in ("GENOME_DIR", "STAR_INDEX_ROOT", "ORGANISM")]
+                + [("BED " + k, (bed_cfg or {}).get(k)) for k in ("ALTANALYZE_DIR", "SPECIES", "ORGANISM")]
+                + [("PSI " + k, (psi_cfg or {}).get(k)) for k in ("ALTANALYZE_HOME", "ALTANALYZE_DB", "SPECIES", "ORGANISM", "EXPNAME")])
+            if _bad:
+                return _bad
             pw = body.get("ssh_password") or ""      # secret -> memory for the run; saved only if remembered
             if pw:
                 secrets["ssh_password"] = pw
+
+        # The STAR/BED/PSI "also run" checkboxes are AUTHORITATIVE for the analysis chain: when the phase
+        # range already reaches that chain (end >= star_submit), a TICKED trailing stage EXTENDS end_stage
+        # to include it (never shrinks). Without this, a stale saved end_stage (e.g. "bed_submit" from
+        # before the PSI stage existed) silently skips PSI even with its box ticked. A run that ends BEFORE
+        # the chain (download-only / stop-at-STAR via the slider) is untouched; uncheck a box to stop earlier.
+        if module == "bulk_rna_seq" and cluster_mode != "off" and end_stage in ("star_submit", "bed_submit", "psi_submit"):
+            _bed_en = str((bed_cfg or {}).get("enabled", "1")).lower() not in ("0", "off", "false", "no")
+            _psi_en = str((psi_cfg or {}).get("enabled", "1")).lower() not in ("0", "off", "false", "no")
+            _target = end_stage
+            if _bed_en and _order.index("bed_submit") > _order.index(_target):
+                _target = "bed_submit"
+            if _psi_en and _order.index("psi_submit") > _order.index(_target):
+                _target = "psi_submit"
+            if _order.index(_target) > _order.index(end_stage):
+                print(f"  PHASE RANGE: end '{end_stage}' -> '{_target}' (enabled analysis toggles extend the range)")
+                end_stage = _target
 
         _save_settings(body)   # remember these inputs locally for the next launch
 
@@ -289,7 +414,9 @@ def _start_run(body):
                                  module=module,
                                  concurrency=concurrency, run_dir=P.run_dir, skip_ai=skip_ai,
                                  deep_dive=deep_dive, pick_mode=pick_mode,
-                                 cluster_mode=cluster_mode, cluster_cfg=cluster_cfg, star_cfg=star_cfg)
+                                 cluster_mode=cluster_mode, cluster_cfg=cluster_cfg, star_cfg=star_cfg,
+                                 bed_cfg=bed_cfg, psi_cfg=psi_cfg, group_cfg=group_cfg,
+                                 start_stage=start_stage, end_stage=end_stage, supplied_inputs=supplied_inputs)
         # config.json mirrors the CLI (ncbi_key + cluster_cfg stored; Anthropic key + SSH password NOT)
         json.dump(asdict(cfg), open(P.config, "w", encoding="utf-8"), indent=2)
 
@@ -321,20 +448,57 @@ def _load_settings():
         return {}
 
 
+# The live cluster password is NEVER served over HTTP (it's not even persisted anymore).
+_NEVER_SERVE_KEYS = ("ssh_password",)
+# API/NCBI keys are withheld ONLY on a non-loopback (token) bind — don't push them across the network
+# even to a token holder. On the default 127.0.0.1 bind they ARE served so the UI prefills: the keys
+# already live in the local plaintext settings file, so loopback HTTP adds no exposure beyond that.
+_NETWORK_SECRET_KEYS = ("api_keys", "api_key", "ncbi_key")
+
+
+def _public_settings():
+    """Saved settings for UI prefill. Always strips the live SSH password; on a non-loopback bind also
+    strips the API/NCBI keys (the token gate is the protection there). On loopback the keys are served
+    so the form prefills exactly as before."""
+    s = dict(_load_settings())
+    strip = list(_NEVER_SERVE_KEYS)
+    if _AUTH_TOKEN:            # non-loopback bind -> also withhold API/NCBI keys from the network
+        strip += list(_NETWORK_SECRET_KEYS)
+    for k in strip:
+        s.pop(k, None)
+    if isinstance(s.get("cluster"), dict):
+        s["cluster"] = {k: v for k, v in s["cluster"].items() if k != "ssh_password"}
+    return s
+
+
 def _save_settings(body):
-    """Persist form inputs locally so they prefill next launch. NOTE: plaintext on this machine —
-    includes the Anthropic key, NCBI key, and any SSH password, at ~/.geo_pipeline_settings.json."""
+    """Persist form inputs locally so they prefill next launch. The SSH password is NEVER written to
+    disk (it lives only in the in-memory secrets dict for the active run); the file is written 0600 +
+    atomically. API/NCBI keys are still persisted for prefill but are stripped from /api/settings."""
     keep = {k: body[k] for k in
             ("query", "scope", "cap", "skip_ai", "provider", "api_keys", "ncbi_key", "model",
              "base_url", "disable_reasoning", "module", "concurrency", "pick_mode", "cluster_mode",
-             "ssh_password") if k in body}
+             "start_stage", "end_stage") if k in body}
     if isinstance(body.get("cluster"), dict):
-        keep["cluster"] = body["cluster"]
+        keep["cluster"] = {k: v for k, v in body["cluster"].items() if k != "ssh_password"}
     if isinstance(body.get("star"), dict):
         keep["star"] = body["star"]
+    if isinstance(body.get("bed"), dict):
+        keep["bed"] = body["bed"]
+    if isinstance(body.get("psi"), dict):
+        keep["psi"] = body["psi"]
+    if isinstance(body.get("groups"), dict):
+        keep["groups"] = body["groups"]
     try:
-        with open(_settings_path(), "w", encoding="utf-8") as f:
+        p = _settings_path()
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(keep, f, indent=2)
+        try:
+            os.chmod(tmp, 0o600)
+        except Exception:
+            pass
+        os.replace(tmp, p)
     except Exception:
         pass
 
@@ -369,9 +533,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(404, {"error": "no run yet"})
         base = os.path.basename(name)
         path = None
+        run_real = os.path.realpath(run_dir)
         for sub in ("tables", "runtable"):       # search both output dirs by basename
-            cand = os.path.join(run_dir, sub, base)
-            if base and os.path.isfile(cand):
+            cand = os.path.realpath(os.path.join(run_dir, sub, base))
+            # containment guard (defense in depth beyond basename): never serve outside the run dir
+            if (base and os.path.isfile(cand)
+                    and os.path.commonpath([run_real, cand]) == run_real):
                 path = cand
                 break
         if not path:
@@ -420,15 +587,54 @@ class Handler(BaseHTTPRequestHandler):
                 + _html_attr(md) + "</pre></body></html>")
         self._send_html(html)
 
+    # -- access control --
+    def _token_ok(self):
+        """True if no token is required (loopback bind) OR the request carries the right token."""
+        if not _AUTH_TOKEN:
+            return True
+        tok = self.headers.get("X-Auth-Token") or ""
+        if not tok:
+            tok = parse_qs(urlparse(self.path).query).get("token", [""])[0]
+        return hmac.compare_digest(str(tok), _AUTH_TOKEN)
+
+    def _csrf_ok(self):
+        """Block browser CROSS-ORIGIN state-changing requests. A non-browser client (no Origin/Referer)
+        is not a CSRF vector and is allowed; a browser request is allowed only if its Origin host is
+        loopback or matches the Host we were reached on (same-origin)."""
+        origin = self.headers.get("Origin") or self.headers.get("Referer") or ""
+        if not origin:
+            return True
+        oh = _host_of(origin)
+        if oh in _LOOPBACK_HOSTS:
+            return True
+        return bool(oh) and oh == _host_of("//" + (self.headers.get("Host") or ""))
+
+    def _guard(self, csrf=False):
+        """Enforce token (non-loopback bind) and, for state changes, the CSRF origin check.
+        Returns True if the request may proceed; otherwise sends the error response and returns False."""
+        if not self._token_ok():
+            self._send_json(401, {"error": "missing or invalid auth token (see the SpliceScout console "
+                                            "banner for the URL that includes ?token=...)"})
+            return False
+        if csrf and not self._csrf_ok():
+            self._send_json(403, {"error": "cross-origin request blocked"})
+            return False
+        return True
+
     # -- routes --
     def do_GET(self):
         route = urlparse(self.path)
         if route.path in ("/", "/index.html"):
+            if not self._token_ok():
+                return self._send_json(401, {"error": "missing or invalid auth token — open the URL "
+                                                      "printed in the SpliceScout console (it includes ?token=...)"})
             return self._send_html(_page())
+        if route.path.startswith("/api/") and not self._token_ok():
+            return self._send_json(401, {"error": "missing or invalid auth token"})
         if route.path == "/api/status":
             return self._send_json(200, _status())
         if route.path == "/api/settings":
-            return self._send_json(200, _load_settings())
+            return self._send_json(200, _public_settings())
         if route.path == "/api/file":
             q = parse_qs(route.query)
             return self._send_file(q.get("name", [""])[0])
@@ -455,6 +661,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         route = urlparse(self.path)
+        if not self._guard(csrf=True):     # token (non-loopback) + CSRF origin check on every state change
+            return
         if route.path == "/api/start":
             try:
                 body = self._read_body()
@@ -553,19 +761,50 @@ class Handler(BaseHTTPRequestHandler):
                 fallback_root = (sc.get("PIPELINE_ROOT") or "").strip()
             status = cluster_deploy.remote_status(host, user, port, keyfile, password, job_tag, fallback_root)
             # if this run is the Bulk RNA-seq (STAR) module, also report STAR alignment progress
-            run_module = ""
+            run_module = ""; bed_mode = "intron"
             if run_dir:
                 try:
-                    run_module = json.load(open(Paths(run_dir).config, encoding="utf-8")).get("module") or ""
+                    _rcfg = json.load(open(Paths(run_dir).config, encoding="utf-8"))
+                    run_module = _rcfg.get("module") or ""
+                    bed_mode = (_rcfg.get("bed_cfg") or {}).get("BED_MODE") or "intron"
                 except Exception:
                     run_module = ""
             if run_module == "bulk_rna_seq" and status.get("ok"):
-                bam_out = (fallback_root.rstrip("/") + "/STAR_bams") if fallback_root else ""
+                # Self-discover BAM_OUT so the STAR/BED probes don't point at the BASE root (which omits
+                # the per-cell-line subfolder) after a restart or a STAR-start run -> progress would read
+                # 0/0. Order: the star bundle's own config.sh (most authoritative) > the root the download
+                # probe DISCOVERED from live job CWDs > the saved base root.
+                bam_out = ""
+                if run_dir:
+                    try:
+                        _scfg = os.path.join(Paths(run_dir).star_dir, "config.sh")
+                        _m = re.search(r'(?m)^BAM_OUT="?(.*?)"?\s*$', open(_scfg, encoding="utf-8").read())
+                        if _m and _m.group(1).strip():
+                            bam_out = _m.group(1).strip()
+                    except Exception:
+                        bam_out = ""
+                if not bam_out:
+                    _disc = (status.get("root") or "").strip()
+                    _base = _disc or fallback_root
+                    bam_out = (_base.rstrip("/") + "/STAR_bams") if _base else ""
                 try:
                     star = cluster_deploy.remote_star_status(host, user, port, keyfile, password,
                                                              f"{job_tag}_star", bam_out)
                     if star and star.get("ok"):
                         status["star"] = star
+                        # once STAR is done, also report the BAM->BED stage (avoids noise while STAR runs)
+                        if star.get("complete") and bam_out:
+                            bed = cluster_deploy.remote_bed_status(host, user, port, keyfile, password,
+                                                                   f"{job_tag}_star_bed", bam_out, bed_mode)
+                            if bed and bed.get("ok"):
+                                status["bed"] = bed
+                                # once BED is done, also report the AltAnalyze (PSI) stage
+                                if bed.get("complete"):
+                                    psi_root = bam_out.rstrip("/").rsplit("/", 1)[0] + "/psi"
+                                    psi = cluster_deploy.remote_psi_status(host, user, port, keyfile, password,
+                                                                           f"{job_tag}_psi", psi_root)
+                                    if psi and psi.get("ok"):
+                                        status["psi"] = psi
                 except Exception:
                     pass
             return self._send_json(200, status)
@@ -585,8 +824,9 @@ def _page():
     return (PAGE.replace("__DEFAULT_QUERY__", _html_attr(pipeline.DEFAULT_QUERY))
                 .replace("__LLM_CONFIG__", json.dumps(llm_cfg))
                 .replace("__INSTANCE_TAG__", _html_attr(_INSTANCE_TAG))
-                .replace("__INSTANCE_SLOT__", str(_INSTANCE_SLOT or 1))
-                .replace("__STAGE_DOCS__", json.dumps(stage_docs.STAGE_DOCS)))
+                .replace("__CHECKPOINTS__", json.dumps(progress.CHECKPOINTS))
+                .replace("__STAGE_DOCS__", json.dumps(stage_docs.STAGE_DOCS))
+                .replace("__AUTH_TOKEN__", _html_attr(_AUTH_TOKEN)))
 
 
 def _html_attr(s):
@@ -595,29 +835,44 @@ def _html_attr(s):
 
 
 def main():
-    global _INSTANCE_SLOT, _INSTANCE_TAG, _INSTANCE_LOCK_PATH
+    global _INSTANCE_TAG, _INSTANCE_LOCK_PATH, _AUTH_TOKEN
     ap = argparse.ArgumentParser(description="Web front end for the GEO RNA-seq pipeline")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--no-open", action="store_true", help="don't auto-open a browser")
+    ap.add_argument("--instance", default="",
+                    help="instance name -> cluster JOB_TAG (else $SPLICESCOUT_INSTANCE, else auto sraN)")
     a = ap.parse_args()
+
+    # Non-loopback bind (e.g. --host 0.0.0.0 / a LAN IP) exposes a remote-control plane (/api/start
+    # launches cluster runs). Require a random per-startup token on EVERY request so the LAN can't drive
+    # it unauthenticated. Loopback bind keeps the no-token UX (only the CSRF origin check applies).
+    if _host_of("//" + (a.host or "")) not in _LOOPBACK_HOSTS:
+        _AUTH_TOKEN = pysecrets.token_urlsafe(24)
 
     # serve relative to this script so runs/ lands next to the pipeline code
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
-    # claim this instance's slot -> sra1 / sra2 / sra3 ... (released on exit; dead slots reclaimed)
-    _INSTANCE_SLOT, _INSTANCE_LOCK_PATH = _claim_instance_slot()
-    _INSTANCE_TAG = f"sra{_INSTANCE_SLOT}"
+    # claim this instance's identity -> the name from the launcher ($SPLICESCOUT_INSTANCE / --instance),
+    # else the lowest free sra1 / sra2 / sra3 ... (released on exit; a dead instance's tag is reclaimed)
+    preferred = (a.instance or "").strip() or _resolve_instance_name()
+    _INSTANCE_TAG, _INSTANCE_LOCK_PATH = _claim_instance_slot(preferred)
     atexit.register(_release_instance_slot)
 
     # auto-pick a free port so EVERY launch starts its own instance (run concurrent projects)
     httpd, port = _bind_server(a.host, a.port)
     url = f"http://{a.host if a.host != '0.0.0.0' else '127.0.0.1'}:{port}/"
-    print(f"GEO RNA-seq pipeline UI  (instance #{_INSTANCE_SLOT}, cluster JOB_TAG \"{_INSTANCE_TAG}\")  ->  {url}")
+    if _AUTH_TOKEN:
+        url = f"{url}?token={_AUTH_TOKEN}"
+    print(f"GEO RNA-seq pipeline UI  (cluster JOB_TAG \"{_INSTANCE_TAG}\")  ->  {url}")
+    if _AUTH_TOKEN:
+        print("   *** NON-LOOPBACK BIND: this is an UNAUTHENTICATED cluster-control plane without the")
+        print("   *** token above. Open EXACTLY the URL printed here (it carries ?token=...); anyone on")
+        print("   *** the network who lacks the token is refused. Prefer the default 127.0.0.1 bind.")
     if port != a.port:
         print(f"   (port {a.port} was busy -> using {port})")
     print("   Launch this again any time to run a concurrent project — each instance gets its own")
-    print("   port and its own cluster JOB_TAG (sra1, sra2, sra3, ...).")
+    print("   port and its own cluster JOB_TAG (the name you choose, or an auto sra1/sra2/...).")
     print("Press Ctrl+C to stop.")
     if not a.no_open:
         try:
@@ -775,12 +1030,27 @@ PAGE = r"""<!DOCTYPE html>
   /* page footer */
   .pagefoot{color:var(--mut);font-size:12.5px;margin-top:28px;padding-top:14px;border-top:1px solid var(--line)}
   .pagefoot a{color:var(--accent);text-decoration:none} .pagefoot a:hover{text-decoration:underline}
+  /* pipeline phase-range slider (left rail) */
+  .setupgrid{display:grid;grid-template-columns:176px 1fr;gap:22px;align-items:start}
+  @media(max-width:760px){.setupgrid{grid-template-columns:1fr}#phaserail{display:none}}
+  #phaserail{position:sticky;top:18px;padding:12px 10px;border:1px solid var(--line);border-radius:10px;background:var(--panel2)}
+  .raillbl{font-size:11px;color:var(--mut);text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px;text-align:center}
+  .railwrap{display:flex;gap:10px;padding:9px 2px 9px 9px}
+  .railtrack{position:relative;width:8px;border-radius:6px;background:var(--line);flex:none}
+  .railfill{position:absolute;left:0;right:0;background:linear-gradient(180deg,var(--accent),var(--accent2));border-radius:6px}
+  .railhandle{position:absolute;left:4px;width:18px;height:18px;margin-left:-9px;margin-top:-9px;border-radius:50%;background:var(--accent);border:2px solid #fff;cursor:grab;touch-action:none;box-shadow:0 1px 5px rgba(0,0,0,.55);z-index:2}
+  .railhandle:active{cursor:grabbing}
+  .raillabels{position:relative;flex:1}
+  .railtick{position:absolute;left:0;font-size:11.5px;line-height:1.1;color:var(--mut);white-space:nowrap;cursor:pointer;transform:translateY(-50%)}
+  .railtick.inrange{color:var(--txt)}
+  .railtick.edge{color:var(--accent);font-weight:600}
+  #startInputs .startinput{margin-top:8px}
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
-    <h1>GEO RNA-seq Pipeline <span class="ibadge" title="This instance's number and its cluster JOB_TAG. Launch the program again for a concurrent project — it gets the next free tag (sra1, sra2, ...).">instance __INSTANCE_SLOT__ &middot; JOB_TAG __INSTANCE_TAG__</span></h1>
+    <h1>GEO RNA-seq Pipeline <span class="ibadge" title="This instance's cluster JOB_TAG — the instance name you chose at launch (or an auto sra1/sra2/... if you left it blank). It namespaces this project's LSF jobs so concurrent projects never collide.">JOB_TAG __INSTANCE_TAG__</span></h1>
     <p>Submit an NCBI GEO search and get cleaned, splicing-amenable, cell-line-grouped compound tables.</p>
   </header>
 
@@ -792,6 +1062,20 @@ PAGE = r"""<!DOCTYPE html>
   <div id="runtab">
   <!-- SETUP -->
   <section id="setup" class="card">
+    <div class="setupgrid">
+      <aside id="phaserail">
+        <div class="raillbl">Pipeline range</div>
+        <div class="railwrap">
+          <div id="railTrack" class="railtrack">
+            <div id="railFill" class="railfill"></div>
+            <div id="railStart" class="railhandle" data-h="start" title="START — first phase to run"></div>
+            <div id="railEnd" class="railhandle" data-h="end" title="END — last phase to run"></div>
+          </div>
+          <div id="railLabels" class="raillabels"></div>
+        </div>
+        <div class="hint" style="margin-top:10px">Drag the two handles to run only part of the pipeline. Phases above START are skipped (supply their output at right); phases below END don't run.</div>
+      </aside>
+      <div class="setupmain">
     <div id="clusterCheck" hidden style="margin-bottom:16px;padding:12px 14px;border:1px solid var(--line);border-radius:10px;background:var(--panel2)">
       <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
         <span class="hint" style="margin:0">Cluster jobs from a previous launch of this instance still running? Check without starting a new run.</span>
@@ -800,6 +1084,7 @@ PAGE = r"""<!DOCTYPE html>
       <div id="clusterstatus2" style="margin-top:10px"></div>
     </div>
     <form id="form">
+      <div class="fld" id="startInputs" hidden></div>
       <label class="fld">
         <span class="lbl">NCBI GEO search query</span>
         <textarea id="query" spellcheck="false">__DEFAULT_QUERY__</textarea>
@@ -867,6 +1152,50 @@ PAGE = r"""<!DOCTYPE html>
               <input type="text" id="star_wall" placeholder="wall (24:00)">
             </div>
           </details>
+          <label class="sel" style="display:block;margin-top:10px"><input type="checkbox" id="bed_enable" checked> Then convert BAMs &rarr; AltAnalyze junction/exon BEDs (the BAM&rarr;BED stage, after STAR)</label>
+          <div class="hint">Runs automatically once STAR finishes. The AltAnalyze BAM&rarr;BED scripts + exon reference are shipped with the bundle, so the cluster needs no AltAnalyze install (just the stock python/2.7.5 + samtools modules).</div>
+          <details class="adv" style="margin-top:8px"><summary>BAM&rarr;BED options</summary>
+            <div class="row" style="margin-top:8px">
+              <input type="text" id="bed_species" placeholder="species (blank = auto from organism: Hs/Mm/Rn/Dr/Ss/Ma)" autocomplete="off">
+              <input type="number" id="bed_mem" placeholder="mem MB (32000)" min="1000">
+              <input type="text" id="bed_wall" placeholder="wall (16:00)">
+            </div>
+            <div class="scope" id="bedmodesel" style="margin-top:8px">
+              <label class="sel"><input type="radio" name="bedmode" value="intron" checked> Intron-retention (__intronJunction.bed)</label>
+              <label><input type="radio" name="bedmode" value="exon"> Exon counts (__exon.bed)</label>
+              <label><input type="radio" name="bedmode" value="both"> Both</label>
+            </div>
+            <div class="hint">__junction.bed is always produced; this picks the BAMtoExonBED pass. Default is intron-retention (AltAnalyze's own default).</div>
+          </details>
+          <label class="sel" style="display:block;margin-top:10px"><input type="checkbox" id="psi_enable" checked> Then run AltAnalyze splicing (PSI) on the BEDs (the analysis stage, after BAM&rarr;BED)</label>
+          <div class="hint">Runs one AltAnalyze job over all the BEDs once BAM&rarr;BED finishes &mdash; a per-sample PSI table, plus a differential (dPSI) comparison when a 2-group split exists. AltAnalyze is found on the cluster (default the lab install) or uploaded only if it isn't there.</div>
+          <details class="adv" style="margin-top:8px"><summary>AltAnalyze (PSI) options</summary>
+            <div class="row" style="margin-top:8px">
+              <input type="text" id="psi_home" placeholder="AltAnalyze home on cluster (blank = /data/salomonis2/software/AltAnalyze-91/AltAnalyze)" autocomplete="off">
+              <input type="text" id="psi_db" placeholder="AltDatabase path (blank = inside AltAnalyze home)" autocomplete="off">
+            </div>
+            <div class="row" style="margin-top:8px">
+              <input type="text" id="psi_local" placeholder="local AltAnalyze dir to upload ONLY if not found on cluster (optional)" autocomplete="off">
+              <input type="text" id="psi_species" placeholder="species (blank = auto: Hs/Mm/Rn/Dr/Ss/Ma)" autocomplete="off">
+            </div>
+            <div class="row" style="margin-top:8px">
+              <input type="text" id="psi_expname" placeholder="experiment name (blank = cell line)" autocomplete="off">
+              <input type="number" id="psi_mem" placeholder="mem MB (128000)" min="1000">
+              <input type="text" id="psi_wall" placeholder="wall (10:00)">
+            </div>
+            <label class="sel" style="display:block;margin-top:8px"><input type="checkbox" id="psi_goelite"> Also run GO-Elite enrichment (needs the GO-Elite DB + R; only when a comparison runs)</label>
+            <div class="hint">AltAnalyze runs as Python 2.7 + samtools + R on the cluster. Comparison groups default to the run table's treated-vs-control split.</div>
+          </details>
+          <details class="adv" style="margin-top:8px"><summary>Comparison groups (optional &mdash; define your own)</summary>
+            <div class="hint">Leave empty to auto-compare <b>drug-treated vs control</b> from the run-table metadata. To compare your OWN categories, add 2+ groups: a name, optional match keywords (comma-separated), and mark one as the control/baseline. Each sample is sorted by those keywords first, then the AI handles the rest from the full metadata row; samples that match no group are dropped from the comparison (the per-sample PSI table still covers everyone).</div>
+            <div id="psigroups" style="margin-top:8px"></div>
+            <button type="button" id="psi_addgroup" style="margin-top:6px;padding:4px 10px;cursor:pointer">+ Add group</button>
+          </details>
+          <div style="margin-top:12px">
+            <div class="lbl" style="margin-bottom:4px">Disk cleanup</div>
+            <label class="sel" style="display:block"><input type="checkbox" id="del_fastq" checked> Delete FASTQs after they're aligned &mdash; frees disk (re-alignment would need a re-download)</label>
+            <label class="sel" style="display:block;margin-top:6px"><input type="checkbox" id="del_bam"> Delete BAMs after they're converted to BEDs &mdash; frees more disk (re-making BEDs would need re-alignment)</label>
+          </div>
         </div>
       </label>
 
@@ -917,7 +1246,7 @@ PAGE = r"""<!DOCTYPE html>
               <input type="number" id="clmem" placeholder="MEM_MB (32000)">
               <input type="text" id="clwall" placeholder="WALL (50:00)">
               <input type="number" id="clpfmem" placeholder="PREFETCH_MEM_MB (132000)">
-              <input type="text" id="cljob" value="__INSTANCE_TAG__" placeholder="JOB_TAG (auto per instance)" title="LSF job-name prefix. Auto-set to this instance's tag (sra1, sra2, ...) so concurrent projects' cluster jobs never collide. Edit if you want a custom tag." autocomplete="off">
+              <input type="text" id="cljob" value="__INSTANCE_TAG__" placeholder="JOB_TAG (auto per instance)" title="LSF job-name prefix. Defaults to this instance's name (the one you chose at launch, or an auto sra1/sra2/... if you left it blank) so concurrent projects' cluster jobs never collide. Edit if you want a different tag." autocomplete="off">
             </div>
           </details>
         </div>
@@ -941,6 +1270,8 @@ PAGE = r"""<!DOCTYPE html>
       <button type="submit" class="primary" id="start">Start pipeline</button>
       <div class="err" id="formErr" hidden></div>
     </form>
+      </div><!-- /setupmain -->
+    </div><!-- /setupgrid -->
   </section>
 
   <!-- RUN -->
@@ -1015,10 +1346,23 @@ document.querySelectorAll('#examples .chip').forEach(c =>
 const skipEl=$('#skip'), akeyEl=$('#akey');
 skipEl.addEventListener('change', ()=>{ akeyEl.disabled = skipEl.checked; akeyEl.style.opacity = skipEl.checked?.5:1; });
 
+// On a non-loopback bind the server requires a per-startup token on every request. It is embedded
+// here (the page was only served because the request already proved it has the token) and attached to
+// EVERY fetch via X-Auth-Token, so all the existing fetch() call sites keep working unchanged.
+const AUTH_TOKEN = "__AUTH_TOKEN__";
+if (AUTH_TOKEN) {
+  const _origFetch = window.fetch.bind(window);
+  window.fetch = (u, o) => {
+    o = o || {};
+    o.headers = Object.assign({}, o.headers || {}, {"X-Auth-Token": AUTH_TOKEN});
+    return _origFetch(u, o);
+  };
+}
+
 // AI provider + model + per-provider key memory
 const LLM = __LLM_CONFIG__;
 const STAGE_DOCS = __STAGE_DOCS__;
-const INSTANCE_TAG = "__INSTANCE_TAG__";   // this server instance's cluster JOB_TAG (sra1/sra2/...)
+const INSTANCE_TAG = "__INSTANCE_TAG__";   // this server instance's cluster JOB_TAG (name chosen at launch, else sra1/sra2/...)
 const providerEl=$('#provider'), modelEl=$('#model'), keyhintEl=$('#keyhint');
 let savedKeys = {};
 function rebuildModels(p){
@@ -1048,6 +1392,88 @@ function syncModule(){
   const b=$('#lblBulkRna'); if(b) b.classList.toggle('sel', m==='bulk_rna_seq');
 }
 $('#modulesel').addEventListener('change', syncModule); syncModule();
+
+function syncBedMode(){
+  const m=(document.querySelector('input[name=bedmode]:checked')||{}).value||'intron';
+  document.querySelectorAll('#bedmodesel label').forEach(l=>{const i=l.querySelector('input'); if(i) l.classList.toggle('sel', i.value===m);});
+}
+if($('#bedmodesel')) $('#bedmodesel').addEventListener('change', syncBedMode);
+syncBedMode();
+
+// ----- AltAnalyze comparison-groups editor (Phase B) -----
+function addGroupRow(name, keywords, control){
+  const host=$('#psigroups'); if(!host) return;
+  const d=document.createElement('div'); d.className='row psigrp'; d.style.marginTop='6px';
+  d.innerHTML='<input type="text" class="pg_name" placeholder="group name (e.g. control)" autocomplete="off">'+
+    '<input type="text" class="pg_kw" placeholder="match keywords, comma-separated (e.g. dmso, vehicle)" autocomplete="off">'+
+    '<label class="sel" style="white-space:nowrap"><input type="radio" name="pg_control"> baseline</label>'+
+    '<button type="button" class="pg_rm" style="padding:2px 8px;cursor:pointer">&times;</button>';
+  host.appendChild(d);
+  if(name!=null) d.querySelector('.pg_name').value=name;
+  if(keywords!=null) d.querySelector('.pg_kw').value=keywords;
+  if(control) d.querySelector('.pg_control').checked=true;
+  d.querySelector('.pg_rm').addEventListener('click', ()=>d.remove());
+}
+function collectGroups(){
+  const out=[];
+  document.querySelectorAll('#psigroups .psigrp').forEach(d=>{
+    const name=((d.querySelector('.pg_name')||{}).value||'').trim(); if(!name) return;
+    const kw=(((d.querySelector('.pg_kw')||{}).value||'').split(',')).map(s=>s.trim()).filter(Boolean);
+    const ctrl=!!(d.querySelector('.pg_control')&&d.querySelector('.pg_control').checked);
+    out.push({name:name, control:ctrl, keywords:kw});
+  });
+  return out;
+}
+if($('#psi_addgroup')) $('#psi_addgroup').addEventListener('click', ()=>addGroupRow());
+
+// ----- pipeline phase-range slider (vertical dual-handle) -----
+const CHECKPOINTS = __CHECKPOINTS__;
+let startIdx = 0, endIdx = Math.max(0, CHECKPOINTS.length - 1);
+const RAIL_H = Math.max(150, CHECKPOINTS.length * 32);
+function _railTop(i){ return Math.round((CHECKPOINTS.length < 2 ? 0 : i/(CHECKPOINTS.length-1)) * RAIL_H); }
+function renderStartInputs(){
+  const box = $('#startInputs'); if(!box) return;
+  const cp = CHECKPOINTS[startIdx], ins = (cp && cp.inputs) || [];
+  if(startIdx === 0 || !ins.length){ box.innerHTML=''; box.hidden=true; return; }
+  box.hidden=false;
+  let h = '<span class="lbl">Start at "'+cp.label+'" — supply what the skipped phases would have produced</span>';
+  ins.forEach(sp=>{
+    const ph = sp.label + (sp.optional?' (optional)':'') + ' — absolute path on this machine' + (sp.kind==='dir'?' (folder)':'');
+    h += '<input type="text" class="startinput" data-field="'+sp.field+'" placeholder="'+ph+'" autocomplete="off" spellcheck="false">';
+    h += '<div class="hint">'+sp.desc+'</div>';
+  });
+  box.innerHTML = h;
+}
+function collectStartInputs(){
+  const o = {};
+  document.querySelectorAll('#startInputs .startinput').forEach(el=>{ const v=(el.value||'').trim(); if(v) o[el.dataset.field]=v; });
+  return o;
+}
+function renderPhaseRail(){
+  const track = $('#railTrack'); if(!track) return;
+  const labels = $('#railLabels');
+  track.style.height = RAIL_H+'px'; labels.style.height = RAIL_H+'px';
+  $('#railStart').style.top = _railTop(startIdx)+'px';
+  $('#railEnd').style.top = _railTop(endIdx)+'px';
+  const f = $('#railFill'); f.style.top = _railTop(startIdx)+'px'; f.style.height = (_railTop(endIdx)-_railTop(startIdx))+'px';
+  labels.innerHTML = '';
+  CHECKPOINTS.forEach((c,i)=>{
+    const d = document.createElement('div');
+    d.className = 'railtick' + ((i>=startIdx && i<=endIdx)?' inrange':'') + ((i===startIdx||i===endIdx)?' edge':'');
+    d.style.top = _railTop(i)+'px'; d.textContent = c.label;
+    d.onclick = ()=>{ if(Math.abs(i-startIdx) <= Math.abs(i-endIdx)) startIdx=Math.min(i,endIdx); else endIdx=Math.max(i,startIdx); renderPhaseRail(); };
+    labels.appendChild(d);
+  });
+  renderStartInputs();
+}
+(function wireRail(){
+  let dragH = null;
+  function pick(clientY){ const r=$('#railTrack').getBoundingClientRect(); let fr=(clientY-r.top)/r.height; fr=Math.max(0,Math.min(1,fr)); return Math.round(fr*(CHECKPOINTS.length-1)); }
+  function move(e){ if(!dragH) return; const y=(e.touches?e.touches[0].clientY:e.clientY); const i=pick(y); if(dragH==='start') startIdx=Math.min(i,endIdx); else endIdx=Math.max(i,startIdx); renderPhaseRail(); e.preventDefault(); }
+  function up(){ dragH=null; document.removeEventListener('pointermove',move); document.removeEventListener('pointerup',up); }
+  ['railStart','railEnd'].forEach(id=>{ const h=$('#'+id); if(!h) return; h.addEventListener('pointerdown',e=>{ dragH=h.dataset.h; document.addEventListener('pointermove',move); document.addEventListener('pointerup',up); e.preventDefault(); }); });
+})();
+renderPhaseRail();
 
 // cluster section
 function syncClusterMode(){
@@ -1080,12 +1506,26 @@ $('#form').addEventListener('submit', async e=>{
     disable_reasoning: (($('#noreason')||{}).checked || false),
     concurrency: $('#conc').value,
     deep_dive: true,
+    start_stage: ((CHECKPOINTS[startIdx]||{}).stage || 'fetch'),
+    end_stage: ((CHECKPOINTS[endIdx]||{}).end_stage || 'bed_submit'),
+    supplied_inputs: collectStartInputs(),
     pick_mode: document.querySelector('input[name=pick]:checked').value,
     module: (document.querySelector('input[name=module]:checked')||{}).value || 'bulk_rna_seq',
     star: { GENOME_DIR:(($('#star_genome')||{}).value||''), ORGANISM:(($('#star_org')||{}).value||''),
             SJDB_GTF:(($('#star_gtf')||{}).value||''), STAR_INDEX_ROOT:(($('#star_indexroot')||{}).value||''),
             THREADS:(($('#star_threads')||{}).value||''), MEM_MB:(($('#star_mem')||{}).value||''),
-            WALL:(($('#star_wall')||{}).value||'') },
+            WALL:(($('#star_wall')||{}).value||''),
+            DELETE_FASTQ_AFTER_BAM:((($('#del_fastq')||{}).checked)?'1':'0') },
+    bed: { SPECIES:(($('#bed_species')||{}).value||''), MEM_MB:(($('#bed_mem')||{}).value||''),
+           WALL:(($('#bed_wall')||{}).value||''), enabled:((($('#bed_enable')||{}).checked)?'1':'0'),
+           BED_MODE:((document.querySelector('input[name=bedmode]:checked')||{}).value||'intron'),
+           DELETE_BAM_AFTER_BED:((($('#del_bam')||{}).checked)?'1':'0') },
+    psi: { enabled:((($('#psi_enable')||{}).checked)?'1':'0'),
+           ALTANALYZE_HOME:(($('#psi_home')||{}).value||''), ALTANALYZE_DB:(($('#psi_db')||{}).value||''),
+           ALTANALYZE_LOCAL:(($('#psi_local')||{}).value||''), SPECIES:(($('#psi_species')||{}).value||''),
+           EXPNAME:(($('#psi_expname')||{}).value||''), MEM_MB:(($('#psi_mem')||{}).value||''),
+           WALL:(($('#psi_wall')||{}).value||''), RUN_GOELITE:((($('#psi_goelite')||{}).checked)?'1':'0') },
+    groups: { groups: (typeof collectGroups==='function'?collectGroups():[]) },
     cluster_mode: document.querySelector('input[name=clmode]:checked').value,
     cluster: {
       PIPELINE_ROOT: $('#clroot').value, SCRATCH_DIR: $('#clscratch').value,
@@ -1607,6 +2047,17 @@ function renderClusterStatus(d, panelId){
        + (s.live_jobs!=null?' &middot; '+s.live_jobs+' jobs':'')
        + (s.eta_seconds!=null&&!s.complete?' &middot; ~'+fmtDur(s.eta_seconds)+' left':'') + '</div>';
   }
+  if(d.bed){
+    const b=d.bed, bo=b.overall||{};
+    const bphase = b.complete ? '✓ BAM&rarr;BED complete'
+      : b.stalled ? '⚠ BAM&rarr;BED stalled'
+      : b.launch_pending ? 'BAM&rarr;BED queued — waiting for STAR'
+      : 'BAM&rarr;BED converting';
+    h += '<div class="banner '+(b.complete?'ok':(b.stalled?'err':'pick'))+'" style="margin-top:6px">'
+       + bphase + (bo.exp?' &mdash; '+bo.done+' / '+bo.exp+' BED pairs ('+bo.pct+'%)':'')
+       + (b.live_jobs!=null?' &middot; '+b.live_jobs+' jobs':'')
+       + (b.eta_seconds!=null&&!b.complete?' &middot; ~'+fmtDur(b.eta_seconds)+' left':'') + '</div>';
+  }
   if(ov.exp){ h+='<div class="obar" title="solid = converted, faint = downloaded" style="margin-bottom:4px;position:relative">'
     + '<span style="width:'+(ov.dl_pct||0)+'%;opacity:.30"></span>'
     + '<span style="width:'+(ov.pct||0)+'%;position:absolute;left:1px;top:0"></span></div>'
@@ -1661,6 +2112,24 @@ function applySettings(s){
   setVal('star_genome', st.GENOME_DIR); setVal('star_org', st.ORGANISM); setVal('star_gtf', st.SJDB_GTF);
   setVal('star_indexroot', st.STAR_INDEX_ROOT); setVal('star_threads', st.THREADS);
   setVal('star_mem', st.MEM_MB); setVal('star_wall', st.WALL);
+  if($('#del_fastq') && st.DELETE_FASTQ_AFTER_BAM!=null) $('#del_fastq').checked = (String(st.DELETE_FASTQ_AFTER_BAM)!=='0');
+  const bd=s.bed||{};
+  setVal('bed_species', bd.SPECIES); setVal('bed_mem', bd.MEM_MB); setVal('bed_wall', bd.WALL);
+  if($('#bed_enable') && bd.enabled!=null) $('#bed_enable').checked = (String(bd.enabled)!=='0');
+  if(bd.BED_MODE){ const r=document.querySelector('input[name=bedmode][value="'+bd.BED_MODE+'"]'); if(r) r.checked=true; }
+  if($('#del_bam') && bd.DELETE_BAM_AFTER_BED!=null) $('#del_bam').checked = (String(bd.DELETE_BAM_AFTER_BED)==='1');
+  if(typeof syncBedMode==='function') syncBedMode();
+  const ps=s.psi||{};
+  setVal('psi_home', ps.ALTANALYZE_HOME); setVal('psi_db', ps.ALTANALYZE_DB); setVal('psi_local', ps.ALTANALYZE_LOCAL);
+  setVal('psi_species', ps.SPECIES); setVal('psi_expname', ps.EXPNAME); setVal('psi_mem', ps.MEM_MB); setVal('psi_wall', ps.WALL);
+  if($('#psi_enable') && ps.enabled!=null) $('#psi_enable').checked = (String(ps.enabled)!=='0');
+  if($('#psi_goelite') && ps.RUN_GOELITE!=null) $('#psi_goelite').checked = (String(ps.RUN_GOELITE)==='1');
+  const pg=(s.groups&&s.groups.groups)||[];
+  if(pg.length && $('#psigroups') && typeof addGroupRow==='function'){ $('#psigroups').innerHTML='';
+    pg.forEach(g=>addGroupRow(g.name||'', (g.keywords||[]).join(', '), g.control)); }
+  if(s.start_stage && typeof CHECKPOINTS!=='undefined'){ const i=CHECKPOINTS.findIndex(c=>c.stage===s.start_stage); if(i>=0) startIdx=i; }
+  if(s.end_stage && typeof CHECKPOINTS!=='undefined'){ const i=CHECKPOINTS.findIndex(c=>c.end_stage===s.end_stage); if(i>=0) endIdx=i; }
+  if(typeof renderPhaseRail==='function') renderPhaseRail();
   if(s.cluster && (s.cluster.ssh_host||'').trim()) $('#clusterCheck').hidden=false;  // enable after-restart status check
   syncScope(); syncPick(); syncModule(); syncClusterMode();
 }

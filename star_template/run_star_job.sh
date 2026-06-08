@@ -114,6 +114,19 @@ if [ "$DO_STAGE" -eq 1 ]; then
 else
   echo "[star] $SAMPLE: not enough room to stage (~$((NEED + STAGE_HEADROOM_GB))G needed, ${WORKBASE_AVAIL}G free) -- reading direct; a resubmit retries any flaky read"
   R1="$FASTQ1"; R2="$FASTQ2"
+  # Integrity-check the source gz on the DIRECT path (the staged path already gzip -t's each copy). A
+  # truncated NFS read would otherwise feed STAR fewer reads -> a silently UNDER-ALIGNED BAM that then
+  # passes quickcheck and gets its source FASTQ deleted. Reads each file once; VERIFY_FASTQ_DIRECT=0 skips.
+  if [ "${VERIFY_FASTQ_DIRECT:-1}" = "1" ]; then
+    for _grp in "$R1" "$R2"; do
+      [ -n "$_grp" ] && [ "$_grp" != "NA" ] || continue
+      IFS=',' read -ra _vf <<< "$_grp"
+      for _f in ${_vf[@]+"${_vf[@]}"}; do
+        [ "$_f" = "NA" ] && continue
+        gzip -t "$_f" 2>/dev/null || { echo "[star] $SAMPLE: source FASTQ failed gzip -t ($_f) -- not aligning (safe to resubmit)" >&2; exit 1; }
+      done
+    done
+  fi
 fi
 READS="$R1"
 [ "$R2" != "NA" ] && [ -n "$R2" ] && READS="$R1 $R2"
@@ -160,10 +173,52 @@ if ! samtools quickcheck "$BAM_OUT/$SAMPLE.bam" 2>/dev/null; then
   cp -f "$BAM" "$BAM_OUT/$SAMPLE.bam"
   samtools quickcheck "$BAM_OUT/$SAMPLE.bam" 2>/dev/null || { echo "[star] $SAMPLE: BAM publish FAILED" >&2; exit 1; }
 fi
-samtools index "$BAM_OUT/$SAMPLE.bam" 2>/dev/null || true
+# index = a full BAM decode (catches truncation samtools quickcheck misses); its success gates the
+# irreversible FASTQ deletion below, and produces the .bai the BED stage needs.
+_INDEXED=0
+samtools index "$BAM_OUT/$SAMPLE.bam" 2>/dev/null && _INDEXED=1
 
 # keep splice junctions + alignment-QC log next to the BAMs (in logs/)
 [ -f "$WORK/${SAMPLE}_SJ.out.tab" ]    && cp -f "$WORK/${SAMPLE}_SJ.out.tab"    "$LOG_DIR/${SAMPLE}.SJ.out.tab"    2>/dev/null || true
 [ -f "$WORK/${SAMPLE}_Log.final.out" ] && cp -f "$WORK/${SAMPLE}_Log.final.out" "$LOG_DIR/${SAMPLE}.Log.final.out" 2>/dev/null || true
 
 echo "[star] $SAMPLE: complete -> $BAM_OUT/$SAMPLE.bam"
+
+# Free disk: the source FASTQ(s) are no longer needed once a valid BAM is published. Delete the
+# ORIGINALS (FASTQ1/FASTQ2 -- comma-lists), never the staged copies (those live in $WORK, trap-removed).
+# SAFETY (T1.2): the source is irreversible (the .sra was already dropped upstream), so delete ONLY when
+#   (a) the BAM index succeeded -- a full decode that catches truncation quickcheck misses, AND
+#   (b) the uniquely-mapped fraction from Log.final.out is >= MIN_MAPPED_FRAC (default 0 = no floor; new
+#       runs set ~0.01). A suspiciously-empty/under-aligned BAM keeps its FASTQ for re-alignment.
+if [ "${DELETE_FASTQ_AFTER_BAM:-1}" = "1" ]; then
+  _del_ok=1
+  if [ "$_INDEXED" != "1" ]; then
+    echo "[star] $SAMPLE: BAM index did not succeed -> KEEPING source FASTQ (cannot verify completeness)" >&2; _del_ok=0
+  fi
+  _minfrac="${MIN_MAPPED_FRAC:-0}"
+  if [ "$_del_ok" = "1" ] && [ -n "$_minfrac" ] && [ "$_minfrac" != "0" ]; then
+    _logf="$LOG_DIR/${SAMPLE}.Log.final.out"
+    if [ -f "$_logf" ]; then
+      _frac=$(awk -F'|' '/Uniquely mapped reads %/{v=$2; gsub(/[ %\t]/,"",v); print v/100; exit}' "$_logf" 2>/dev/null)
+      _pass=$(awk -v f="${_frac:-0}" -v m="$_minfrac" 'BEGIN{print (f+0>=m+0)?1:0}')
+      if [ "$_pass" != "1" ]; then
+        echo "[star] $SAMPLE: uniquely-mapped frac ${_frac:-?} < floor $_minfrac -> KEEPING source FASTQ (suspect alignment)" >&2; _del_ok=0
+      fi
+    fi
+  fi
+  if [ "$_del_ok" = "1" ]; then
+    for _grp in "$FASTQ1" "$FASTQ2"; do
+      [ -n "$_grp" ] && [ "$_grp" != "NA" ] || continue
+      IFS=',' read -ra _fqs <<< "$_grp"
+      for _fq in ${_fqs[@]+"${_fqs[@]}"}; do
+        [ "$_fq" = "NA" ] && continue
+        [ -f "$_fq" ] && rm -f "$_fq" && echo "[star] $SAMPLE: deleted source FASTQ $_fq"
+      done
+    done
+  fi
+fi
+
+# If this was the LAST live work job, wake the watchdog NOW rather than waiting for its ~30-min poll
+# (WATCHDOG_INTERVAL_MIN). Pure accelerator -- the timed poll stays as the fallback. See
+# lib_star.sh:star_nudge_watchdog.
+star_nudge_watchdog "$SAMPLE" || true

@@ -4,12 +4,13 @@
 # denominator can never drift mid-run. Delete $SAMPLE_LIST to force a rebuild.
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/config.sh"
+source "$HERE/lib_star.sh"   # for star_expected_count (pure-bash row count; grep -c is unreliable on compute nodes)
 set -u
 
 mkdir -p "$PIPELINE_ROOT" "$LOG_DIR"
 
 if [ -s "$SAMPLE_LIST" ]; then
-  n=$(grep -cve '^[[:space:]]*$' "$SAMPLE_LIST")
+  n=$(star_expected_count)
   echo "sample list already exists ($n rows): $SAMPLE_LIST"
   echo "  (delete it to force a rebuild)"
   exit 0
@@ -27,7 +28,7 @@ rt=()
     --out "$SAMPLE_LIST"
 rc=$?
 
-n=$(grep -cve '^[[:space:]]*$' "$SAMPLE_LIST" 2>/dev/null || echo 0)
+n=$(star_expected_count)
 if [ "$rc" -ne 0 ] || [ "$n" -eq 0 ]; then
   echo "ERROR: sample-list build failed or produced 0 rows." >&2
   echo "  check $FASTQ_INPUT_DIR and the .orphans/.unmapped/.mixed reports beside $SAMPLE_LIST" >&2

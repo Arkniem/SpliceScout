@@ -65,10 +65,14 @@ if [ -n "$SCRATCH" ] && mkdir -p "$SCRATCH" 2>/dev/null && [ -w "$SCRATCH" ]; th
 else
   echo "  WARNING: SCRATCH '$SCRATCH' not writable -- jobs fall back to BAM_OUT volume / direct reads"
 fi
-if mkdir -p "$BAM_OUT" "$LOG_DIR" 2>/dev/null && [ -w "$BAM_OUT" ]; then
+# Test writability BY ACTION (touch a probe), NOT `[ -w ]`: on the lab NFS from COMPUTE NODES,
+# `[ -w dir ]` returns false even where mkdir/touch actually SUCCEED -- this falsely failed setup
+# ("BAM_OUT not writable") and wedged the STAR launcher in a retry loop.
+if mkdir -p "$BAM_OUT" "$LOG_DIR" 2>/dev/null && touch "$BAM_OUT/.wtest.$$" 2>/dev/null; then
+  rm -f "$BAM_OUT/.wtest.$$" 2>/dev/null
   echo "  BAM_OUT         : $BAM_OUT  ($(df -h "$BAM_OUT" 2>/dev/null | awk 'NR==2{print $4}') free)"
 else
-  echo "  ERROR: BAM_OUT not writable: $BAM_OUT"; ok=0
+  echo "  ERROR: BAM_OUT not writable (touch probe failed): $BAM_OUT"; ok=0
 fi
 
 # --- memory sanity ---

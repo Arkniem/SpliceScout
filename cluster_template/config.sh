@@ -43,6 +43,8 @@ PREFETCH_MEM_MB=132000  # memory (-M) per prefetch (download) job
 
 # 6) AUTOMATION.
 WATCHDOG_INTERVAL_MIN=30   # how often the self-driving watchdog re-checks
+ABSOLUTE_MAX_PASSES=960    # HARD backstop: STALL after this many watchdog passes no matter what
+MAX_WALL_HOURS=336         # HARD backstop: STALL after this many wall-clock hours (generous; ~14 days)
 JOB_TAG="sra"              # short prefix that namespaces this project's LSF job
                            # names (set something unique if you run >1 project).
 CLEANUP_ON_COMPLETE="yes"  # after a SUCCESSFUL run, delete transient clutter:
@@ -67,6 +69,7 @@ SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 export PIPELINE_ROOT STUDIES_DIR SCRATCH_DIR SRATOOLKIT_MODULE ASPERA_MODULE \
        LSF_QUEUE THREADS MEM_MB WALL PREFETCH_MEM_MB WATCHDOG_INTERVAL_MIN \
+       ABSOLUTE_MAX_PASSES MAX_WALL_HOURS \
        JOB_TAG CLEANUP_ON_COMPLETE CLEANUP_SCRIPTS_ON_COMPLETE SCRIPTS_DIR
 
 # Make the 'module' command available even in a non-login job shell.

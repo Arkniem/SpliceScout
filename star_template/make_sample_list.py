@@ -201,9 +201,15 @@ def main():
         if len(runs) > 1:
             n_merged += 1
 
-    with open(out, "w", encoding="utf-8", newline="\n") as f:
+    # ATOMIC write (T3.2): two run_star_pipeline.sh can run concurrently (the download watchdog kicks the
+    # launcher while the launcher also self-polls), and this is the BUILD-ONCE denominator -- a torn/
+    # interleaved sample_list.tsv would freeze a wrong exp_n for the whole run. tmp + os.replace is atomic
+    # on the same volume, so a reader sees either the old or the complete new file, never a partial one.
+    tmp = "%s.tmp.%d" % (out, os.getpid())
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
         for bs, c2, c3 in rows:
             f.write("%s\t%s\t%s\n" % (bs, c2, c3))
+    os.replace(tmp, out)
 
     def dump(suffix, header, items):
         p = out + suffix

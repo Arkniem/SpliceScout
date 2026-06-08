@@ -11,7 +11,7 @@ echo "===== ${JOB_TAG} pipeline @ $(date) ====="
 exp=0; dn=0; inc=""
 for S in */; do
   [ -f "$S/SraAccList.txt" ] || continue
-  a=$(grep -c . "$S/SraAccList.txt"); g=$(sra_done_count "$STUDIES_DIR/$(basename "$S")")
+  a=$(sra_count_nonblank "$S/SraAccList.txt"); g=$(sra_done_count "$STUDIES_DIR/$(basename "$S")")
   exp=$((exp+a)); dn=$((dn+g))
   [ "$g" -lt "$a" ] && inc="$inc  $(printf '%-22s %s/%s' "$(basename "$S")" "$g" "$a")"$'\n'
 done
@@ -19,9 +19,9 @@ echo "converted: $dn / $exp runs"
 
 echo "--- live jobs (this pipeline) ---"
 bjobs -noheader -o "job_name stat" 2>/dev/null | grep "^${JOB_TAG}_" | awk '{print $2}' | sort | uniq -c | sed 's/^/  /'
-echo "  conversions RUNNING: $(bjobs -noheader -o 'job_name stat' 2>/dev/null | grep "^${JOB_TAG}_fqd_" | grep -c RUN)"
+echo "  conversions RUNNING: $(bjobs -noheader -o 'job_name stat' 2>/dev/null | grep "^${JOB_TAG}_fqd_" | grep RUN | wc -l)"
 mapfile -t SL < <(bjobs -noheader -o "stat slots" -u "$USER" 2>/dev/null | awk '$1=="RUN"{print $2}')
-t=0; for s in "${SL[@]}"; do t=$((t+s)); done; echo "  my RUN slots in use: $t"
+t=0; for s in ${SL[@]+"${SL[@]}"}; do t=$((t+s)); done; echo "  my RUN slots in use: $t"   # +-guard: empty array under set -u
 
 echo "--- REAL conversion failures (EXIT, excluding owner-cancellations) ---"
 f=$(bjobs -a -noheader -o "jobid job_name stat exit_reason delimiter='|'" 2>/dev/null \

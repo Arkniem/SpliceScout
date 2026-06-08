@@ -36,6 +36,12 @@ STAGES = [
     # STAR alignment (Bulk RNA-seq module; auto-chained after the download)
     ("star_bundle", "Build STAR bundle"),
     ("star_submit", "Launch STAR alignment"),
+    # BAM -> BED (AltAnalyze junction/exon; auto-chained after STAR)
+    ("bed_bundle", "Build BED bundle"),
+    ("bed_submit", "Launch BAM->BED"),
+    # AltAnalyze splicing (PSI; auto-chained after BAM->BED)
+    ("psi_bundle", "Build AltAnalyze (PSI) bundle"),
+    ("psi_submit", "Run AltAnalyze splicing"),
 ]
 
 # Rough fraction-of-wall-time weights used only to drive the *overall* progress bar
@@ -58,7 +64,60 @@ WEIGHTS = {
     "cluster_submit": 0.02,
     "star_bundle": 0.01,
     "star_submit": 0.02,
+    "bed_bundle": 0.01,
+    "bed_submit": 0.02,
+    "psi_bundle": 0.01,
+    "psi_submit": 0.02,
 }
+
+# ---------------------------------------------------------------------------
+# Phase-range control. The web UI's vertical dual-handle slider snaps to these
+# ordered PHASES; the two handles pick the FIRST and LAST phase to run. A phase
+# is a contiguous run of stages named by the boundary you can START from.
+#   key       : stable slider id (== the start stage)
+#   label     : shown beside the slider tick
+#   stage     : the FIRST stage that runs when STARTING at this phase
+#   end_stage : the LAST stage that runs when ENDING at this phase
+#   inputs    : artifacts to supply when STARTING here on a FRESH run -- each
+#               {field, label, kind('file'|'dir'), dest, optional?, desc}.
+#               `dest` is a Paths attribute name to copy the supplied path into,
+#               or the special 'runtable_filtered_csv' (resolved with the cell-line
+#               slug at inject time). Stages before `stage` are pre-marked done;
+#               stages after `end_stage` never run. RunConfig stores start_stage/
+#               end_stage (the stage keys), NOT `key`.
+# ---------------------------------------------------------------------------
+_SEL_INPUT = {"field": "cellline_selection", "label": "cellline_selection.json", "kind": "file",
+              "dest": "cellline_selection",
+              "desc": "the chosen cell line + its studies (its name maps to the cluster folder where your data lives)"}
+
+CHECKPOINTS = [
+    {"key": "fetch", "label": "Fetch GEO studies", "stage": "fetch", "end_stage": "fetch",
+     "inputs": []},
+    {"key": "extract", "label": "Extract metadata", "stage": "extract", "end_stage": "extract",
+     "inputs": [{"field": "raw_json", "label": "ncbi_raw.json", "kind": "file", "dest": "raw_json",
+                 "desc": "raw GEO study JSON from a prior fetch"}]},
+    {"key": "prep", "label": "AI clean + build tables", "stage": "prep", "end_stage": "build",
+     "inputs": [{"field": "samples_jsonl", "label": "structured_samples.jsonl", "kind": "file",
+                 "dest": "samples_jsonl", "desc": "structured per-sample metadata from a prior extract"}]},
+    {"key": "select", "label": "Select cell line", "stage": "select", "end_stage": "select",
+     "inputs": [{"field": "cellline_index", "label": "cellline_index.json", "kind": "file",
+                 "dest": "cellline_index", "desc": "the all-cell-line index from a prior build"}]},
+    {"key": "runtable_fetch", "label": "Build run table", "stage": "runtable_fetch", "end_stage": "runtable_annotate",
+     "inputs": [_SEL_INPUT]},
+    {"key": "cluster_bundle", "label": "Download reads", "stage": "cluster_bundle", "end_stage": "cluster_submit",
+     "inputs": [_SEL_INPUT,
+                {"field": "by_study_dir", "label": "by_study/ folder", "kind": "dir", "dest": "by_study_dir",
+                 "desc": "per-study SraAccList.txt the cluster download consumes"}]},
+    {"key": "star_bundle", "label": "STAR align", "stage": "star_bundle", "end_stage": "star_submit",
+     "inputs": [_SEL_INPUT,
+                {"field": "star_runtable", "label": "SraRunTable CSV (optional)", "kind": "file",
+                 "dest": "runtable_filtered_csv", "optional": True,
+                 "desc": "filtered run table so STAR merges runs of one BioSample into one BAM (optional; the FASTQs must already be on the cluster)"}]},
+    {"key": "bed_bundle", "label": "BAM → BED", "stage": "bed_bundle", "end_stage": "bed_submit",
+     "inputs": [_SEL_INPUT]},
+    {"key": "psi_bundle", "label": "AltAnalyze PSI", "stage": "psi_bundle", "end_stage": "psi_submit",
+     "inputs": [_SEL_INPUT]},
+]
 
 
 class _Stage:
@@ -148,6 +207,8 @@ class RunReporter:
         with self._lock:
             st = self._by_key.get(key) if key else self._by_key.get(self._cur)
             if st is None:
+                return
+            if st.status == "skipped":   # a pre-skipped (out-of-range) stage must not flip to done
                 return
             if st.total:
                 st.done = st.total

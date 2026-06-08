@@ -31,16 +31,26 @@ else
   fi
 fi
 
+# T4.1: nothing downloaded? (prefetch can fail yet this job still runs -- it's gated on ended(), not
+# done().) Early-return with a breadcrumb instead of crashing on a bare empty-array expansion under set -u,
+# so the download watchdog's own STALL logic -- not a cryptic 'ACCS[@]: unbound variable' -- decides next.
+if [ ${#ACCS[@]} -eq 0 ]; then
+  echo "convert_study: $(basename "$SDIR") nothing to convert (no .sra on disk -- prefetch may have downloaded nothing)"
+  exit 0
+fi
+
 LIVE="$(sra_live_names)"
 n=0
-for acc in "${ACCS[@]}"; do
+for acc in ${ACCS[@]+"${ACCS[@]}"}; do
   # 1) flatten this accession's download into the study dir
   for f in "$acc"/*.sra "$acc"/*.sralite "$acc".sralite; do
     [ -e "$f" ] && mv -n "$f" .
   done
   [ -e "$acc.sralite" ] && mv -n "$acc.sralite" "$acc.sra"
-  # 2) skip if already converted
-  gz=("$acc"*.fastq.gz); [ ${#gz[@]} -gt 0 ] && continue
+  # 2) skip if already converted. T4.2: ANCHOR the glob to match sra_done_count EXACTLY -- an unanchored
+  #    "$acc"*.fastq.gz prefix-matches a sibling (SRR123 vs SRR1234.fastq.gz) and would skip SRR123 forever
+  #    while the counter (correctly anchored) never credits it -> a permanent stall + a missing FASTQ.
+  if compgen -G "$acc.fastq.gz" >/dev/null 2>&1 || compgen -G "${acc}_[0-9].fastq.gz" >/dev/null 2>&1; then continue; fi
   # 3) skip if no .sra present (nothing downloaded for it)
   [ -e "$acc.sra" ] || continue
   # 4) skip if a conversion job for it is already live (idempotent)

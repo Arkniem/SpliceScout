@@ -44,6 +44,18 @@ CONFIG_DEFAULTS = {
 NUMERIC = {"THREADS", "MEM_MB", "PREFETCH_MEM_MB", "WATCHDOG_INTERVAL_MIN"}
 
 
+# A "safe expandable" config value: a pure path whose only `$` uses are allowlisted shell vars
+# ($USER/$HOME/$SCRATCH/$TMPDIR) and which contains NO other shell-active char. Such values keep
+# expansion (e.g. SCRATCH_DIR="/scratch/$USER"); everything else is escaped to an inert literal.
+_SAFE_EXPAND_RE = re.compile(r'^(?:[A-Za-z0-9_./:+-]|\$(?:USER|HOME|SCRATCH|SCRATCHDIR|TMPDIR)\b)*$')
+
+
+def shq(value):
+    """POSIX single-quote a value for safe interpolation into a REMOTE SHELL COMMAND line.
+    Closes shell injection: $, `, $(...), ;, |, &, spaces, embedded quotes are all inert."""
+    return "'" + str(value).replace("'", "'\"'\"'") + "'"
+
+
 # ---------- config.sh generation ----------
 def _shval(name, value, numeric=NUMERIC, defaults=CONFIG_DEFAULTS):
     if name in numeric:
@@ -51,7 +63,13 @@ def _shval(name, value, numeric=NUMERIC, defaults=CONFIG_DEFAULTS):
             return str(int(value))
         except Exception:
             return str(defaults.get(name, value))
-    s = str(value).replace('"', '\\"')
+    s = str(value)
+    # Keep DOUBLE quotes (so every config.sh reader stays unchanged), but neutralize every
+    # shell-active character inside them UNLESS the value is a trusted pure path that legitimately
+    # relies on an allowlisted $VAR (then we leave $ alone so it still expands when sourced).
+    if "$" in s and _SAFE_EXPAND_RE.match(s):
+        return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    s = s.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "\\`")
     return f'"{s}"'
 
 
@@ -302,10 +320,10 @@ def _submit_systemssh(P, host, port, user, keyfile, root, reporter, src_dir=None
     common = ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=20"]
     ssh = ["ssh", "-p", str(port)] + common + (["-i", keyfile] if keyfile else [])
     scp = ["scp", "-r", "-P", str(port)] + common + (["-i", keyfile] if keyfile else [])
-    _run(ssh + [target, f"mkdir -p '{root}'"])
+    _run(ssh + [target, f"mkdir -p {shq(root)}"])
     items = [os.path.join(src_dir, n) for n in sorted(os.listdir(src_dir))]
     _run(scp + items + [f"{target}:{root}/"], timeout=600)
-    out = _run(ssh + [target, f"cd '{root}' && chmod +x *.sh && {launch_cmd}"], timeout=600)
+    out = _run(ssh + [target, f"cd {shq(root)} && chmod +x *.sh && {launch_cmd}"], timeout=600)
     print(f"  CLUSTER SUBMIT: launched on {target}:{root}")
     reporter.set_detail(f"launched on {host}")
     return {"submitted": True, "host": host, "root": root, "output": out[-2000:]}
@@ -335,7 +353,7 @@ def _submit_paramiko(P, host, port, user, password, keyfile, root, reporter, src
         return out
 
     try:
-        ex(f"mkdir -p '{root}'")
+        ex(f"mkdir -p {shq(root)}")
         sftp = cli.open_sftp()
         for base, _dirs, files in os.walk(src_dir):
             rel = os.path.relpath(base, src_dir)
@@ -347,7 +365,7 @@ def _submit_paramiko(P, host, port, user, password, keyfile, root, reporter, src
             for fn in files:
                 sftp.put(os.path.join(base, fn), f"{rdir}/{fn}")
         sftp.close()
-        out = ex(f"cd '{root}' && chmod +x *.sh && {launch_cmd}")
+        out = ex(f"cd {shq(root)} && chmod +x *.sh && {launch_cmd}")
     finally:
         cli.close()
     print(f"  CLUSTER SUBMIT: launched on {user}@{host}:{root}")
@@ -481,6 +499,8 @@ def parse_status(text):
     return {"overall": overall, "per_study": per_study, "root": root,
             "live_jobs": int(lm.group(1)) if lm else None,
             "complete": "COMPLETE" in meta, "stalled": "STALLED" in meta,
+            "partial": "PARTIAL" in meta, "incomplete_upstream": "UPSTREAMPARTIAL" in meta,
+            "orphaned": "ORPHANED" in meta,
             "eta_seconds": _eta_from_watchdog(wd, eta_base), "raw": text[-4000:]}
 
 
@@ -521,6 +541,9 @@ fi
 echo "---META---"
 [ -n "$ROOT" ] && [ -f "$ROOT/PIPELINE_COMPLETE.txt" ] && echo COMPLETE
 [ -n "$ROOT" ] && [ -f "$ROOT/PIPELINE_STALLED.txt" ] && echo STALLED
+[ -n "$ROOT" ] && [ -f "$ROOT/PIPELINE_COMPLETE_PARTIAL.txt" ] && echo PARTIAL
+[ -n "$ROOT" ] && [ -f "$ROOT/PIPELINE_INCOMPLETE_UPSTREAM.txt" ] && echo UPSTREAMPARTIAL
+[ -n "$ROOT" ] && [ -f "$ROOT/PIPELINE_ORPHANED.txt" ] && echo ORPHANED
 echo "LIVE $(bjobs -noheader -o stat -J "${TAG}_*" 2>/dev/null | grep -cE 'RUN|PEND')"
 echo "---WATCHDOG---"
 [ -n "$ROOT" ] && tail -n 80 "$ROOT/watchdog.log" 2>/dev/null
@@ -539,8 +562,8 @@ def remote_status(host, user, port, keyfile, password, job_tag, fallback_root=""
                 "diagnosis": diagnose_failure("missing host/user")}
     port = str(port or "22").strip() or "22"
     keyfile = (keyfile or "").strip()
-    cmd = (_STATUS_PROBE.replace("%TAG%", "'" + (job_tag or "sra") + "'")
-                        .replace("%FB%", "'" + (fallback_root or "") + "'"))
+    cmd = (_STATUS_PROBE.replace("%TAG%", shq(job_tag or "sra"))
+                        .replace("%FB%", shq(fallback_root or "")))
     try:
         if password:
             try:
@@ -573,6 +596,10 @@ fi
 echo "---META---"
 [ -n "$BO" ] && [ -f "$BO/PIPELINE_COMPLETE.txt" ] && echo COMPLETE
 [ -n "$BO" ] && [ -f "$BO/PIPELINE_STALLED.txt" ] && echo STALLED
+[ -n "$BO" ] && [ -f "$BO/PIPELINE_COMPLETE_PARTIAL.txt" ] && echo PARTIAL
+[ -n "$BO" ] && [ -f "$BO/PIPELINE_INCOMPLETE_UPSTREAM.txt" ] && echo UPSTREAMPARTIAL
+[ -n "$BO" ] && [ -f "$BO/PIPELINE_ORPHANED.txt" ] && echo ORPHANED
+[ -n "$BO" ] && [ -f "$BO/star/PIPELINE_LAUNCH_TIMEOUT.txt" ] && echo LAUNCHTIMEOUT
 echo "LIVE $(bjobs -noheader -o stat -J "${TAG}_*" 2>/dev/null | grep -cE 'RUN|PEND')"
 echo "LAUNCHPEND $(bjobs -noheader -o stat -J "${TAG}_launch" 2>/dev/null | grep -c PEND)"
 echo "BUILD $(bjobs -noheader -o stat -J "${TAG}_staridx_*" 2>/dev/null | grep -cE 'RUN|PEND')"
@@ -598,6 +625,8 @@ def parse_star_status(text):
             "launch_pending": bool(lp and int(lp.group(1)) > 0),
             "building": bool(bd and int(bd.group(1)) > 0),
             "complete": "COMPLETE" in meta, "stalled": "STALLED" in meta,
+            "partial": "PARTIAL" in meta, "incomplete_upstream": "UPSTREAMPARTIAL" in meta,
+            "orphaned": "ORPHANED" in meta, "launch_timeout": "LAUNCHTIMEOUT" in meta,
             "eta_seconds": eta, "raw": text[-2000:]}
 
 
@@ -608,8 +637,8 @@ def remote_star_status(host, user, port, keyfile, password, star_job_tag, bam_ou
     if not host or not user:
         return {"ok": False, "error": "missing SSH host/user"}
     port = str(port or "22").strip() or "22"
-    cmd = (_STAR_STATUS_PROBE.replace("%TAG%", "'" + (star_job_tag or "sra_star") + "'")
-                             .replace("%BO%", "'" + (bam_out or "") + "'"))
+    cmd = (_STAR_STATUS_PROBE.replace("%TAG%", shq(star_job_tag or "sra_star"))
+                             .replace("%BO%", shq(bam_out or "")))
     try:
         if password:
             try:
@@ -623,6 +652,155 @@ def remote_star_status(host, user, port, keyfile, password, star_job_tag, bam_ou
         return {"ok": False, "error": str(e)}
     parsed = parse_star_status(text)
     parsed.update({"ok": True, "job_tag": star_job_tag})
+    return parsed
+
+
+# ---------- BAM->BED progress (the AltAnalyze junction/exon stage after STAR) ----------
+# Given the BED JOB_TAG ('<dlTag>_star_bed') + STAR's BAM_OUT, count complete junction+exon BED PAIRS vs
+# *.bam, note whether the launcher is still PENDing (waiting on STAR), plus COMPLETE/STALLED + the bed/
+# watchdog tail (for an ETA). BED state lives in $BO/bed/. (raw string -> literal globs.)
+_BED_STATUS_PROBE = r'''TAG=%TAG%; BO=%BO%; MODE=%MODE%
+BEDDIR="$(dirname "$BO")/STAR_beds"
+echo "BAMOUT $BO"
+if [ -d "$BO" ]; then
+  if [ -f "$BO/bed/bam_list.tsv" ]; then exp=$(grep -cve '^[[:space:]]*$' "$BO/bed/bam_list.tsv" 2>/dev/null); else exp=$(ls "$BO"/*.bam 2>/dev/null | grep -c .); fi
+  done=$(ls "$BEDDIR"/*__junction.bed 2>/dev/null | while read -r j; do
+           s="${j%__junction.bed}"; [ -s "$j" ] || continue
+           case "$MODE" in
+             exon) [ -s "${s}__exon.bed" ] && echo 1 ;;
+             both) [ -s "${s}__exon.bed" ] && [ -e "${s}__intronJunction.bed" ] && echo 1 ;;
+             *)    [ -e "${s}__intronJunction.bed" ] && echo 1 ;;
+           esac
+         done | grep -c .)
+  echo "COUNT $exp $done"
+fi
+echo "---META---"
+[ -n "$BO" ] && [ -f "$BO/bed/PIPELINE_COMPLETE.txt" ] && echo COMPLETE
+[ -n "$BO" ] && [ -f "$BO/bed/PIPELINE_STALLED.txt" ] && echo STALLED
+[ -n "$BO" ] && [ -f "$BO/bed/PIPELINE_COMPLETE_PARTIAL.txt" ] && echo PARTIAL
+[ -n "$BO" ] && [ -f "$BO/bed/PIPELINE_INCOMPLETE_UPSTREAM.txt" ] && echo UPSTREAMPARTIAL
+[ -n "$BO" ] && [ -f "$BO/bed/PIPELINE_ORPHANED.txt" ] && echo ORPHANED
+[ -n "$BO" ] && [ -f "$BO/bed/PIPELINE_LAUNCH_TIMEOUT.txt" ] && echo LAUNCHTIMEOUT
+echo "LIVE $(bjobs -noheader -o stat -J "${TAG}_*" 2>/dev/null | grep -cE 'RUN|PEND')"
+echo "LAUNCHPEND $(bjobs -noheader -o stat -J "${TAG}_launch" 2>/dev/null | grep -c PEND)"
+echo "---WATCHDOG---"
+[ -n "$BO" ] && tail -n 40 "$BO/bed/watchdog.log" 2>/dev/null
+true'''
+
+
+def parse_bed_status(text):
+    """Parse the BED progress probe into a dict (unit-testable, no SSH)."""
+    head, _, wd = text.partition("---WATCHDOG---")
+    body, _, meta = head.partition("---META---")
+    overall = None
+    m = re.search(r"(?m)^COUNT\s+(\d+)\s+(\d+)", body)
+    if m:
+        exp, done = int(m.group(1)), int(m.group(2))
+        overall = {"exp": exp, "done": done, "pct": round(100 * done / exp, 1) if exp else 0.0}
+    lm = re.search(r"(?m)^LIVE\s+(\d+)", meta)
+    lp = re.search(r"(?m)^LAUNCHPEND\s+(\d+)", meta)
+    eta = _eta_from_watchdog(wd, {"exp": overall["exp"], "done": overall["done"]}) if overall else None
+    return {"overall": overall, "live_jobs": int(lm.group(1)) if lm else None,
+            "launch_pending": bool(lp and int(lp.group(1)) > 0),
+            "complete": "COMPLETE" in meta, "stalled": "STALLED" in meta,
+            "partial": "PARTIAL" in meta, "incomplete_upstream": "UPSTREAMPARTIAL" in meta,
+            "orphaned": "ORPHANED" in meta, "launch_timeout": "LAUNCHTIMEOUT" in meta,
+            "eta_seconds": eta, "raw": text[-2000:]}
+
+
+def remote_bed_status(host, user, port, keyfile, password, bed_job_tag, bam_out="", bed_mode="intron"):
+    """SSH to the submit host and report BAM->BED progress for `bed_job_tag` (= '<dlTag>_star_bed').
+    `bed_mode` (intron|exon|both) selects which BED files count as 'done' (matches lib_bed.sh:bed_done).
+    Non-fatal (returns {"ok": False, ...} on SSH error)."""
+    host = (host or "").strip(); user = (user or "").strip()
+    if not host or not user:
+        return {"ok": False, "error": "missing SSH host/user"}
+    port = str(port or "22").strip() or "22"
+    _mode = (bed_mode or "intron").strip().lower()
+    if _mode not in ("intron", "exon", "both"):
+        _mode = "intron"
+    cmd = (_BED_STATUS_PROBE.replace("%TAG%", shq(bed_job_tag or "sra_star_bed"))
+                            .replace("%BO%", shq(bam_out or ""))
+                            .replace("%MODE%", shq(_mode)))
+    try:
+        if password:
+            try:
+                import paramiko  # noqa: F401
+            except Exception:
+                raise _SubmitError("password auth needs paramiko", "")
+            text = _ssh_capture_paramiko(host, port, user, password, keyfile, cmd)
+        else:
+            text = _ssh_capture_systemssh(host, port, user, keyfile, cmd)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    parsed = parse_bed_status(text)
+    parsed.update({"ok": True, "job_tag": bed_job_tag})
+    return parsed
+
+
+# ---------- AltAnalyze splicing (PSI) progress (the stage after BAM->BED) ----------
+# Given the PSI JOB_TAG ('<dlTag>_psi') + its psi_root (= <download_root>/psi), note whether the PSI table
+# was produced, whether the launcher is still PENDing (waiting on BED), plus COMPLETE/STALLED + the psi
+# watchdog tail. PSI is a single AltAnalyze job, so there is no exp/done count -- just present-or-not.
+_PSI_STATUS_PROBE = r'''TAG=%TAG%; PR=%PR%
+echo "PSIROOT $PR"
+if [ -n "$PR" ]; then
+  if ls "$PR"/output/AltResults/AlternativeOutput/*EventAnnotation* >/dev/null 2>&1; then echo "PSITABLE 1"; else echo "PSITABLE 0"; fi
+fi
+echo "---META---"
+[ -n "$PR" ] && [ -f "$PR/PIPELINE_COMPLETE.txt" ] && echo COMPLETE
+[ -n "$PR" ] && [ -f "$PR/PIPELINE_STALLED.txt" ] && echo STALLED
+[ -n "$PR" ] && [ -f "$PR/PIPELINE_INCOMPLETE_UPSTREAM.txt" ] && echo UPSTREAMPARTIAL
+[ -n "$PR" ] && [ -f "$PR/PIPELINE_ORPHANED.txt" ] && echo ORPHANED
+[ -n "$PR" ] && [ -f "$PR/PIPELINE_LAUNCH_TIMEOUT.txt" ] && echo LAUNCHTIMEOUT
+echo "LIVE $(bjobs -noheader -o stat -J "${TAG}_*" 2>/dev/null | grep -cE 'RUN|PEND')"
+echo "LAUNCHPEND $(bjobs -noheader -o stat -J "${TAG}_launch" 2>/dev/null | grep -c PEND)"
+echo "JOBRUN $(bjobs -noheader -o stat -J "${TAG}_job" 2>/dev/null | grep -c RUN)"
+echo "---WATCHDOG---"
+[ -n "$PR" ] && tail -n 40 "$PR/watchdog.log" 2>/dev/null
+true'''
+
+
+def parse_psi_status(text):
+    """Parse the PSI progress probe into a dict (unit-testable, no SSH)."""
+    head, _, wd = text.partition("---WATCHDOG---")
+    body, _, meta = head.partition("---META---")
+    table = bool(re.search(r"(?m)^PSITABLE\s+1", body))
+    lm = re.search(r"(?m)^LIVE\s+(\d+)", meta)
+    lp = re.search(r"(?m)^LAUNCHPEND\s+(\d+)", meta)
+    jr = re.search(r"(?m)^JOBRUN\s+(\d+)", meta)
+    return {"psi_table": table,
+            "live_jobs": int(lm.group(1)) if lm else None,
+            "launch_pending": bool(lp and int(lp.group(1)) > 0),
+            "job_running": bool(jr and int(jr.group(1)) > 0),
+            "complete": "COMPLETE" in meta, "stalled": "STALLED" in meta,
+            "incomplete_upstream": "UPSTREAMPARTIAL" in meta,
+            "orphaned": "ORPHANED" in meta, "launch_timeout": "LAUNCHTIMEOUT" in meta,
+            "raw": text[-2000:]}
+
+
+def remote_psi_status(host, user, port, keyfile, password, psi_job_tag, psi_root=""):
+    """SSH to the submit host and report AltAnalyze (PSI) progress for `psi_job_tag` (= '<dlTag>_psi').
+    Non-fatal (returns {"ok": False, ...} on SSH error)."""
+    host = (host or "").strip(); user = (user or "").strip()
+    if not host or not user:
+        return {"ok": False, "error": "missing SSH host/user"}
+    port = str(port or "22").strip() or "22"
+    cmd = (_PSI_STATUS_PROBE.replace("%TAG%", shq(psi_job_tag or "sra_psi"))
+                            .replace("%PR%", shq(psi_root or "")))
+    try:
+        if password:
+            try:
+                import paramiko  # noqa: F401
+            except Exception:
+                raise _SubmitError("password auth needs paramiko", "")
+            text = _ssh_capture_paramiko(host, port, user, password, keyfile, cmd)
+        else:
+            text = _ssh_capture_systemssh(host, port, user, keyfile, cmd)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    parsed = parse_psi_status(text)
+    parsed.update({"ok": True, "job_tag": psi_job_tag})
     return parsed
 
 

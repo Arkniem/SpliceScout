@@ -33,7 +33,7 @@ STAR_CONFIG_DEFAULTS = {
     "SJDB_OVERHANG": 100,
     "RUNTABLE": "",
     "SCRATCH": "/scratch/$USER",
-    "THREADS": 6,
+    "THREADS": 5,    # LSF slots per STAR job; 5 packs 16-core nodes 3-up and divides a 125-slot cap evenly (25 jobs)
     "SORT_RAM": 20000000000,
     "STAR_EXTRA_ARGS": "",
     "MEM_MB": 64000,
@@ -43,6 +43,7 @@ STAR_CONFIG_DEFAULTS = {
     "JOB_TAG": "star",
     "WATCHDOG_INTERVAL_MIN": 30,
     "MAX_STALL_PASSES": 2,
+    "DELETE_FASTQ_AFTER_BAM": "1",   # UI toggle: delete a sample's source FASTQ(s) once its BAM is verified
     "STAR_MODULE": "STAR/2.7.10b",
     "SAMTOOLS_MODULE": "samtools",
     "ORGANISM": "Homo sapiens",
@@ -102,11 +103,19 @@ def _url_registry_for(organism):
         return {}
 
 
-def _star_launch_sh(download_root, star_tag, check_min=30):
+def _star_launch_sh(download_root, star_tag, check_min=30, max_wait_hours=336):
     """SELF-RESCHEDULING launcher (mirrors the watchdog pattern). Each pass is a short LSF job: if the
     SRA download has finished it launches STAR, otherwise it re-queues itself for +CHECK_MIN minutes.
     It lives entirely on the cluster, so SpliceScout can be CLOSED right after the upload — the cluster
-    keeps checking across a possibly multi-day download and starts STAR on its own when it completes."""
+    keeps checking across a possibly multi-day download and starts STAR on its own when it completes.
+
+    Hardening:
+      * If the download finalized STALLED (not COMPLETE), STAR still aligns whatever downloaded, but the
+        STAR root is marked PIPELINE_INCOMPLETE_UPSTREAM.txt so STAR's finalize disables destructive
+        cleanup / FASTQ-purge and writes an HONEST partial marker (stops the silent data-loss cascade).
+      * Bounded wait: give up (PIPELINE_LAUNCH_TIMEOUT.txt) only after MAX_WAIT_HOURS *and* the upstream
+        watchdog.log has gone stale, so a legitimately long multi-day download is never aborted but a
+        DEAD upstream no longer polls a queue slot forever."""
     dl = download_root.rstrip("/")
     return (
         "#!/usr/bin/env bash\n"
@@ -114,23 +123,47 @@ def _star_launch_sh(download_root, star_tag, check_min=30):
         "# done; if so launches STAR, else re-queues itself. Runs as short LSF jobs on the cluster, so you\n"
         "# can close SpliceScout after the upload -- it survives multi-day downloads with no laptop on.\n"
         'HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\n'
-        f"DL_ROOT='{dl}'\n"
+        f"DL_ROOT={cluster_deploy.shq(dl)}\n"
         f"CHECK_MIN={int(check_min)}\n"
-        f"JT='{star_tag}'\n"
+        f"MAX_WAIT_HOURS={int(max_wait_hours)}\n"
+        f"JT={cluster_deploy.shq(star_tag)}\n"
+        'STAR_ROOT="$DL_ROOT/STAR_bams"\n'
         "command -v bsub >/dev/null 2>&1 || { echo '[star_launch] no bsub here' >&2; exit 0; }\n"
         "# STAR already finished -> nothing to do\n"
-        'if [ -f "$DL_ROOT/STAR_bams/PIPELINE_COMPLETE.txt" ] || [ -f "$DL_ROOT/STAR_bams/PIPELINE_STALLED.txt" ]; then\n'
+        'if [ -f "$STAR_ROOT/PIPELINE_COMPLETE.txt" ] || [ -f "$STAR_ROOT/PIPELINE_STALLED.txt" ]; then\n'
         '  echo "[star_launch] STAR already finalized -> stop"; exit 0\n'
         "fi\n"
         "# download finished (or stalled -> align whatever downloaded) -> TRY to launch STAR. If the launch\n"
         "# (setup / index resolve / sample-list) FAILS -- e.g. a transient cluster hiccup -- DON'T give up:\n"
         "# fall through to reschedule + retry next pass (run_star_pipeline.sh is idempotent). Stop only on success.\n"
         'if [ -f "$DL_ROOT/PIPELINE_COMPLETE.txt" ] || [ -f "$DL_ROOT/PIPELINE_STALLED.txt" ]; then\n'
+        "  # upstream STALLED (not COMPLETE) -> this run is PARTIAL: mark it so STAR finalize keeps the\n"
+        "  # un-downloaded samples' inputs (no by_study purge) and reports honestly.\n"
+        '  if [ ! -f "$DL_ROOT/PIPELINE_COMPLETE.txt" ] && [ -f "$DL_ROOT/PIPELINE_STALLED.txt" ]; then\n'
+        '    mkdir -p "$STAR_ROOT" 2>/dev/null\n'
+        '    { echo "upstream download STALLED at $(date) -- not all accessions delivered."; \\\n'
+        '      echo "This STAR run is PARTIAL: destructive cleanup + FASTQ/BAM deletion are DISABLED."; } \\\n'
+        '      > "$STAR_ROOT/PIPELINE_INCOMPLETE_UPSTREAM.txt" 2>/dev/null\n'
+        '    cp -f "$DL_ROOT/PIPELINE_STALLED.txt" "$STAR_ROOT/UPSTREAM_DOWNLOAD_STALLED.txt" 2>/dev/null\n'
+        "  fi\n"
         '  echo "[star_launch] download finished -> launching STAR pipeline"\n'
         '  if bash "$HERE/run_star_pipeline.sh"; then\n'
         '    echo "[star_launch] STAR pipeline launched -> stop"; exit 0\n'
         "  fi\n"
         '  echo "[star_launch] run_star_pipeline.sh FAILED -> will retry in $CHECK_MIN min" >&2\n'
+        "fi\n"
+        "# Bounded wait: only abort if we've waited past MAX_WAIT_HOURS AND the upstream watchdog.log is\n"
+        "# stale (no recent progress) -- so a long live download is never killed, but a DEAD chain stops.\n"
+        'STAMP="$HERE/.launch_first_seen"\n'
+        '[ -f "$STAMP" ] || date +%s > "$STAMP" 2>/dev/null\n'
+        'now=$(date +%s); first=$(cat "$STAMP" 2>/dev/null || echo "$now")\n'
+        'upwd="$DL_ROOT/watchdog.log"; up_age=999999999\n'
+        '[ -f "$upwd" ] && up_age=$(( now - $(stat -c %Y "$upwd" 2>/dev/null || echo "$now") ))\n'
+        'if [ "$(( now - first ))" -gt "$(( MAX_WAIT_HOURS * 3600 ))" ] && [ "$up_age" -gt "$(( CHECK_MIN * 180 ))" ]; then\n'
+        '  mkdir -p "$DL_ROOT/star" 2>/dev/null\n'
+        '  echo "STAR launcher gave up at $(date): download never finalized and its watchdog.log went stale (>${MAX_WAIT_HOURS}h)." \\\n'
+        '    > "$DL_ROOT/star/PIPELINE_LAUNCH_TIMEOUT.txt" 2>/dev/null\n'
+        '  echo "[star_launch] upstream dead -> giving up (PIPELINE_LAUNCH_TIMEOUT.txt written)" >&2; exit 0\n'
         "fi\n"
         "# download not done yet, OR a launch attempt just failed -> reschedule THIS launcher (+CHECK_MIN), then exit\n"
         "when=$(date -d \"+$CHECK_MIN min\" '+%Y:%m:%d:%H:%M' 2>/dev/null) || "
@@ -228,8 +261,10 @@ def build_star_bundle(P, sel, download_root, star_cfg, download_job_tag="sra", r
             "star_root": star_root}
 
 
-def submit_star_over_ssh(P, cluster_cfg, secrets, download_root, reporter=NULL):
-    """Upload the STAR bundle and submit the auto-chain launcher (waits on the download). Non-fatal."""
+def submit_star_over_ssh(P, cluster_cfg, secrets, download_root, reporter=NULL, prior_skipped=False):
+    """Upload the STAR bundle and submit the auto-chain launcher (waits on the download). Non-fatal.
+    prior_skipped=True (phase-range START at STAR): the download stage was skipped, so pre-create the
+    download's PIPELINE_COMPLETE.txt sentinel the launcher polls -> STAR runs immediately."""
     cfg = cluster_cfg or {}
     secrets = secrets or {}
     host = (cfg.get("ssh_host") or "").strip()
@@ -252,10 +287,18 @@ def submit_star_over_ssh(P, cluster_cfg, secrets, download_root, reporter=NULL):
     # Submit the SELF-RESCHEDULING launcher ONCE (no -w dependency: it re-queues itself every ~30 min
     # until the download writes PIPELINE_COMPLETE.txt, then launches STAR). It runs immediately, sees the
     # download isn't done yet, and arms the reschedule chain — so SpliceScout can be CLOSED after this.
+    shq = cluster_deploy.shq
     launch = (
-        f"bsub -L /bin/bash -n 1 -M 1000 -W 120 -J '{star_tag}_launch' "
-        f"-o '{star_root}/launch.out' -e '{star_root}/launch.err' '{star_root}/star_launch.sh'"
+        f"bsub -L /bin/bash -n 1 -M 1000 -W 120 -J {shq(star_tag + '_launch')} "
+        f"-o {shq(star_root + '/launch.out')} -e {shq(star_root + '/launch.err')} {shq(star_root + '/star_launch.sh')}"
     )
+    if prior_skipped:
+        # START at STAR (download skipped): the launcher polls <download_root>/PIPELINE_COMPLETE.txt,
+        # which no download will ever write -> pre-create it so STAR runs NOW on the FASTQs the user
+        # already placed under <download_root>/by_study. Same remote shell, before the launcher bsub.
+        _dr = download_root.rstrip("/")
+        launch = f"mkdir -p {shq(_dr)} && touch {shq(_dr + '/PIPELINE_COMPLETE.txt')}; " + launch
+        print(f"  STAR SUBMIT: download skipped -> pre-touch {_dr}/PIPELINE_COMPLETE.txt (no-wait start)")
     print(f"=== STAR SUBMIT: {user}@{host}:{port} -> {star_root} ===")
     try:
         if password:

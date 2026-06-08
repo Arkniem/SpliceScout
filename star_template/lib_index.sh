@@ -30,13 +30,16 @@ if m and m.get("index_dir"):
 PYEOF
 }
 
-# Resolve the index. Echoes the chosen GENOME_DIR; sets NEED_BUILD=1 + BUILD_TARGET when a build is
-# needed; may set SJDB_GTF from the registry. Order: explicit -> registry -> prior auto build -> build.
+# Resolve the index. Sets the chosen GENOME_DIR into the global RESOLVED_GENOME_DIR (NOT stdout -- the
+# caller must invoke this WITHOUT $(...) so the side-effect globals survive; command substitution runs in
+# a subshell and would silently lose NEED_BUILD, leaving the build-once branch dead). Sets NEED_BUILD=1 +
+# BUILD_TARGET when a build is needed; may set SJDB_GTF from the registry. Order: explicit -> registry ->
+# prior auto build -> build.
 star_resolve_index() {
-  NEED_BUILD=0; BUILD_TARGET=""
+  NEED_BUILD=0; BUILD_TARGET=""; RESOLVED_GENOME_DIR=""
   if star_index_valid "${GENOME_DIR:-}"; then
     echo "[resolve] explicit GENOME_DIR is a valid index: $GENOME_DIR" >&2
-    printf '%s' "$GENOME_DIR"; return 0
+    RESOLVED_GENOME_DIR="$GENOME_DIR"; return 0
   fi
   [ -n "${GENOME_DIR:-}" ] && echo "[resolve] GENOME_DIR set but missing SAindex/Genome -> trying registry" >&2
   local hit idir gtf
@@ -46,16 +49,16 @@ star_resolve_index() {
     if star_index_valid "$idir"; then
       echo "[resolve] registry match for '${ORGANISM:-?}': $idir" >&2
       [ -n "$gtf" ] && [ -z "${SJDB_GTF:-}" ] && SJDB_GTF="$gtf"
-      printf '%s' "$idir"; return 0
+      RESOLVED_GENOME_DIR="$idir"; return 0
     fi
     echo "[resolve] registry path invalid ($idir) -> checking auto root" >&2
   fi
   local slug auto; slug="$(star_org_slug "${ORGANISM:-}")"; auto="${STAR_INDEX_ROOT%/}/$slug"
   if star_index_valid "$auto"; then
     echo "[resolve] using previously built index: $auto" >&2
-    printf '%s' "$auto"; return 0
+    RESOLVED_GENOME_DIR="$auto"; return 0
   fi
   NEED_BUILD=1; BUILD_TARGET="$auto"
   echo "[resolve] no index for '${ORGANISM:-?}' anywhere -> build-once into $auto" >&2
-  printf '%s' "$auto"; return 0
+  RESOLVED_GENOME_DIR="$auto"; return 0
 }

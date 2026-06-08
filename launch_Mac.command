@@ -79,7 +79,16 @@ fi
 echo "Starting the web UI - a browser window will open shortly."
 echo "Keep this window open while you work; close it (or press Ctrl+C) to stop."
 echo "TIP: run launch_Mac.command again to start ANOTHER instance for a concurrent project --"
-echo "     each instance gets its own port and cluster JOB_TAG (sra1, sra2, sra3, ...)."
+echo "     each one prompts for its own name and gets its own port."
+echo
+# Name this instance -> its cluster JOB_TAG (namespaces this project's LSF jobs); blank = auto sraN.
+read -r -p "Name this instance (e.g. A549, MDAMB231) [blank = auto sra1/sra2/...]: " SPLICESCOUT_INSTANCE
+export SPLICESCOUT_INSTANCE
+if [ -n "$SPLICESCOUT_INSTANCE" ]; then
+  echo "Using instance name \"$SPLICESCOUT_INSTANCE\" as the cluster JOB_TAG."
+else
+  echo "No name given - this instance will auto-pick the next free tag (sra1, sra2, ...)."
+fi
 echo
 "$PY" server.py
 

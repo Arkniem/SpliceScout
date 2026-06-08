@@ -18,7 +18,10 @@ star_require_bsub
 ENVF="$PIPELINE_ROOT/RESOLVED_INDEX.env"
 mkdir -p "$PIPELINE_ROOT" "$LOG_DIR"
 
-RESOLVED="$(star_resolve_index)"
+# Call DIRECTLY (not via $()) so the side-effect globals NEED_BUILD/BUILD_TARGET/SJDB_GTF survive --
+# command substitution would run it in a subshell and lose them (the build-once branch below depends on NEED_BUILD).
+star_resolve_index
+RESOLVED="${RESOLVED_GENOME_DIR:-}"
 echo "[resolve] GENOME_DIR -> $RESOLVED"
 
 BUILD_JID=""

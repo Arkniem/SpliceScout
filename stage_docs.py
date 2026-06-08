@@ -164,4 +164,48 @@ STAGE_DOCS = {
         "inputs": "star_bundle.zip, your SSH settings, the running download",
         "outputs": "(remote) STAR BAMs + SJ.out.tab; star_submit.json",
     },
+    "bed_bundle": {
+        "title": "Build BED bundle",
+        "what": "(Bulk RNA-seq module) Assembles the BAM->BED bundle: the VENDORED AltAnalyze toolkit "
+                "(BAMtoJunctionBED.py + BAMtoExonBED.py + export.py/unique.py) and the exon reference, plus a "
+                "config.sh pointed at STAR's BAM_OUT and the species (auto-mapped from the run's organism: "
+                "Homo sapiens->Hs, Mus musculus->Mm, ...). ALL-IN-ONE: it ships the AltAnalyze slice it needs, "
+                "so the cluster needs no AltAnalyze install (just stock python/2.7.5 + samtools). JOB_TAG is "
+                "the STAR tag + '_bed'.",
+        "inputs": "STAR's BAM_OUT (<download_root>/STAR_bams), the detected organism, the vendored altanalyze/ toolkit",
+        "outputs": "runtable/bed/ + bed_bundle.zip",
+    },
+    "bed_submit": {
+        "title": "Launch BAM->BED",
+        "what": "(Autonomous mode only) Uploads the BED bundle to <BAM_OUT>/bed/ (the ~100 MB exon reference is "
+                "uploaded once and size-skipped on re-runs) and queues a launcher that WAITS for STAR to finish "
+                "(polls <BAM_OUT>/PIPELINE_COMPLETE.txt), then runs ./run_bed_pipeline.sh — converting each BAM "
+                "to AltAnalyze <sample>__junction.bed + <sample>__exon.bed beside it. Non-fatal: the bundle "
+                "stays downloadable.",
+        "inputs": "bed_bundle.zip + the vendored exon ref, your SSH settings, the running/finished STAR alignment",
+        "outputs": "(remote) <sample>__junction.bed + <sample>__exon.bed; bed_submit.json",
+    },
+    "psi_bundle": {
+        "title": "Build AltAnalyze (PSI) bundle",
+        "what": "(Bulk RNA-seq module) Assembles the AltAnalyze splicing bundle: the self-driving psi scripts, a "
+                "config.sh pointed at the BED dir (STAR_beds) + the species, and sample_groups.tsv — a "
+                "BioSample->group map for the differential comparison. By default the groups are the run table's "
+                "treated-vs-control classification; with user-defined groups they come from a deterministic + AI "
+                "assignment. AltAnalyze itself is NOT shipped (it is multi-GB with its database) — it is resolved "
+                "on the cluster at submit time. JOB_TAG is the download tag + '_psi'.",
+        "inputs": "the BED stage's BED_OUT_DIR (<download_root>/STAR_beds), the annotated SraRunTable_<line>.csv",
+        "outputs": "runtable/psi/ + psi_bundle.zip (config.sh, scripts, sample_groups.tsv)",
+    },
+    "psi_submit": {
+        "title": "Run AltAnalyze splicing",
+        "what": "(Autonomous mode only) Resolves AltAnalyze on the cluster — uses an install found at "
+                "ALTANALYZE_HOME (default the lab install) with its species database, or uploads a local copy only "
+                "if none is found (an ALTANALYZE_DB path override is supported). Uploads the PSI bundle and queues a "
+                "launcher that WAITS for BAM->BED to finish (polls <BAM_OUT>/bed/PIPELINE_COMPLETE.txt), then runs "
+                "ONE AltAnalyze job over the whole BED dir -> a per-sample PSI table, plus a differential dPSI "
+                "comparison when a usable 2-group split exists (groupless otherwise). Non-fatal: the bundle stays "
+                "downloadable.",
+        "inputs": "psi_bundle.zip, your SSH settings, AltAnalyze on the cluster, the running/finished BAM->BED stage",
+        "outputs": "(remote) <psi_root>/output/AltResults PSI/dPSI tables; psi_submit.json",
+    },
 }

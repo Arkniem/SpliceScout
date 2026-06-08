@@ -18,7 +18,7 @@ for S in */; do
   sdir="$STUDIES_DIR/$name"
 
   # idempotent skips
-  nacc=$(grep -c . "$S/SraAccList.txt")
+  nacc=$(sra_count_nonblank "$S/SraAccList.txt")   # pure-bash count (grep -c empty on compute nodes)
   ngz=$(sra_done_count "$sdir")
   nsra=$(ls "$sdir"/*.sra 2>/dev/null | wc -l)
   if [ "$ngz" -ge "$nacc" ] && [ "$nsra" -eq 0 ]; then

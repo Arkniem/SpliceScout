@@ -70,6 +70,16 @@ class Paths:
         self.star_bundle_zip = os.path.join(self.runtable_dir, "star_bundle.zip")
         self.star_status = os.path.join(self.runtable_dir, "star_submit.json")  # what the STAR upload did
 
+        # stages 17-18: BAM->BED handoff (AltAnalyze junction/exon; auto-chained after STAR)
+        self.bed_dir = os.path.join(self.runtable_dir, "bed")                 # BED bundle root
+        self.bed_bundle_zip = os.path.join(self.runtable_dir, "bed_bundle.zip")
+        self.bed_status = os.path.join(self.runtable_dir, "bed_submit.json")  # what the BED upload did
+
+        # stages 19-20: AltAnalyze splicing (PSI) handoff (auto-chained after BAM->BED)
+        self.psi_dir = os.path.join(self.runtable_dir, "psi")                 # PSI bundle root
+        self.psi_bundle_zip = os.path.join(self.runtable_dir, "psi_bundle.zip")
+        self.psi_status = os.path.join(self.runtable_dir, "psi_submit.json")  # what the PSI upload did
+
     def runtable_filtered_csv(self, slug):
         return os.path.join(self.runtable_dir, f"SraRunTable_{slug}.csv")
 
@@ -83,6 +93,6 @@ class Paths:
         for d in (self.run_dir, self.work_dir, self.compound_batches,
                   self.compound_results, self.sample_batches, self.sample_results,
                   self.tables_dir, self.runtable_dir, self.xml_cache_dir, self.cluster_dir,
-                  self.star_dir):
+                  self.star_dir, self.bed_dir, self.psi_dir):
             os.makedirs(d, exist_ok=True)
         return self
