@@ -17,6 +17,7 @@ import html
 import threading
 import urllib.request
 import urllib.parse
+import urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from normalize_v2 import clean_compound  # single source of truth for dose/control logic
@@ -45,8 +46,37 @@ _throttle_lock = threading.Lock()
 
 def _configure(ncbi_key):
     _state["key"] = ncbi_key
-    _state["interval"] = 0.11 if ncbi_key else 0.34
+    # a touch under NCBI's cap (10/s keyed, 3/s keyless) for headroom; _slow_pacer() raises it on a 429
+    _state["interval"] = 0.13 if ncbi_key else 0.36
     _state["last"] = 0.0
+    _state["throttled_notice"] = False
+
+
+def _is_429(e):
+    return isinstance(e, urllib.error.HTTPError) and e.code == 429
+
+
+def _retry_after(e, default):
+    """Honor NCBI's Retry-After header on a 429 when present, else the caller's backoff."""
+    try:
+        if isinstance(e, urllib.error.HTTPError):
+            ra = e.headers.get("Retry-After")
+            if ra:
+                return max(default, min(120.0, float(ra)))
+    except Exception:
+        pass
+    return default
+
+
+def _slow_pacer():
+    """On a 429, PERMANENTLY raise the GLOBAL request interval so EVERY parallel worker backs off and the
+    rate-limit storm quells itself (not just the one thread that got the 429)."""
+    with _throttle_lock:
+        _state["interval"] = min(_state["interval"] + 0.05, 1.0)
+        if not _state.get("throttled_notice"):
+            _state["throttled_notice"] = True
+            print(f"  NCBI 429 rate-limit hit -> slowing ALL extract workers (req interval now "
+                  f"~{_state['interval']:.2f}s); automatic, the run keeps going.")
 
 
 def _ksuf():
@@ -62,19 +92,30 @@ def _throttle():
         _state["last"] = time.monotonic()
 
 
-def fetch(url, retries=4):
+def fetch(url, retries=8):
+    """GET with global pacing + resilient retries. A 429 (NCBI rate cap) is RIDDEN OUT: honor Retry-After,
+    back off, and slow EVERY worker (so the parallel storm quells), retrying generously rather than failing
+    the study. Non-429 errors get bounded retries. The network call is outside the throttle lock so responses
+    still overlap across threads."""
     url += _ksuf()
-    for attempt in range(retries):
+    attempt = 0
+    while True:
         _throttle()                      # global pacing (thread-safe); network call is outside the lock
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=45) as r:
                 return r.read().decode("utf-8", "replace")
-        except Exception:
-            if attempt == retries - 1:
+        except Exception as e:
+            attempt += 1
+            if _is_429(e):
+                _slow_pacer()                                       # slow ALL workers, not just this one
+                if attempt <= 15:
+                    time.sleep(_retry_after(e, min(60.0, 1.5 * (2 ** min(attempt, 5)))))
+                    continue
+                return None                                         # gave up after generous 429 retries
+            if attempt >= retries:
                 return None
-            time.sleep(1.5 * (attempt + 1))
-    return None
+            time.sleep(1.5 * attempt)
 
 
 def parse_protocol(xml):

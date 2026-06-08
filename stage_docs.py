@@ -128,8 +128,9 @@ STAGE_DOCS = {
     "cluster_bundle": {
         "title": "Build cluster bundle",
         "what": "Assembles a ready-to-run LSF download bundle: the vendored cluster scripts, a config.sh "
-                "filled from your settings (with a per-cell-line PIPELINE_ROOT subfolder so runs never "
-                "mix, and an auto JOB_TAG per instance), and the PER-STUDY accession lists (each study "
+                "filled from your settings (into a per-INSTANCE PIPELINE_ROOT subfolder named by the "
+                "instance tag, so every stage + re-run of one instance shares a stable folder and runs "
+                "never mix), and the PER-STUDY accession lists (each study "
                 "downloaded independently). Zipped for download.",
         "inputs": "by_study/<GSE>/SraAccList.txt, your cluster settings",
         "outputs": "runtable/cluster/ + cluster_bundle.zip",

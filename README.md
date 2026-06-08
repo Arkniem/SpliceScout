@@ -215,9 +215,14 @@ Hands the per-study accession lists to an LSF download/convert pipeline (vendore
 - **manual** — builds `cluster_bundle.zip` for you to download and run yourself.
 - **autonomous** — uploads the bundle over SSH and runs `./run_pipeline.sh` on the cluster.
 
-Each run is **isolated** in its own per-cell-line subfolder under `PIPELINE_ROOT` (e.g.
-`/data/mylab/sra/A549`), so runs never mix. The bundle ships **per-study** `by_study/<GSE>/` lists
-(never a single combined list) so each study is downloaded and converted independently.
+Each run is **isolated** in its own per-**instance** subfolder under `PIPELINE_ROOT`, named by the
+instance tag (e.g. `/data/mylab/sra/A549`), so every stage (download → STAR → BED → PSI) and every
+re-run or phase-start of the same instance shares ONE stable folder and runs never mix. (It used to be
+keyed on the cell-line name, which scattered a project across folders when the AI named the line
+differently between runs.) The resolved cell line is recorded in a **`CELL_LINE.txt`** at the folder
+root (so `cat …/Brazen/CELL_LINE.txt` or `grep -H . …/*/CELL_LINE.txt` maps each instance folder back to
+its cell line). The bundle ships **per-study** `by_study/<GSE>/` lists (never a single combined list) so
+each study is downloaded and converted independently.
 
 The cluster **`JOB_TAG`** (which namespaces this project's LSF job names) comes from the **instance
 name you're prompted for at launch** (e.g. `A549`); leave it blank and it auto-picks the next free

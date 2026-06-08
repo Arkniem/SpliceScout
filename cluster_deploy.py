@@ -99,13 +99,19 @@ def _slug(name):
     return re.sub(r"[^A-Za-z0-9._-]+", "_", str(name)).strip("_") or "cellline"
 
 
-def _effective_root(cluster_cfg, sel):
-    """The form's PIPELINE_ROOT + a per-cell-line subfolder, so each run is ISOLATED — its bundle
-    deploys to e.g. /data/mylab/sra/UMUC9 and only that line's studies live there. No merging with
-    studies left over from previous runs to the same parent path; non-destructive to other runs."""
-    base = _resolve_cfg(cluster_cfg)["PIPELINE_ROOT"].rstrip("/")
-    line = _slug((sel or {}).get("canonical", "")) if sel else ""
-    return f"{base}/{line}" if line else base
+def _effective_root(cluster_cfg, sel=None):
+    """The form's PIPELINE_ROOT + a per-INSTANCE subfolder (the JOB_TAG / instance tag), so each run is
+    ISOLATED *and* STABLE: every stage (download -> STAR -> BED -> PSI) and every re-run or phase-start of
+    the SAME instance resolves to the SAME folder, no matter how the AI happens to name the cell line that
+    run. It used to key on the cell-line slug, which fragmented ONE project across folders (e.g. MDS-L /
+    MDSL_Cell_line / MDSL) when the AI matcher named the line differently between runs — so a later
+    phase-start's STAR/BED/PSI launchers polled a folder the download never populated, and the auto-chain
+    silently never fired. `sel` is accepted for call-site compatibility but no longer used."""
+    cfg = _resolve_cfg(cluster_cfg)
+    base = cfg["PIPELINE_ROOT"].rstrip("/")
+    raw = str(cfg.get("JOB_TAG", "") or "").strip()
+    tag = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("_") if raw else ""
+    return f"{base}/{tag}" if tag else base
 
 
 def _read_config_root(P):
@@ -120,11 +126,42 @@ def _read_config_root(P):
 
 
 # ---------- stage 13: build the bundle ----------
-def _write_instructions(P, vals, n_studies, n_acc):
+def _gse_list(sel):
+    out = []
+    for s in (sel or {}).get("studies", []) or []:
+        if isinstance(s, dict):
+            g = s.get("gse") or s.get("accession") or s.get("GSE_Series") or s.get("GSE")
+            if g:
+                out.append(str(g))
+        elif s:
+            out.append(str(s))
+    return out
+
+
+def _write_cellline_marker(P, sel, vals):
+    """Stamp the resolved cell line into the cluster folder. The folder is named by the STABLE instance
+    tag (not the cell line), so this CELL_LINE.txt is how you map folder -> cell line on the cluster:
+    `cat <root>/CELL_LINE.txt` or `grep -H . <PIPELINE_ROOT>/*/CELL_LINE.txt`."""
+    root = vals["PIPELINE_ROOT"]
+    canonical = (sel or {}).get("canonical", "") if sel else ""
+    gses = _gse_list(sel)
+    body = (
+        f"{canonical or '(cell line unknown)'}\n"
+        f"cluster folder (instance tag): {os.path.basename(root.rstrip('/'))}\n"
+        f"PIPELINE_ROOT: {root}\n"
+        + (f"GEO studies: {', '.join(gses)}\n" if gses else "")
+    )
+    with open(os.path.join(P.cluster_dir, "CELL_LINE.txt"), "w", encoding="utf-8", newline="\n") as f:
+        f.write(body)
+
+
+def _write_instructions(P, vals, n_studies, n_acc, canonical=""):
     root = vals["PIPELINE_ROOT"]
     txt = (
         "GEO -> SRA cluster download bundle\n"
         "==================================\n"
+        f"Cell line: {canonical or '(unknown)'}    (this folder is named by the instance tag, "
+        "NOT the cell line -- see CELL_LINE.txt)\n"
         f"{n_studies} studies, {n_acc} run accessions, organized one folder per study under by_study/.\n\n"
         "Run on your LSF cluster:\n"
         f"  1. Put this bundle on the cluster at:  {root}\n"
@@ -136,8 +173,9 @@ def _write_instructions(P, vals, n_studies, n_acc):
         "       ./run_pipeline.sh\n"
         f"  3. Watch:  ./status.sh   (or  tail -f {root}/watchdog.log )\n"
         f"     Done when  {root}/PIPELINE_COMPLETE.txt  appears.\n\n"
-        f"This run is isolated in its own per-cell-line folder ({root}), so it never mixes with the\n"
-        "studies from any other run that targets the same parent path.\n\n"
+        f"This run is isolated in its own per-INSTANCE folder ({root}, named by the instance tag), so it never\n"
+        "mixes with other instances -- and EVERY stage (download/STAR/BED/PSI) plus every re-run or\n"
+        "phase-start of THIS instance lands in this same folder, regardless of how the cell line is named.\n\n"
         f"config.sh is pre-filled (PIPELINE_ROOT={root}, THREADS={vals['THREADS']}, "
         f"MEM_MB={vals['MEM_MB']}, WALL={vals['WALL']}). Edit it if your cluster's module names / "
         "queue / limits differ. Each study under by_study/ is downloaded and converted INDEPENDENTLY "
@@ -178,8 +216,9 @@ def build_bundle(P, sel, cluster_cfg, reporter=NULL):
             with open(os.path.join(P.cluster_dir, name), "w", encoding="utf-8", newline="\n") as f:
                 f.write(txt)
 
-    # filled config.sh (LF newlines — it runs on the cluster). PIPELINE_ROOT gets a per-cell-line
-    # subfolder so this run is isolated and never mixes with studies from previous runs.
+    # filled config.sh (LF newlines — it runs on the cluster). PIPELINE_ROOT gets a per-INSTANCE
+    # subfolder (the JOB_TAG/instance tag) so every stage + re-run of one instance shares a STABLE folder
+    # (the cell-line name, which the AI can resolve differently between runs, no longer steers the path).
     vals = _resolve_cfg(cluster_cfg)
     vals["PIPELINE_ROOT"] = _effective_root(cluster_cfg, sel)
     template_text = open(os.path.join(TEMPLATE_DIR, "config.sh"), encoding="utf-8").read()
@@ -203,12 +242,15 @@ def build_bundle(P, sel, cluster_cfg, reporter=NULL):
                 n_studies += 1
                 n_acc += len(accs)
 
-    _write_instructions(P, vals, n_studies, n_acc)
+    _canonical = (sel or {}).get("canonical", "") if sel else ""
+    _write_cellline_marker(P, sel, vals)          # CELL_LINE.txt -> uploaded to the folder root
+    _write_instructions(P, vals, n_studies, n_acc, canonical=_canonical)
     _zip_dir(P.cluster_dir, P.cluster_bundle_zip)
-    print(f"  CLUSTER BUNDLE: {n_studies} studies, {n_acc} accessions (split per study) "
-          f"-> {os.path.basename(P.cluster_bundle_zip)}")
+    print(f"  CLUSTER BUNDLE: {n_studies} studies, {n_acc} accessions (split per study); "
+          f"cell line {_canonical or '?'} -> {os.path.basename(P.cluster_bundle_zip)}")
     reporter.set_detail(f"{n_studies} studies / {n_acc} accessions zipped")
-    return {"n_studies": n_studies, "n_accessions": n_acc, "pipeline_root": vals["PIPELINE_ROOT"]}
+    return {"n_studies": n_studies, "n_accessions": n_acc, "pipeline_root": vals["PIPELINE_ROOT"],
+            "cell_line": _canonical}
 
 
 # ---------- stage 14: autonomous SSH submit ----------
@@ -382,7 +424,7 @@ def submit_over_ssh(P, cluster_cfg, secrets, reporter=NULL):
     port = str(cfg.get("ssh_port") or "22").strip() or "22"
     keyfile = (cfg.get("ssh_key") or "").strip()
     password = secrets.get("ssh_password") or ""
-    # upload to exactly the PIPELINE_ROOT the bundle's config.sh declares (the per-cell-line subfolder)
+    # upload to exactly the PIPELINE_ROOT the bundle's config.sh declares (the per-instance subfolder)
     root = _read_config_root(P) or _resolve_cfg(cfg)["PIPELINE_ROOT"]
 
     if not host or not user:

@@ -475,10 +475,11 @@ def _save_settings(body):
     """Persist form inputs locally so they prefill next launch. The SSH password is NEVER written to
     disk (it lives only in the in-memory secrets dict for the active run); the file is written 0600 +
     atomically. API/NCBI keys are still persisted for prefill but are stripped from /api/settings."""
+    # NOTE: start_stage/end_stage are deliberately NOT persisted -- the phase range always launches at its
+    # largest (full pipeline) and is a per-run override, never a saved preference.
     keep = {k: body[k] for k in
             ("query", "scope", "cap", "skip_ai", "provider", "api_keys", "ncbi_key", "model",
-             "base_url", "disable_reasoning", "module", "concurrency", "pick_mode", "cluster_mode",
-             "start_stage", "end_stage") if k in body}
+             "base_url", "disable_reasoning", "module", "concurrency", "pick_mode", "cluster_mode") if k in body}
     if isinstance(body.get("cluster"), dict):
         keep["cluster"] = {k: v for k, v in body["cluster"].items() if k != "ssh_password"}
     if isinstance(body.get("star"), dict):
@@ -771,7 +772,7 @@ class Handler(BaseHTTPRequestHandler):
                     run_module = ""
             if run_module == "bulk_rna_seq" and status.get("ok"):
                 # Self-discover BAM_OUT so the STAR/BED probes don't point at the BASE root (which omits
-                # the per-cell-line subfolder) after a restart or a STAR-start run -> progress would read
+                # the per-instance subfolder) after a restart or a STAR-start run -> progress would read
                 # 0/0. Order: the star bundle's own config.sh (most authoritative) > the root the download
                 # probe DISCOVERED from live job CWDs > the saved base root.
                 bam_out = ""
@@ -1216,7 +1217,7 @@ PAGE = r"""<!DOCTYPE html>
           <label id="lblManualDl"><input type="radio" name="clmode" value="manual"> Download a bundle</label>
           <label id="lblClOff"><input type="radio" name="clmode" value="off"> Off</label>
         </div>
-        <div class="hint">Hands the per-study accession lists to your LSF download pipeline (each study downloaded/converted separately). <b>Autonomous</b> uploads the bundle to your cluster and runs <code>./run_pipeline.sh</code>; <b>Download</b> gives you a ready-to-run zip. Each run lands in its own <b>per-cell-line subfolder</b> under PIPELINE_ROOT (e.g. <code>…/UMUC9</code>), so runs never mix.</div>
+        <div class="hint">Hands the per-study accession lists to your LSF download pipeline (each study downloaded/converted separately). <b>Autonomous</b> uploads the bundle to your cluster and runs <code>./run_pipeline.sh</code>; <b>Download</b> gives you a ready-to-run zip. Each run lands in its own <b>per-instance subfolder</b> under PIPELINE_ROOT named by the instance tag (e.g. <code>…/Brazen</code>), so every stage + re-run of one instance shares a stable folder and runs never mix.</div>
         <div id="clfields">
           <input type="text" id="clroot" placeholder="PIPELINE_ROOT — absolute path on the cluster, e.g. /data/mylab/sra" style="margin-top:10px" autocomplete="off">
           <div id="sshwrap">
@@ -1507,7 +1508,7 @@ $('#form').addEventListener('submit', async e=>{
     concurrency: $('#conc').value,
     deep_dive: true,
     start_stage: ((CHECKPOINTS[startIdx]||{}).stage || 'fetch'),
-    end_stage: ((CHECKPOINTS[endIdx]||{}).end_stage || 'bed_submit'),
+    end_stage: ((CHECKPOINTS[endIdx]||{}).end_stage || 'psi_submit'),
     supplied_inputs: collectStartInputs(),
     pick_mode: document.querySelector('input[name=pick]:checked').value,
     module: (document.querySelector('input[name=module]:checked')||{}).value || 'bulk_rna_seq',
@@ -2127,8 +2128,10 @@ function applySettings(s){
   const pg=(s.groups&&s.groups.groups)||[];
   if(pg.length && $('#psigroups') && typeof addGroupRow==='function'){ $('#psigroups').innerHTML='';
     pg.forEach(g=>addGroupRow(g.name||'', (g.keywords||[]).join(', '), g.control)); }
-  if(s.start_stage && typeof CHECKPOINTS!=='undefined'){ const i=CHECKPOINTS.findIndex(c=>c.stage===s.start_stage); if(i>=0) startIdx=i; }
-  if(s.end_stage && typeof CHECKPOINTS!=='undefined'){ const i=CHECKPOINTS.findIndex(c=>c.end_stage===s.end_stage); if(i>=0) endIdx=i; }
+  // Pipeline range ALWAYS launches at its LARGEST (full fetch -> psi_submit). The slider is a per-run
+  // override, NOT a persisted preference, so a saved narrow end (e.g. bed_submit) can never silently cap a
+  // launch. Drag the rail per run if you want a partial range.
+  if(typeof CHECKPOINTS!=='undefined'){ startIdx = 0; endIdx = Math.max(0, CHECKPOINTS.length - 1); }
   if(typeof renderPhaseRail==='function') renderPhaseRail();
   if(s.cluster && (s.cluster.ssh_host||'').trim()) $('#clusterCheck').hidden=false;  // enable after-restart status check
   syncScope(); syncPick(); syncModule(); syncClusterMode();

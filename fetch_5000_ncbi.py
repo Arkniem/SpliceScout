@@ -5,6 +5,7 @@ into a run directory (paths from pipeline_paths.Paths).
 """
 import urllib.request
 import urllib.parse
+import urllib.error
 import json
 import time
 import os
@@ -17,8 +18,25 @@ def _key_suffix(ncbi_key):
 
 
 def _pace(ncbi_key):
-    # NCBI: 10 req/s with key, 3 req/s without
-    return 0.11 if ncbi_key else 0.34
+    # NCBI caps at 10 req/s with a key, 3 req/s without. Stay a touch UNDER the cap for headroom (a burst
+    # right at the line is what trips the occasional 429), then the adaptive slowdown handles the rest.
+    return 0.13 if ncbi_key else 0.36
+
+
+def _is_rate_limited(e):
+    return isinstance(e, urllib.error.HTTPError) and e.code == 429
+
+
+def _retry_after_secs(e, default):
+    """Honor NCBI's Retry-After header on a 429 when present, else use the caller's backoff."""
+    try:
+        if isinstance(e, urllib.error.HTTPError):
+            ra = e.headers.get("Retry-After")
+            if ra:
+                return max(default, min(120.0, float(ra)))
+    except Exception:
+        pass
+    return default
 
 
 def search_all_ids(query, db="gds", max_results=5000, ncbi_key=None):
@@ -30,9 +48,10 @@ def search_all_ids(query, db="gds", max_results=5000, ncbi_key=None):
                f"?db={db}&term={urllib.parse.quote(query)}&retmode=json"
                f"&retmax={min(batch, max_results - retstart)}&retstart={retstart}"
                f"{_key_suffix(ncbi_key)}")
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        for attempt in range(4):
+        ids = []
+        for attempt in range(6):
             try:
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
                 with urllib.request.urlopen(req, timeout=30) as resp:
                     data = json.loads(resp.read().decode())
                 ids = data['esearchresult']['idlist']
@@ -41,8 +60,10 @@ def search_all_ids(query, db="gds", max_results=5000, ncbi_key=None):
                 print(f"  Fetched IDs {retstart}-{retstart+len(ids)} of {total}")
                 break
             except Exception as e:
-                print(f"  esearch error at retstart={retstart}: {e}; retrying...")
-                time.sleep(2 * (attempt + 1))
+                wait = _retry_after_secs(e, min(60.0, 2 ** attempt)) if _is_rate_limited(e) else 2 * (attempt + 1)
+                tag = "429 rate-limited" if _is_rate_limited(e) else "error"
+                print(f"  esearch {tag} at retstart={retstart}: {e}; waiting {wait:.0f}s...")
+                time.sleep(wait)
         retstart += batch
         if retstart >= total or not ids:
             break
@@ -55,12 +76,15 @@ def fetch_summaries_batch(id_list, db="gds", batch_size=50, ncbi_key=None, repor
     all_results = {}
     total_batches = (len(id_list) + batch_size - 1) // batch_size
     reporter.set_total(total_batches)
+    extra_pace = 0.0   # adaptive: grows on each 429 so the WHOLE run slows down and stops tripping the cap
+    missing = []
     for i in range(0, len(id_list), batch_size):
         batch_ids = id_list[i:i + batch_size]
         url = (f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
                f"?db={db}&id={','.join(batch_ids)}&retmode=json{_key_suffix(ncbi_key)}")
         batch_num = i // batch_size + 1
-        for attempt in range(5):
+        attempt = 0
+        while True:
             try:
                 req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
                 with urllib.request.urlopen(req, timeout=30) as resp:
@@ -71,12 +95,35 @@ def fetch_summaries_batch(id_list, db="gds", batch_size=50, ncbi_key=None, repor
                         print(f"  Summary batch {batch_num}/{total_batches}")
                 break
             except Exception as e:
-                wait = 2 ** attempt
+                attempt += 1
+                if _is_rate_limited(e):
+                    # 429 is transient: back off (honor Retry-After), PERMANENTLY slow the steady pace so we
+                    # stop hitting the cap, and keep retrying for a while rather than dropping these studies.
+                    extra_pace = min(extra_pace + 0.1, 1.0)
+                    wait = _retry_after_secs(e, min(60.0, 1.5 * (2 ** min(attempt, 5))))
+                    if attempt <= 15:
+                        print(f"  esummary batch {batch_num}: HTTP 429 Too Many Requests -> waiting {wait:.0f}s, "
+                              f"slowing pace (+{extra_pace:.1f}s/req); retry {attempt}")
+                        time.sleep(wait)
+                        continue
+                    print(f"  esummary batch {batch_num}: still 429 after {attempt} tries -> omitting its studies")
+                    missing.append(batch_num)
+                    break
+                # other transient error -> bounded retries
+                if attempt > 5:
+                    print(f"  esummary batch {batch_num}: failed after {attempt} tries ({e}) -> omitting its studies")
+                    missing.append(batch_num)
+                    break
+                wait = 2 ** (attempt - 1)
                 print(f"  esummary error batch {batch_num}: {e}; waiting {wait}s...")
                 time.sleep(wait)
         reporter.advance(1)
-        reporter.set_detail(f"summaries {batch_num}/{total_batches}")
-        time.sleep(_pace(ncbi_key))
+        reporter.set_detail(f"summaries {batch_num}/{total_batches}"
+                            + (f" (throttled +{extra_pace:.1f}s)" if extra_pace else ""))
+        time.sleep(_pace(ncbi_key) + extra_pace)
+    if missing:
+        print(f"  WARNING: {len(missing)} esummary batch(es) could not be fetched after retries (NCBI "
+              f"throttling); their studies are OMITTED. Re-run to fill the gaps, or check your NCBI API key.")
     return all_results
 
 
