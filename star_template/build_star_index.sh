@@ -16,6 +16,7 @@ star_load_modules
 
 ORG="${1:-organism}"; IDX="$2"; FAURL="$3"; GTFURL="$4"; THR="${5:-${BUILD_THREADS:-16}}"; OH="${6:-100}"
 MARK="$IDX/.star_index_done"
+trap 'rmdir "${IDX%/}.buildlock" 2>/dev/null' EXIT   # release the cross-run build lock resolve_index.sh took
 
 command -v STAR >/dev/null 2>&1 || { echo "[buildidx] STAR not on PATH" >&2; exit 1; }
 if star_index_valid "$IDX"; then

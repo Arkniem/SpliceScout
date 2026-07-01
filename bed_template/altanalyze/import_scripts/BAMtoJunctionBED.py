@@ -319,6 +319,10 @@ def parseJunctionEntries(bam_dir,multi=False, Species=None, ReferenceDir=None):
     writeJunctionBedFile(junction_db,jid,o) ### One last read-out
     if multi == False:
         print bam_reads, count, time.time()-start, 'seconds required to parse the BAM file'
+    try: ### Force the junction.bed to disk so a walltime-killed job cannot leave a truncated file
+        o.flush()
+        os.fsync(o.fileno())
+    except Exception: pass
     o.close()
     bamf.close()
     

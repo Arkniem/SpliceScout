@@ -128,8 +128,11 @@ else
     done
   fi
 fi
-READS="$R1"
-[ "$R2" != "NA" ] && [ -n "$R2" ] && READS="$R1 $R2"
+# READS as an ARRAY so it can be passed QUOTED ("${READS[@]}") -- an unquoted scalar would word-split
+# and glob-expand on any space/odd char in a staged or by_study path. STAR takes R1 then R2 as separate
+# args (each may itself be a comma-list of lanes, which STAR parses), so two array elements suffice.
+READS=("$R1")
+[ "$R2" != "NA" ] && [ -n "$R2" ] && READS=("$R1" "$R2")
 
 # conditional splice-junction GTF (default: index already has it -> don't re-supply)
 SJDB=()
@@ -139,7 +142,7 @@ echo "[star] $SAMPLE: aligning (threads=$THREADS, sortRAM=$SORT_RAM)"
 cd "$WORK" || exit 1
 STAR --runThreadN "$THREADS" \
      --genomeDir "$GENOME_DIR" \
-     --readFilesIn $READS \
+     --readFilesIn "${READS[@]}" \
      --readFilesCommand gunzip -c \
      --outFileNamePrefix "$WORK/${SAMPLE}_" \
      --outSAMtype BAM SortedByCoordinate \
@@ -166,17 +169,31 @@ if [ "$RC" -ne 0 ] || [ ! -s "$BAM" ]; then
   exit 1
 fi
 
-# publish + verify the BAM
-cp -f "$BAM" "$BAM_OUT/$SAMPLE.bam"
-if ! samtools quickcheck "$BAM_OUT/$SAMPLE.bam" 2>/dev/null; then
-  echo "[star] $SAMPLE: published BAM failed quickcheck -- retrying copy" >&2
-  cp -f "$BAM" "$BAM_OUT/$SAMPLE.bam"
-  samtools quickcheck "$BAM_OUT/$SAMPLE.bam" 2>/dev/null || { echo "[star] $SAMPLE: BAM publish FAILED" >&2; exit 1; }
+# publish + verify the BAM via a UNIQUE temp on the BAM_OUT volume, then an ATOMIC rename. So two concurrent
+# STAR jobs for the SAME sample (a duplicate watchdog resubmit) can NEVER write the shared <sample>.bam at
+# once and tear it -- the same concurrent-writer collision class as the BED beds. Last-writer-wins on a
+# COMPLETE, quickcheck-valid bam (the rename is atomic same-volume; the cp into the temp is the slow part).
+_pub="$BAM_OUT/$SAMPLE.bam"
+_tmp="$BAM_OUT/.$SAMPLE.${LSB_JOBID:-$$}.tmp.bam"
+if ! { cp -f "$BAM" "$_tmp" && samtools quickcheck "$_tmp" 2>/dev/null; }; then
+  echo "[star] $SAMPLE: staged BAM copy failed quickcheck -- retrying" >&2
+  cp -f "$BAM" "$_tmp"
+  samtools quickcheck "$_tmp" 2>/dev/null || { echo "[star] $SAMPLE: BAM publish FAILED" >&2; rm -f "$_tmp"; exit 1; }
 fi
+mv -f "$_tmp" "$_pub"
+samtools quickcheck "$_pub" 2>/dev/null || { echo "[star] $SAMPLE: published BAM failed quickcheck" >&2; exit 1; }
 # index = a full BAM decode (catches truncation samtools quickcheck misses); its success gates the
-# irreversible FASTQ deletion below, and produces the .bai the BED stage needs.
+# irreversible FASTQ deletion below, and produces the .bai the BED stage needs. Treat the index as done
+# ONLY when the .bai ACTUALLY exists -- `samtools index` can exit 0 yet leave no .bai on a flaky NFS,
+# and a missing index must NOT be mistaken for a successfully-verified BAM (it gates FASTQ deletion).
+# Validate the BAM with quickcheck first, then index; retry once if the .bai didn't materialize.
 _INDEXED=0
-samtools index "$BAM_OUT/$SAMPLE.bam" 2>/dev/null && _INDEXED=1
+_BAI="$BAM_OUT/$SAMPLE.bam.bai"
+if samtools quickcheck "$BAM_OUT/$SAMPLE.bam" 2>/dev/null; then
+  samtools index "$BAM_OUT/$SAMPLE.bam" 2>/dev/null
+  [ -s "$_BAI" ] || samtools index "$BAM_OUT/$SAMPLE.bam" 2>/dev/null
+  [ -s "$_BAI" ] && _INDEXED=1
+fi
 
 # keep splice junctions + alignment-QC log next to the BAMs (in logs/)
 [ -f "$WORK/${SAMPLE}_SJ.out.tab" ]    && cp -f "$WORK/${SAMPLE}_SJ.out.tab"    "$LOG_DIR/${SAMPLE}.SJ.out.tab"    2>/dev/null || true

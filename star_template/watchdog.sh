@@ -12,6 +12,8 @@
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/config.sh"
 source "$HERE/lib_star.sh"
+if [ -f "$HERE/lib_notify.sh" ]; then source "$HERE/lib_notify.sh"; else
+  log_event(){ :; }; notify_error(){ :; }; notify_update(){ :; }; fi
 [ -f "$PIPELINE_ROOT/RESOLVED_INDEX.env" ] && source "$PIPELINE_ROOT/RESOLVED_INDEX.env"  # resolved GENOME_DIR + BUILD_JID
 set -u; shopt -s nullglob
 star_load_modules                       # samtools, for quickcheck
@@ -52,7 +54,7 @@ finalize() {                            # $1 = COMPLETE | STALLED
   # would otherwise re-spawn the chain after we stop (T2.4/T6).
   local _self _wj
   _self="${LSB_JOBID:-}"
-  for _wj in $(bjobs -noheader -o jobid -J "${JOB_TAG}_watchdog" 2>/dev/null); do
+  for _wj in $(timeout 60 bjobs -noheader -o jobid -J "${JOB_TAG}_watchdog" 2>/dev/null); do
     [ "$_wj" = "$_self" ] && continue
     bkill "$_wj" >/dev/null 2>&1
   done
@@ -98,7 +100,7 @@ finalize() {                            # $1 = COMPLETE | STALLED
   # COMPLETE or STALLED so partial data still flows; bed_launch + BED finalize enforce the partial safety.
   if [ -f "$PIPELINE_ROOT/bed/bed_launch.sh" ]; then
     star_qopt
-    bsub -L /bin/bash -n 1 -M 1000 -W 120 -J "${JOB_TAG}_bed_launch" \
+    bsub -L /bin/bash -n 1 -M 1000 -W 66480 -J "${JOB_TAG}_bed_launch" \
          -o "$PIPELINE_ROOT/bed/launch.out" -e "$PIPELINE_ROOT/bed/launch.err" \
          ${QOPT[@]+"${QOPT[@]}"} "$PIPELINE_ROOT/bed/bed_launch.sh" >/dev/null 2>&1
     say "kicked BED launcher -> $PIPELINE_ROOT/bed/bed_launch.sh"
@@ -126,6 +128,10 @@ finalize() {                            # $1 = COMPLETE | STALLED
       say "cleanup: SKIPPED -- a work job is still live or bjobs is unreliable (kept tools, no risky rm)"
     fi
   fi
+  if [ "$status" = "STALLED" ]; then
+    notify_error "STAR stage STALLED" "$(head -20 "$rep" 2>/dev/null)" "star-stalled"
+    notify_diagnose "$JOB_TAG" "$PIPELINE_ROOT" "$SCRIPTS_DIR" "$LOG_DIR"
+  else notify_update "STAR stage COMPLETE" "$(head -10 "$rep" 2>/dev/null)"; fi
   say "FINALIZED ($status; partial=$partial) -> $rep  (watchdog stopping)"
 }
 
@@ -191,20 +197,39 @@ resub=0
 while IFS=$'\t' read -r label f1 f2; do
   [ -n "$label" ] || continue
   star_bam_ok "$label" && continue
+  star_is_dropped "$label" && continue        # already gave up on this sample (drop-after-N)
   jn="$(star_jobname "$label")"
   star_has_live "$jn" "$LIVE" && continue
   star_job_is_live "$jn" && continue        # targeted re-verify (T2.1): fail-closed against partial snapshots
   if [ "${f1:-NA}" != "NA" ] && [ -n "${f1:-}" ] && ! star_fastq_exists "$f1"; then
-    say "UNRECOVERABLE: $label has no valid BAM and its source FASTQ is gone ($f1) -- cannot re-align (re-download needed)"
+    star_drop_sample "$label" "fastq-gone"
+    say "UNRECOVERABLE: $label has no valid BAM and its source FASTQ is gone -- DROPPED (re-download needed to recover)"
+    continue
+  fi
+  # not done + not live = the last alignment FAILED -> count it; DROP after STAR_MAX_FAILS so one bad
+  # sample can't STALL the stage (mirrors download/BED).
+  _n=$(star_bump_attempt "$label")
+  if [ "$_n" -gt "${STAR_MAX_FAILS:-3}" ]; then
+    star_drop_sample "$label" "alignment"
+    say "DROPPED $label after $((_n - 1)) failed alignments -> logged to star_dropped.txt"
     continue
   fi
   star_submit_sample "$label" "$f1" "${f2:-NA}" >/dev/null && resub=$((resub+1))
 done < "$SAMPLE_LIST"
 [ "$resub" -gt 0 ] && say "resubmitted $resub missing/invalid sample(s)"
-say "progress: $done_n/$exp_n aligned ; $nlive live work job(s) ; $resub resubmitted this pass"
+dropped_n=$(star_dropped_count)
+say "progress: $done_n/$exp_n aligned ($dropped_n dropped after ${STAR_MAX_FAILS:-3} fails) ; $nlive live work job(s) ; $resub resubmitted this pass"
 
-# 2) completion: every sample done AND no live work job
-if [ "$done_n" -ge "$exp_n" ] && [ "$nlive" -eq 0 ]; then
+# MELTDOWN GUARD: a large fraction dropped = STAR/index/FASTQ globally broken -> STALL, not a false
+# COMPLETE with most BAMs missing (which would silently feed an almost-empty BED+PSI).
+_ceiling=$(( exp_n / 10 )); [ "$_ceiling" -lt 5 ] && _ceiling=5
+if [ "$dropped_n" -gt "$_ceiling" ] && [ "$nlive" -eq 0 ]; then
+  say "MELTDOWN: $dropped_n/$exp_n dropped (> $_ceiling = >10%) -> STALLED (inspect star_dropped.txt + logs, fix, re-run)"
+  finalize "STALLED"; exit 0
+fi
+
+# 2) completion: every sample done OR dropped, AND no live work job
+if [ "$(( done_n + dropped_n ))" -ge "$exp_n" ] && [ "$nlive" -eq 0 ]; then
   finalize "COMPLETE"; exit 0
 fi
 

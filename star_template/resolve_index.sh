@@ -40,6 +40,12 @@ if [ "${NEED_BUILD:-0}" -eq 1 ]; then
     echo "[resolve] a build job ($BJ, id ${BUILD_JID:-?}) is already live -> reusing it"
   elif star_index_valid "$RESOLVED"; then
     echo "[resolve] target index became valid -> no build needed"
+  elif ! mkdir "${RESOLVED%/}.buildlock" 2>/dev/null; then
+    # CROSS-RUN guard: another run (different JOB_TAG, so star_has_live above can't see it) is already
+    # building this EXACT shared index dir -> do NOT submit a 2nd build that would race the same files.
+    # build_star_index.sh removes the lock on exit; per-sample STAR jobs that start before the index is
+    # ready just fail + get resubmitted, so this never deadlocks even if the lock is briefly stale.
+    echo "[resolve] index build already claimed by another run (${RESOLVED%/}.buildlock) -> not duplicating"
   else
     echo "[resolve] submitting build-once job for '${ORGANISM:-?}' -> $RESOLVED"
     BUILD_JID="$(bsub -L /bin/bash -J "$BJ" \

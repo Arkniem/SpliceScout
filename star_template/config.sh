@@ -37,7 +37,7 @@ REF_GTF_URL=""                    # annotation GTF(.gz) URL for ORGANISM (filled
 BUILD_THREADS=16                  # genomeGenerate threads / LSF slots (heavy)
 BUILD_MEM_MB=64000                # genomeGenerate -M (GRCh38 needs ~32-40 GB)
 BUILD_MEM_RUSAGE=4000             # rusage[mem=] per slot for the build
-BUILD_WALL="8:00"                 # genomeGenerate walltime (HH:MM)
+BUILD_WALL="1108:00"              # genomeGenerate -W (HH:MM) — queue MAX (66480 min); never hits walltime
 
 # 4) SPLICE JUNCTIONS.  Leave SJDB_GTF EMPTY if the index was built WITH a GTF
 #    (the usual case -- re-supplying it at align time only wastes RAM). Set it to
@@ -65,11 +65,18 @@ STAR_EXTRA_ARGS=""                # raw extra args appended to the STAR command 
 # 8) LSF SCHEDULER.
 MEM_MB=64000                      # -M per job (genome ~29 GB + sort + headroom)
 MEM_RUSAGE=10000                  # rusage[mem=] per slot; x THREADS ~= total reserved
-WALL="24:00"                      # -W per job (HH:MM)
+WALL="1108:00"                    # -W per job (HH:MM) — queue MAX (66480 min) so jobs never hit walltime
 LSF_QUEUE=""                      # "" = cluster default queue; else e.g. "normal"/"long"
 
 # 9) AUTOMATION.
 JOB_TAG="star"                    # namespaces this run's LSF job names (make it unique per run)
+ALERT_EMAIL=""                    # baked at deploy from the PC settings -> cluster jobs email the user on error/milestone ('' = off)
+DIAGNOSE_ON_STALL=1               # on a STALL, ask the cluster CPU LLM (if installed) for a diagnosis + email it
+DIAGNOSE_AUTOFIX=0                # 1 = also let the AI APPLY a SAFE whitelisted fix (quarantine bed / re-arm), budget-capped
+DIAGNOSE_MAX_REARMS=2             # cap on AI auto re-arms before it stops and leaves the stall for a human
+DIAGNOSE_AI_HOME="/data/salomonis-archive/LabFiles/SpliceScout_AI"   # self-contained CPU LLM (conda env + GGUF model)
+DIAGNOSE_MODEL_PATH=""            # optional: full path to a specific .gguf to use (overrides the model search)
+DIAGNOSE_MODEL_DIR=""             # optional: dir to CACHE the model so future runs reuse it ('' = <PIPELINE_ROOT>/.splicescout_ai/models)
 WATCHDOG_INTERVAL_MIN=30          # how often the self-driving watchdog re-checks
 MAX_STALL_PASSES=2                # consecutive no-progress passes before giving up (STALLED)
 ABSOLUTE_MAX_PASSES=960           # HARD backstop: STALL after this many watchdog passes no matter what

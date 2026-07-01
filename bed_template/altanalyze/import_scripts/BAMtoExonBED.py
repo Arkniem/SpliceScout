@@ -388,9 +388,21 @@ def parseExonReferences(bam_dir,reference_exon_bed,multi=False,intronRetentionOn
             ### Occurs also due to non-chromosome contigs in the annotation file
             if 'bamfile without index' in e:
                 print 'Please ensure an index exists for the bam file:',bam_dir;sys.exit()
+    try: ### Force the BED outputs to disk so a walltime-killed job cannot leave a truncated file
+        o.flush()
+        os.fsync(o.fileno())
+    except Exception: pass
     try: o.close()
     except Exception: pass
+    try:
+        eo.flush()
+        os.fsync(eo.fileno())
+    except Exception: pass
     try: eo.close()
+    except Exception: pass
+    try:
+        io.flush()
+        os.fsync(io.fileno())
     except Exception: pass
     try: io.close()
     except Exception: pass

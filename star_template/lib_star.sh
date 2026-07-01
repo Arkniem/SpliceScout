@@ -15,8 +15,9 @@ star_qopt() { QOPT=(); [ -n "$LSF_QUEUE" ] && QOPT=(-q "$LSF_QUEUE"); }
 # Parse "Job <12345> is submitted ..." -> 12345
 star_jobid() { sed -n 's/.*Job <\([0-9]\{1,\}\)>.*/\1/p'; }
 
-# Snapshot of all live (PEND+RUN) LSF job names, one per line.
-star_live_names() { bjobs -noheader -o job_name 2>/dev/null; }
+# Snapshot of all live (PEND+RUN) LSF job names, one per line. Capped with `timeout 60` so a hung
+# bjobs (overloaded LSF) can't wedge a whole watchdog pass; the caller's empty/rc guard then skips.
+star_live_names() { timeout 60 bjobs -noheader -o job_name 2>/dev/null; }
 
 # Is job-name $1 present (exact match) in the newline-separated snapshot $2?
 star_has_live() { printf '%s\n' "$2" | grep -qxF "$1"; }
@@ -27,7 +28,9 @@ star_jobname() {
   local s="$1"
   s="${s//[^A-Za-z0-9_.-]/_}"               # only LSF-safe characters
   if [ "${#s}" -gt 40 ]; then               # cap length: readable head + stable hash tail
-    local h; h="$(printf '%s' "$1" | cksum | cut -d' ' -f1)"
+    # checksum AND byte-count (was checksum only) so two different long labels must collide on BOTH 32-bit
+    # fields before they alias to one job name -> collision becomes vanishingly unlikely.
+    local h; h="$(printf '%s' "$1" | cksum | awk '{print $1"x"$2}')"
     s="${s:0:31}_${h}"
   fi
   printf '%s_star_%s' "$JOB_TAG" "$s"
@@ -43,23 +46,44 @@ star_bam_ok() {
   [ -s "$b" ] && samtools quickcheck "$b" 2>/dev/null || return 1
   if [ "${STRICT_BAM_CHECK:-0}" = "1" ]; then
     [ -f "$LOG_DIR/$1.Log.final.out" ] || return 1
+    # `samtools idxstats` needs an index: with NO .bai it prints nothing and exits 0, so a missing index
+    # would zero the mapped-read sum and FALSELY fail an otherwise-good BAM. quickcheck already passed
+    # above, so create the index if it's missing before counting (idempotent; harmless if it exists).
+    [ -s "$b.bai" ] || [ -s "${b%.bam}.bai" ] || samtools index "$b" 2>/dev/null || return 1
     samtools idxstats "$b" 2>/dev/null | awk '{m+=$3} END{exit !(m>0)}' || return 1
   fi
   return 0
 }
 
-# Submit ONE sample. Args: label fastq1 fastq2(:-NA). Echoes the LSF job id.
+# Submit ONE sample. Args: label fastq1 fastq2(:-NA). Echoes the LSF job id on success.
+# VERIFY bsub SUCCESS on (re)arm: capture bsub's OWN exit status (a pipe to star_jobid would hide it
+# behind sed's rc) -- a failed bsub (PEND cap, transient LSF) echoes NOTHING and returns non-zero, so a
+# caller's `&& resub=...` won't miscount a non-submit as a resubmit and the sample is retried next pass.
 star_submit_sample() {
-  local label="$1" f1="$2" f2="${3:-NA}" jn
+  local label="$1" f1="$2" f2="${3:-NA}" jn out rc
   jn="$(star_jobname "$label")"
   star_qopt
+  # WALLTIME / MEM SELF-HEAL: if THIS sample's previous attempt hit an LSF limit, escalate its -W/-M for the
+  # retry -- else the same limit kills it again and it's DROPPED after STAR_MAX_FAILS. Per-sample + LOCAL, so
+  # one big sample never inflates the others. WALL -> queue max on a walltime kill; MEM (+rusage) +50% per
+  # mem kill. Reads the LAST termination from the sample's accumulated -o log (awk -> compute-node safe).
+  local _wall="$WALL" _mem="$MEM_MB" _rus="${MEM_RUSAGE:-$MEM_MB}" _jo="$LOG_DIR/star_${label}.out" _t _nm
+  if [ -f "$_jo" ]; then
+    _t=$(awk 'match($0,/TERM_(RUNLIMIT|MEMLIMIT)/){m=substr($0,RSTART,RLENGTH)} END{print m}' "$_jo" 2>/dev/null)
+    _nm=$(awk '/TERM_MEMLIMIT/{n++} END{print n+0}' "$_jo" 2>/dev/null); _nm=${_nm:-0}
+    [ "$_t" = "TERM_RUNLIMIT" ] && _wall="1108:00"
+    [ "${_nm:-0}" -gt 0 ] && { _mem=$(( _mem + _mem * _nm / 2 )); _rus=$(( _rus + _rus * _nm / 2 )); }
+  fi
   # If a build-once index job is pending (BUILD_JID, from RESOLVED_INDEX.env), wait for it.
   local DEPW=(); [ -n "${BUILD_JID:-}" ] && DEPW=(-w "done(${BUILD_JID})")
-  bsub -L /bin/bash ${QOPT[@]+"${QOPT[@]}"} ${DEPW[@]+"${DEPW[@]}"} \
-       -J "$jn" -n "$THREADS" -W "$WALL" -M "$MEM_MB" \
-       -R "rusage[mem=${MEM_RUSAGE}] span[hosts=1]" \
+  out=$(bsub -L /bin/bash ${QOPT[@]+"${QOPT[@]}"} ${DEPW[@]+"${DEPW[@]}"} \
+       -J "$jn" -n "$THREADS" -W "$_wall" -M "$_mem" \
+       -R "rusage[mem=${_rus}] span[hosts=1]" \
        -o "$LOG_DIR/star_${label}.out" -e "$LOG_DIR/star_${label}.err" \
-       "$SCRIPTS_DIR/run_star_job.sh" "$label" "$f1" "$f2" | star_jobid
+       "$SCRIPTS_DIR/run_star_job.sh" "$label" "$f1" "$f2" 2>&1)
+  rc=$?
+  [ "$rc" -eq 0 ] || return 1                  # bsub itself failed -> NOT submitted; let the caller retry
+  printf '%s' "$out" | star_jobid
 }
 
 # Non-empty rows in the sample list = the fixed-at-launch denominator. Counted with a PURE-BASH loop, NOT
@@ -105,13 +129,28 @@ star_live_work_count() { star_count_work "$(star_live_names)"; }
 # A non-zero rc means bjobs itself FAILED (overloaded/transient) -- the caller must NOT act on the result
 # (an empty/partial list would resubmit running jobs or falsely finalize). The rc CANNOT be returned via a
 # global here: command substitution runs in a SUBSHELL, so any var set inside is lost -- read $? instead.
-star_snapshot() { bjobs -noheader -o job_name 2>/dev/null; }
+# `timeout 60`: a hung bjobs under load returns non-zero here, which the caller treats as "unreliable,
+# skip the pass" -- far safer than blocking the watchdog walltime out on a single bjobs.
+star_snapshot() { timeout 60 bjobs -noheader -o job_name 2>/dev/null; }
 
 # Targeted, fail-CLOSED liveness re-check for ONE job name, used right BEFORE an expensive resubmit:
 # a SECOND independent bjobs query that a partial/truncated bulk snapshot can't fool. Live -> return 0
 # (skip the resubmit). (A transient failure here just defers to the pass-level snapshot guard + the
 # miss being retried next pass -- far cheaper than a duplicate alignment colliding on the same BAM.)
-star_job_is_live() { bjobs -noheader -o stat -J "$1" 2>/dev/null | grep -qE 'RUN|PEND'; }
+# Guard: `timeout 60` caps a hung query, an EMPTY result is NOT treated as done (an empty bjobs under
+# load must not green-light a duplicate submit), and an UNKNOWN/transient stat is re-polled ONCE before
+# we conclude the job is gone -- so a flaky single query can't drop a still-live job into a resubmit.
+star_job_is_live() {
+  local out
+  out="$(timeout 60 bjobs -noheader -o stat -J "$1" 2>/dev/null)"
+  printf '%s\n' "$out" | grep -qE 'RUN|PEND' && return 0
+  # UNKNOWN/UNKWN (LSF lost contact with the exec host) or an empty result: re-poll once before deciding.
+  if printf '%s\n' "$out" | grep -qiE 'UNKWN|UNKNOWN' || [ -z "$(printf '%s' "$out" | tr -d '[:space:]')" ]; then
+    out="$(timeout 60 bjobs -noheader -o stat -J "$1" 2>/dev/null)"
+    printf '%s\n' "$out" | grep -qE 'RUN|PEND' && return 0
+  fi
+  return 1
+}
 
 # Exactly-once finalization claim via an atomic mkdir (works over NFS where flock can silently
 # degrade). Only the FIRST caller in a finalize race gets 0; everyone else gets non-zero and bails.
@@ -121,6 +160,26 @@ star_finalize_once() { mkdir "$PIPELINE_ROOT/.finalized.lock" 2>/dev/null; }
 # this hash are unchanged across passes, no forward progress is being made (e.g. a permanently-PENDING
 # job), so the watchdog can STALL instead of looping forever. Reuses a provided snapshot ($1).
 star_live_work_hash() { printf '%s\n' "$1" | grep -E "^${JOB_TAG}_star_" | sort | cksum | cut -d' ' -f1; }
+
+# ---- per-sample failure tracking: drop a sample after STAR_MAX_FAILS failed alignments (user 2026-06-22) -
+# Mirrors the BED/download drop-after-N so one bad sample can't STALL the stage: per-sample attempts in
+# $PIPELINE_ROOT/.attempts/<label>.n; a <label>.dropped marker stops resubmits; logged to star_dropped.txt
+# and COUNTED toward completion (done_n + dropped >= exp).
+: "${STAR_MAX_FAILS:=3}"
+STAR_ATTEMPTS_DIR="$PIPELINE_ROOT/.attempts"
+STAR_DROPPED_LIST="$PIPELINE_ROOT/star_dropped.txt"
+star_attempts()   { cat "$STAR_ATTEMPTS_DIR/$1.n" 2>/dev/null || echo 0; }
+star_is_dropped() { [ -f "$STAR_ATTEMPTS_DIR/$1.dropped" ]; }
+star_bump_attempt() {
+  mkdir -p "$STAR_ATTEMPTS_DIR" 2>/dev/null
+  local n=$(( $(star_attempts "$1") + 1 )); echo "$n" > "$STAR_ATTEMPTS_DIR/$1.n"; echo "$n"
+}
+star_drop_sample() {
+  [ -f "$STAR_ATTEMPTS_DIR/$1.dropped" ] && return 0
+  mkdir -p "$STAR_ATTEMPTS_DIR" 2>/dev/null; : > "$STAR_ATTEMPTS_DIR/$1.dropped"
+  printf '%s\t%s\tafter %s attempts\t%s\n' "$1" "${2:-alignment}" "$(star_attempts "$1")" "$(date '+%Y-%m-%d %H:%M:%S')" >> "$STAR_DROPPED_LIST"
+}
+star_dropped_count() { local n=0 f; for f in "$STAR_ATTEMPTS_DIR"/*.dropped; do [ -e "$f" ] && n=$((n+1)); done; echo "$n"; }
 
 # Does at least one of a comma-list of FASTQ paths still exist on disk? Used by the watchdog to detect
 # that a sample's source reads were already deleted (DELETE_FASTQ_AFTER_BAM) -- a resubmit would be doomed,
