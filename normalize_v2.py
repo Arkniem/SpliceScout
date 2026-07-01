@@ -15,6 +15,16 @@ CONTROL_VALUES = {
     "negative control", "ethanol", "etoh", "wild type", "wt", "parental",
 }
 
+# Strong "no real agent" tokens: if ANY appears as a token in the value (split on non-alphanumerics),
+# it's a control arm even when joined to an experiment-model prefix -- e.g. "SARS2_Mock",
+# "mock-infected", "EV_untreated", "shCtrl_uninfected". These words NEVER name a real drug. Solvent
+# words (DMSO/ethanol/PBS/water/vehicle) are deliberately NOT here -- they can be a drug's carrier
+# ("DrugX in 0.1% DMSO"), so they stay residue-based in is_control() below to avoid false positives.
+STRONG_CONTROL_TOKENS = {
+    "mock", "uninfected", "noninfected", "sham", "naive", "untreated", "unstimulated",
+    "untransfected", "nontransfected", "parental",
+}
+
 
 # multi-clause / combination markers -> value is a sentence, not a single compound.
 # For these we strip ONLY safe trailing tokens (no greedy mid-string removal) and
@@ -51,6 +61,10 @@ def normalize_compound(val):
 def is_control(val):
     v = (val or "").strip().lower()
     if v in CONTROL_VALUES:
+        return True
+    # strong no-agent token anywhere in the value (handles underscore/hyphen-joined model prefixes
+    # like "SARS2_Mock" / "mock-infected" that the residue logic below misses on non-space separators)
+    if set(re.split(r"[^a-z0-9]+", v)) & STRONG_CONTROL_TOKENS:
         return True
     residue = v
     for pat in (r"dimethyl\s*sulfoxide", r"\bdmso\b", r"\bv/v\b", r"\bvehicle\b",

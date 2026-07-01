@@ -1,5 +1,3 @@
-# https://drive.google.com/drive/folders/1Qj7P80y3m9ymCMlrUiJgHXjf5Wkd5-0e?usp=sharing
-
 # SpliceScout
 
 **Submit an NCBI GEO search query -> get cleaned, splicing-amenable, cell-line-grouped compound

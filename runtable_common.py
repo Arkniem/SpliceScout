@@ -14,18 +14,24 @@ import threading
 import urllib.request
 import urllib.parse
 import urllib.error
+import xml.etree.ElementTree as ET
 
 EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
 
-_state = {"key": "", "interval": 0.34, "last": 0.0, "throttled_notice": False}
+_state = {"key": "", "interval": 0.34, "baseline": 0.34, "last": 0.0, "last_429": 0.0,
+          "throttled_notice": False}
 _throttle_lock = threading.Lock()   # global pacer so parallel callers stay within NCBI's rate
 
 
 def configure(ncbi_key):
     """Set the NCBI API key (raises the rate limit 3/s -> 10/s) for this process."""
     _state["key"] = (ncbi_key or "").strip()
-    # a touch under the cap (10/s keyed, 3/s keyless) for headroom; _slow_pacer() raises it on a 429
-    _state["interval"] = 0.13 if _state["key"] else 0.36
+    # a touch under the cap (10/s keyed, 3/s keyless) for headroom; _slow_pacer() raises it on a 429,
+    # and _recover_locked() ramps it back to this baseline after a quiet minute.
+    base = 0.13 if _state["key"] else 0.36
+    _state["interval"] = base
+    _state["baseline"] = base
+    _state["last_429"] = 0.0
     _state["throttled_notice"] = False
 
 
@@ -46,19 +52,41 @@ def _retry_after(e, default):
 
 
 def _slow_pacer():
-    """On a 429, PERMANENTLY raise the GLOBAL request interval so EVERY parallel caller backs off."""
+    """On a 429, raise the GLOBAL request interval so EVERY parallel caller backs off. The slow-down is
+    NOT permanent: _recover_locked() ramps the interval back toward the baseline once a quiet minute has
+    passed since the last 429, so one throttle storm doesn't drag the whole run down forever."""
     with _throttle_lock:
         _state["interval"] = min(_state["interval"] + 0.05, 1.0)
+        _state["last_429"] = time.time()
         if not _state.get("throttled_notice"):
             _state["throttled_notice"] = True
             print(f"  NCBI 429 rate-limit hit -> slowing all deep-dive fetches (interval now "
-                  f"~{_state['interval']:.2f}s); automatic, the run keeps going.")
+                  f"~{_state['interval']:.2f}s); automatic + temporary (recovers ~1 min after the last 429).")
+
+
+def _recover_locked():
+    """Caller holds the throttle lock. Once a full quiet minute has passed since the last 429, ramp the
+    interval back DOWN toward the keyed/keyless baseline (halving the remaining excess each minute, snapping
+    to baseline when within ~0.02s). A fresh 429 re-raises it via _slow_pacer(). This is what makes a brief
+    rate-limit storm self-heal instead of permanently throttling the rest of the run."""
+    base = _state.get("baseline", _state["interval"])
+    if _state["interval"] <= base:
+        return
+    if time.time() - _state.get("last_429", 0.0) < 60:
+        return
+    _state["interval"] = max(base, base + (_state["interval"] - base) * 0.5)
+    if _state["interval"] - base < 0.02:
+        _state["interval"] = base
+        _state["throttled_notice"] = False     # allow a fresh heads-up if it trips again later
+    _state["last_429"] = time.time()           # restart the quiet timer for the next recovery step
 
 
 def _throttle():
     """Block until the caller may START a request, keeping the GLOBAL rate <= 1/interval (thread-safe),
-    so parallel deep-dive fetches never exceed NCBI's limit."""
+    so parallel deep-dive fetches never exceed NCBI's limit. Self-heals the interval back toward baseline
+    once throttling has been quiet for a minute (_recover_locked)."""
     with _throttle_lock:
+        _recover_locked()
         dt = time.time() - _state["last"]
         if dt < _state["interval"]:
             time.sleep(_state["interval"] - dt)
@@ -120,10 +148,38 @@ def elink_gds_to_sra(gse):
     return (we.group(1) if we else None, qk.group(1) if qk else None)
 
 
+# NCBI efetch intermittently splices an HTTP error page (usually a 502 "Bad Gateway" XHTML doc) straight
+# INTO the SRA XML stream, BETWEEN records, on large history sets (a 5000+ experiment study can pick up
+# several). The surrounding records are otherwise intact, so excise the injected <!DOCTYPE html>...</html>
+# blobs; if the result still won't parse (a record got truncated mid-element), salvage by rebuilding the
+# set from only the COMPLETE EXPERIMENT_PACKAGE blocks. Cheap + idempotent when the XML is already clean.
+_SRA_HTML_ERR = re.compile(r"<!DOCTYPE\s+html.*?</html\s*>", re.I | re.S)
+_SRA_HTML_TAG = re.compile(r"<html[\s>].*?</html\s*>", re.I | re.S)
+_SRA_PKG = re.compile(r"<EXPERIMENT_PACKAGE>.*?</EXPERIMENT_PACKAGE>", re.S)
+
+
+def clean_sra_xml(xml):
+    """Strip NCBI error pages injected into an SRA EXPERIMENT_PACKAGE_SET stream; return parseable XML
+    (unchanged when already clean). Lossless when records are intact, else salvages the complete
+    EXPERIMENT_PACKAGE blocks and drops any truncated remainder."""
+    if not xml or ("<!DOCTYPE html" not in xml and "<html" not in xml):
+        return xml
+    cleaned = _SRA_HTML_TAG.sub("", _SRA_HTML_ERR.sub("", xml))
+    try:
+        ET.fromstring(cleaned)
+        return cleaned
+    except ET.ParseError:
+        pkgs = _SRA_PKG.findall(cleaned)
+        if not pkgs:
+            return cleaned                       # nothing to salvage; let the caller's parse surface it
+        return ('<?xml version="1.0" encoding="UTF-8"?>\n<EXPERIMENT_PACKAGE_SET>\n'
+                + "\n".join(pkgs) + "\n</EXPERIMENT_PACKAGE_SET>\n")
+
+
 def efetch_sra_full(webenv, query_key, retmax=10000):
-    """Fetch full SRA EXPERIMENT_PACKAGE_SET XML for a history set."""
-    return http_get(EUTILS + "efetch.fcgi?db=sra&query_key=%s&WebEnv=%s&rettype=full&retmode=xml&retmax=%d"
-                    % (query_key, webenv, retmax))
+    """Fetch full SRA EXPERIMENT_PACKAGE_SET XML for a history set (NCBI error pages stripped)."""
+    return clean_sra_xml(http_get(EUTILS + "efetch.fcgi?db=sra&query_key=%s&WebEnv=%s&rettype=full&retmode=xml&retmax=%d"
+                                  % (query_key, webenv, retmax)))
 
 
 def esearch_idlist(db, term, retmax=10000):
@@ -148,7 +204,7 @@ def efetch_sra_xml(term):
     ids = esearch_idlist("sra", term)
     if not ids:
         raise RuntimeError("no SRA records for %r" % term)
-    return http_get(EUTILS + "efetch.fcgi?db=sra&id=%s&rettype=full&retmode=xml" % ",".join(ids))
+    return clean_sra_xml(http_get(EUTILS + "efetch.fcgi?db=sra&id=%s&rettype=full&retmode=xml" % ",".join(ids)))
 
 
 # ---- tiny XML helpers ----

@@ -32,6 +32,7 @@ import build_final
 DEFAULT_QUERY = "rna-seq[Description] AND human[Organism] AND drug"
 STAGES = ["fetch", "extract", "prep", "ai_compounds", "ai_samples", "merge", "build"]
 _AI_RATE_RETRY_SECS = 30   # on an AI rate-limit (429), wait this long and re-submit, instead of pausing
+_AI_PREFLIGHT_RATE_MAX = 10  # ...but cap preflight rate-retries so a permanently-throttled key can't hang forever
 
 # Canonical 18-stage order (the phase-range slider works over progress.STAGES, not the 7-stage list above).
 _STAGE_ORDER = [k for k, _ in progress.STAGES]
@@ -104,6 +105,7 @@ class RunConfig:
     provider: str = "anthropic"   # AI provider for cleaning: anthropic | openai | gemini
     base_url: str = ""         # custom OpenAI-compatible endpoint (MiMo/Qwen/local/OpenRouter); blank = default
     disable_reasoning: bool = False  # OpenAI-compatible "thinking off" body — for reasoning models (e.g. MiMo)
+    max_tokens: int = 60000    # max OUTPUT tokens per AI cleaning call (per-model, set in the UI); 60000 = default
     module: str = "bulk_rna_seq"  # analysis module: drives the library-prep filter + the analysis pipeline (STAR)
     deep_dive: bool = True     # after build, deep-dive the best cell line into a Run Selector table
     pick_mode: str = "auto"    # "auto" (top real line) or "manual" (UI/CLI picks from the ranked list)
@@ -112,9 +114,10 @@ class RunConfig:
     star_cfg: dict = None      # STAR config.sh values (genome index, organism, build resources) for bulk_rna_seq
     bed_cfg: dict = None       # BAM->BED config.sh values (AltAnalyze species/resources; 'enabled' toggle) for bulk_rna_seq
     psi_cfg: dict = None       # AltAnalyze (PSI) config.sh values + 'enabled' toggle + ALTANALYZE_LOCAL for bulk_rna_seq
+    concordance_cfg: dict = None  # splicing-concordance config.sh values + 'enabled' toggle + cancer_atlas for bulk_rna_seq
     group_cfg: dict = None     # user-defined comparison groups (Phase B); None => default treated-vs-control
     start_stage: str = "fetch"        # phase range: first stage to run (a progress.STAGES key)
-    end_stage: str = "psi_submit"     # phase range: last stage to run; stages outside [start,end] are skipped
+    end_stage: str = "concordance_submit"  # phase range: last stage to run; stages outside [start,end] are skipped
     supplied_inputs: dict = None      # {input-field: local path} to stage in for a mid-pipeline START (progress.CHECKPOINTS)
 
 
@@ -139,7 +142,13 @@ def _load_state(P):
 
 
 def _save_state(P, state):
-    json.dump(state, open(P.state, "w", encoding="utf-8"), indent=2)
+    # atomic: a kill mid-write must not truncate pipeline_state.json (that would lose all resume progress)
+    tmp = P.state + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, P.state)
 
 
 def main():
@@ -682,6 +691,48 @@ def _psi_summary(P):
     return out or None
 
 
+def _save_concordance_status(P, cfg, built, submit_res):
+    """Record what the splicing-concordance stage actually did (survives resume / page reload)."""
+    if built is None and submit_res is None and os.path.exists(P.concordance_status):
+        return  # resume that didn't re-run concordance -> keep prior status
+    status = {"mode": cfg.cluster_mode, "built": bool(built),
+              "attempted": cfg.cluster_mode == "autonomous" and submit_res is not None,
+              "submitted": bool(submit_res and submit_res.get("submitted"))}
+    if built:
+        status.update({k: built.get(k) for k in
+                       ("species", "organism", "job_tag", "psi_root", "concord_root", "atlas", "n_queries")
+                       if built.get(k) is not None})
+    if submit_res:
+        if submit_res.get("altanalyze_home") is not None:
+            status["altanalyze_home"] = submit_res.get("altanalyze_home")
+        if not submit_res.get("submitted") and submit_res.get("reason"):
+            status["reason"] = submit_res.get("reason")
+    try:
+        json.dump(status, open(P.concordance_status, "w", encoding="utf-8"))
+    except Exception:
+        pass
+
+
+def _concordance_summary(P):
+    """Compact concordance-handoff summary for the UI (read from files; robust to resume)."""
+    if not os.path.exists(P.concordance_bundle_zip) and not os.path.exists(P.concordance_status):
+        return None
+    out = {}
+    if os.path.exists(P.concordance_bundle_zip):
+        out["bundle"] = True
+        out["zip"] = os.path.basename(P.concordance_bundle_zip)
+    if os.path.exists(P.concordance_status):
+        try:
+            st = json.load(open(P.concordance_status, encoding="utf-8"))
+            for k in ("mode", "built", "attempted", "submitted", "species", "organism",
+                      "job_tag", "psi_root", "concord_root", "atlas", "n_queries", "altanalyze_home", "reason"):
+                if k in st:
+                    out[k] = st.get(k)
+        except Exception:
+            pass
+    return out or None
+
+
 def _psi_group_inputs(P, cfg, sel, reporter=NULL):
     """Phase B hook: if the user defined comparison groups, classify samples (deterministic code + AI) into
     a `group` column and return (group_col, labelmap) for psi_deploy; else (None, None) -> psi_deploy's
@@ -691,7 +742,8 @@ def _psi_group_inputs(P, cfg, sel, reporter=NULL):
         return None, None
     try:
         import group_assign
-    except Exception:
+    except Exception as e:
+        print(f"  PSI: group_assign module unavailable ({e}) -> default treated-vs-control split")
         return None, None
     try:
         return group_assign.assign(P, cfg, sel, reporter=reporter)
@@ -704,8 +756,40 @@ def _persist_cfg(P, cfg):
     """Save the (non-secret) RunConfig to config.json so a --resume uses any corrected values."""
     try:
         json.dump(asdict(cfg), open(P.config, "w", encoding="utf-8"), indent=2)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  WARN: could not persist run config to {P.config} ({e}) -- a --resume may use stale values")
+
+
+def _ai_cfg_from(cfg):
+    """Build the ai_clean cfg dict from the (possibly mid-run-edited) run config. Re-read each time a pass
+    runs so a provider/model/base_url switch made via the AI-fix form is actually picked up on retry."""
+    return {"provider": cfg.provider, "model": cfg.model, "concurrency": cfg.concurrency,
+            "base_url": getattr(cfg, "base_url", "") or "", "max_retries": 8,
+            "max_tokens": int(getattr(cfg, "max_tokens", 60000) or 60000),
+            "disable_reasoning": getattr(cfg, "disable_reasoning", False)}
+
+
+def _apply_ai_fix(cfg, fix, P):
+    """Apply an AI-fix payload (from the inline fix form / CLI prompt) to cfg IN PLACE. Returns True if the
+    user chose to turn AI OFF (sets cfg.skip_ai), else False after switching provider/model/key/base_url.
+    Shared by the preflight loop and the mid-run resilient-pass loop so both behave identically."""
+    if not fix or fix.get("action") in ("skip_ai", "cancel"):
+        cfg.skip_ai = True
+        _persist_cfg(P, cfg)
+        return True
+    if fix.get("provider"):
+        newp = llm_providers.normalize_provider(fix["provider"])
+        if newp != cfg.provider and not fix.get("model"):
+            cfg.model = llm_providers.DEFAULT_MODEL[newp]   # default model for the new provider
+        cfg.provider = newp
+    if fix.get("model"):
+        cfg.model = str(fix["model"]).strip()
+    if "base_url" in fix:                              # set OR clear (blank -> provider default); honored for openai/gemini/anthropic, ignored by ollama
+        cfg.base_url = str(fix.get("base_url") or "").strip()
+    if fix.get("api_key"):
+        os.environ[llm_providers.KEY_ENV[cfg.provider]] = str(fix["api_key"]).strip()
+    _persist_cfg(P, cfg)
+    return False
 
 
 def _ensure_ai_works(cfg, P, reporter, ai_fix_fn):
@@ -714,6 +798,7 @@ def _ensure_ai_works(cfg, P, reporter, ai_fix_fn):
     it off (sets cfg.skip_ai). The server passes reporter.await_ai_fix; the CLI passes _console_ai_fix.
     """
     import ai_clean
+    rate_tries = 0
     while not cfg.skip_ai:
         print(f"[AI] validating provider={cfg.provider} model={cfg.model} …")
         reporter.set_detail(f"validating {cfg.provider} / {cfg.model}…")
@@ -724,33 +809,78 @@ def _ensure_ai_works(cfg, P, reporter, ai_fix_fn):
             print("[AI] provider/model/key OK")
             return
         diag = llm_providers.classify_ai_error(err)
-        if diag.get("category") == "rate":           # transient throttle -> wait & re-submit, don't pause
+        if diag.get("category") == "rate" and rate_tries < _AI_PREFLIGHT_RATE_MAX:
+            rate_tries += 1                          # transient throttle -> wait & re-submit (capped)
             print(f"[AI] rate limited ({diag['title']}); re-submitting in {_AI_RATE_RETRY_SECS}s "
-                  "(not pausing for a fix)…")
+                  f"(try {rate_tries}/{_AI_PREFLIGHT_RATE_MAX}, not pausing for a fix)…")
             reporter.set_detail(f"rate limited — re-submitting in {_AI_RATE_RETRY_SECS}s…")
             time.sleep(_AI_RATE_RETRY_SECS)
             continue
         print(f"[AI] preflight failed: {diag['title']} — {diag['detail']}")
         asker = ai_fix_fn or reporter.await_ai_fix
-        fix = asker(diag, {"provider": cfg.provider, "model": cfg.model})
-        if not fix or fix.get("action") in ("skip_ai", "cancel"):
-            cfg.skip_ai = True
+        fix = asker(diag, {"provider": cfg.provider, "model": cfg.model,
+                           "base_url": getattr(cfg, "base_url", "") or ""})
+        if _apply_ai_fix(cfg, fix, P):
             reporter.skip_stage("ai_compounds")
             reporter.skip_stage("ai_samples")
-            _persist_cfg(P, cfg)
             print("** AI cleaning turned OFF -> running the deterministic stages only. **")
             return
-        if fix.get("provider"):
-            newp = llm_providers.normalize_provider(fix["provider"])
-            if newp != cfg.provider and not fix.get("model"):
-                cfg.model = llm_providers.DEFAULT_MODEL[newp]   # default model for the new provider
-            cfg.provider = newp
-        if fix.get("model"):
-            cfg.model = str(fix["model"]).strip()
-        if fix.get("api_key"):
-            os.environ[llm_providers.KEY_ENV[cfg.provider]] = str(fix["api_key"]).strip()
-        _persist_cfg(P, cfg)
         print(f"[AI] retrying with provider={cfg.provider} model={cfg.model} …")
+
+
+def _run_ai_pass_resilient(pass_name, P, cfg, reporter, ai_fix_fn):
+    """Run one AI cleaning pass, surviving a MID-RUN provider outage. ai_clean.run_pass RAISES only when so
+    many batches go unanswered that the provider looks DOWN (not just flaky) — historically that aborted the
+    whole run into an 'error' state with no inline retry, stranding hours of completed batches. Instead, PAUSE
+    here with the SAME inline fix form as preflight (switch provider/model/key — e.g. proxy down -> Ollama —
+    or turn AI off) and retry: ai_clean.run_pass resumes per-batch, so only the still-missing batches re-run.
+    Turning AI off drop-fills the unanswered batches as Unknown so the pass COMPLETES with every answered
+    batch kept. Returns when the pass is complete (or AI was turned off)."""
+    import ai_clean
+    while True:
+        try:
+            return ai_clean.run_pass(pass_name, P, _ai_cfg_from(cfg), reporter=reporter)
+        except Exception as e:   # run_pass RAISES only for a mid-pass provider outage (too many to safely drop)
+            d = llm_providers.classify_ai_error(e)
+            diag = {"title": "AI provider went down mid-run",
+                    "detail": (str(e) + "  " + (d.get("detail") or "")).strip()[:600],
+                    "category": d.get("category") or "network"}
+            print(f"[AI:{pass_name}] PAUSED mid-pass — {diag['title']}: {diag['detail']}")
+            reporter.set_detail("AI provider down mid-run — switch provider or turn AI off to continue…")
+            asker = ai_fix_fn or reporter.await_ai_fix
+            fix = asker(diag, {"provider": cfg.provider, "model": cfg.model,
+                               "base_url": getattr(cfg, "base_url", "") or ""})
+            if _apply_ai_fix(cfg, fix, P):
+                # turn AI off mid-pass: complete THIS pass deterministically (keep every answered batch,
+                # Unknown-fill only the unanswered ones) rather than discard the work already done. cfg.skip_ai
+                # is now set, so the caller skips any later AI pass (compounds runs before samples).
+                ai_clean.drop_fill_missing(pass_name, P)
+                print(f"** AI turned OFF mid-{pass_name}: answered batches kept, rest Unknown; "
+                      f"remaining AI stages skipped. **")
+                return {"skipped_remaining": True}
+            print(f"[AI:{pass_name}] retrying with provider={cfg.provider} model={cfg.model} …")
+
+
+def _ensure_provider_key_in_env(provider):
+    """Idempotently load the AI provider's API key from the persisted settings into os.environ. The server
+    pushes the key to the env only when a run STARTS (server.py), and the CLI only via its flags; a RESUME
+    replays NEITHER, so without this a resumed run reaches the first AI step (cellline_match, then
+    runtable_annotate) with no OPENAI_API_KEY -> 'Missing credentials' -> silent deterministic fallback.
+    No-op if the key is already set, the provider is keyless (ollama), or the settings file is absent."""
+    if not provider or provider == "ollama" or llm_providers.have_key(provider):
+        return
+    try:
+        import json as _json
+        sp = os.path.join(os.path.expanduser("~"), ".geo_pipeline_settings.json")
+        with open(sp, encoding="utf-8") as f:
+            settings = _json.load(f)
+        keys = settings.get("api_keys") or {}
+        key = (keys.get(provider) or settings.get("api_key") or "").strip()
+        if key:
+            os.environ[llm_providers.KEY_ENV[provider]] = key
+            print(f"  [key] loaded {provider} API key from ~/.geo_pipeline_settings.json (resume-safe)")
+    except Exception:
+        pass
 
 
 def run_pipeline(cfg, P, reporter=NULL, select_fn=None, secrets=None, cluster_fix_fn=None,
@@ -769,12 +899,11 @@ def run_pipeline(cfg, P, reporter=NULL, select_fn=None, secrets=None, cluster_fi
     Resumable via pipeline_state.json exactly as before.
     """
     secrets = secrets or {}
+    if not getattr(cfg, "skip_ai", False):       # resume-safe: a resumed run never replayed the start-form's key
+        _ensure_provider_key_in_env(cfg.provider)
     state = _load_state(P)
     cap_int = None if cfg.cap == "unlimited" else int(cfg.cap)
     fetch_max = 100000 if cfg.cap == "unlimited" else int(cfg.cap)
-    ai_cfg = {"provider": cfg.provider, "model": cfg.model, "concurrency": cfg.concurrency,
-              "base_url": getattr(cfg, "base_url", "") or "", "max_retries": 8, "max_tokens": 16000,
-              "disable_reasoning": getattr(cfg, "disable_reasoning", False)}
 
     reporter.set_meta(query=cfg.query, cap=cfg.cap, model=cfg.model, provider=cfg.provider,
                       skip_ai=cfg.skip_ai, run_dir=P.run_dir)
@@ -841,20 +970,23 @@ def run_pipeline(cfg, P, reporter=NULL, select_fn=None, secrets=None, cluster_fi
         mark("prep")
     reporter.complete_stage("prep")
 
-    # 4/5 AI PASSES
+    # 4/5 AI PASSES — resilient to a MID-RUN provider outage: if the proxy dies after hours of work, PAUSE
+    # for an inline fix (switch provider/model/key, or turn AI off) and resume per-batch, rather than crash
+    # the whole run into 'error' with the completed batches stranded.
     if cfg.skip_ai:
         print("[AI] skipped")
     else:
         if begin("ai_compounds"):
-            import ai_clean
-            ai_clean.run_pass("compounds", P, ai_cfg, reporter=reporter)
+            _run_ai_pass_resilient("compounds", P, cfg, reporter, ai_fix_fn)
             mark("ai_compounds")
         reporter.complete_stage("ai_compounds")
-        if begin("ai_samples"):
-            import ai_clean
-            ai_clean.run_pass("samples", P, ai_cfg, reporter=reporter)
-            mark("ai_samples")
-        reporter.complete_stage("ai_samples")
+        if cfg.skip_ai:                       # user turned AI off during the compounds pass
+            reporter.skip_stage("ai_samples")
+        else:
+            if begin("ai_samples"):
+                _run_ai_pass_resilient("samples", P, cfg, reporter, ai_fix_fn)
+                mark("ai_samples")
+            reporter.complete_stage("ai_samples")
 
     # 6 MERGE
     if begin("merge"):
@@ -865,13 +997,10 @@ def run_pipeline(cfg, P, reporter=NULL, select_fn=None, secrets=None, cluster_fi
 
     # 7 BUILD (idempotent — rewrites the tables + cellline_index.json)
     summary = None
-    if in_range("build"):
-        reporter.begin_stage("build")
+    if begin("build"):                 # respect the done-check on resume (begin handles in-range + skip)
         summary = build_final.build_all(P, module=getattr(cfg, "module", "bulk_rna_seq") or "bulk_rna_seq")
         mark("build")
-        reporter.complete_stage("build")
-    else:
-        reporter.skip_stage("build")
+    reporter.complete_stage("build")
 
     print(f"\n=== Tables in {P.tables_dir} ===  Headline: ncbi_final_splicing.csv")
 
@@ -881,8 +1010,9 @@ def run_pipeline(cfg, P, reporter=NULL, select_fn=None, secrets=None, cluster_fi
     _STAR = ("star_bundle", "star_submit")
     _BED = ("bed_bundle", "bed_submit")
     _PSI = ("psi_bundle", "psi_submit")
+    _CONCORDANCE = ("concordance_bundle", "concordance_submit")
     if not cfg.deep_dive:
-        for k in ("select",) + _DEEP + _CLUSTER + _STAR + _BED:
+        for k in ("select",) + _DEEP + _CLUSTER + _STAR + _BED + _PSI + _CONCORDANCE:
             reporter.skip_stage(k)
     else:
         import deepdive_select
@@ -898,15 +1028,30 @@ def run_pipeline(cfg, P, reporter=NULL, select_fn=None, secrets=None, cluster_fi
                     picker = select_fn or reporter.await_selection
                     chosen = picker(ranked)
                 deep = deepdive_select.run(P, reporter, chosen=chosen)
-            mark("select")
+            if deep is not None:       # only mark done once a selection actually succeeded (else resume re-selects)
+                mark("select")
         else:
-            # resume: reuse the prior selection if present, else re-select from the current index
+            # resume: reuse the prior selection if present (guarded), else re-select from the current index
             if os.path.exists(P.cellline_selection):
-                deep = json.load(open(P.cellline_selection, encoding="utf-8"))
-            else:
+                try:
+                    with open(P.cellline_selection, encoding="utf-8") as f:
+                        deep = json.load(f)
+                except Exception as e:
+                    print(f"[deep-dive] cellline_selection.json unreadable ({e}); re-selecting")
+                    deep = None
+            if deep is None:
                 deepdive_select.consolidate(P, reporter)
                 deep = deepdive_select.run(P, reporter)
         reporter.complete_stage("select")
+
+        # PROJECT ISOLATION: scope the cluster JOB_TAG (-> the cluster folder AND every stage's job names) by
+        # the cell line, so reusing ONE instance name for a DIFFERENT project never shares the prior project's
+        # cluster folder/jobs. A resume keeps whatever tag the bundle was ALREADY deployed under, so an
+        # in-flight run is never relocated. Normalized slug -> stable even if the AI respells the line.
+        if deep is not None and cfg.cluster_mode != "off" and cfg.cluster_cfg is not None:
+            import cluster_deploy as _cd
+            _deployed = _cd._read_config_jobtag(P)
+            cfg.cluster_cfg["JOB_TAG"] = _deployed or _cd.project_job_tag(cfg.cluster_cfg.get("JOB_TAG", ""), deep)
 
         if deep is None:
             for k in _DEEP + _CLUSTER + _STAR + _BED:
@@ -914,8 +1059,21 @@ def run_pipeline(cfg, P, reporter=NULL, select_fn=None, secrets=None, cluster_fi
         else:
             if begin("runtable_fetch"):
                 import runtable_fetch
-                runtable_fetch.run(P, deep, cfg.ncbi_key, reporter=reporter, workers=cfg.concurrency)
-                mark("runtable_fetch")
+                _fr = runtable_fetch.run(P, deep, cfg.ncbi_key, reporter=reporter, workers=cfg.concurrency)
+                _nf = (_fr or {}).get("n_failed", 0); _ns = (_fr or {}).get("studies", 0) or 1
+                # Do NOT silently mark DONE (and then build a PARTIAL runtable) when studies failed to fetch.
+                # A HIGH miss rate is environmental (disk full / network) -> STOP so the user fixes it and
+                # resumes; fetch re-runs because it's NOT marked done, and skips the already-cached studies.
+                # A FEW misses are likely withdrawn studies -> proceed, but still leave it unmarked so a
+                # later resume retries them. (Before this, an ENOSPC burst dropped 967/1329 studies silently.)
+                if _nf == 0:
+                    mark("runtable_fetch")
+                elif _nf > max(5, _ns // 10):
+                    raise RuntimeError("runtable_fetch: %d/%d studies could not be fetched (likely disk space "
+                                       "or network). Fix it and resume -- refusing to build a partial runtable." % (_nf, _ns))
+                else:
+                    print("  runtable_fetch: %d/%d studies unfetched (likely withdrawn); proceeding but NOT "
+                          "marking done so a resume retries them." % (_nf, _ns))
             reporter.complete_stage("runtable_fetch")
 
             if begin("runtable_build"):
@@ -926,7 +1084,11 @@ def run_pipeline(cfg, P, reporter=NULL, select_fn=None, secrets=None, cluster_fi
 
             if begin("cellline_match"):
                 import cellline_match
-                cellline_match.run(P, deep, ai_cfg, cfg.skip_ai, reporter=reporter)
+                # Splicing module (bulk_rna_seq): keep ONLY RNA-Seq runs so STAR/AltAnalyze never process
+                # ChIP/MeDIP/ATAC/WGS/OTHER(RASL) runs. Other modules keep every assay (assay_keep=None).
+                _assay_keep = ({"rnaseq"} if (getattr(cfg, "module", "bulk_rna_seq") or "bulk_rna_seq")
+                               == "bulk_rna_seq" else None)
+                cellline_match.run(P, deep, _ai_cfg_from(cfg), cfg.skip_ai, reporter=reporter, assay_keep=_assay_keep)
                 mark("cellline_match")
             reporter.complete_stage("cellline_match")
 
@@ -953,7 +1115,8 @@ def run_pipeline(cfg, P, reporter=NULL, select_fn=None, secrets=None, cluster_fi
                 if cfg.cluster_mode == "autonomous":
                     if begin("cluster_submit"):
                         submit_res = _submit_with_retry(P, cfg, deep, secrets, reporter, cluster_fix_fn)
-                        mark("cluster_submit")
+                        if (submit_res or {}).get("submitted"):
+                            mark("cluster_submit")   # only mark done if the upload/launch actually succeeded
                     reporter.complete_stage("cluster_submit")
                 else:
                     reporter.skip_stage("cluster_submit")
@@ -999,7 +1162,8 @@ def run_pipeline(cfg, P, reporter=NULL, select_fn=None, secrets=None, cluster_fi
                         star_submit_res = star_deploy.submit_star_over_ssh(
                             P, cfg.cluster_cfg, secrets, download_root, reporter=reporter,
                             prior_skipped=not in_range("cluster_submit"))
-                        mark("star_submit")
+                        if (star_submit_res or {}).get("submitted"):
+                            mark("star_submit")      # only mark done if the SSH submit actually succeeded
                     reporter.complete_stage("star_submit")
                 else:
                     reporter.skip_stage("star_submit")
@@ -1048,7 +1212,8 @@ def run_pipeline(cfg, P, reporter=NULL, select_fn=None, secrets=None, cluster_fi
                         bed_submit_res = bed_deploy.submit_bed_over_ssh(
                             P, cfg.cluster_cfg, secrets, bam_out_root, reporter=reporter,
                             prior_skipped=not in_range("star_submit"))
-                        mark("bed_submit")
+                        if (bed_submit_res or {}).get("submitted"):
+                            mark("bed_submit")       # only mark done if the SSH submit actually succeeded
                     reporter.complete_stage("bed_submit")
                 else:
                     reporter.skip_stage("bed_submit")
@@ -1101,11 +1266,68 @@ def run_pipeline(cfg, P, reporter=NULL, select_fn=None, secrets=None, cluster_fi
                         psi_submit_res = psi_deploy.submit_psi_over_ssh(
                             P, cfg.cluster_cfg, secrets, bam_out_root, reporter=reporter,
                             prior_skipped=not in_range("bed_submit"))
-                        mark("psi_submit")
+                        if (psi_submit_res or {}).get("submitted"):
+                            mark("psi_submit")       # only mark done if the SSH submit actually succeeded
                     reporter.complete_stage("psi_submit")
                 else:
                     reporter.skip_stage("psi_submit")
                 _save_psi_status(P, cfg, psi_built, psi_submit_res)
+
+            # 21-22 splicing concordance (drug PSI vs cancer atlas; auto-chained AFTER PSI; on by default for bulk_rna_seq)
+            concordance_on = (getattr(cfg, "module", "bulk_rna_seq") == "bulk_rna_seq"
+                              and cfg.cluster_mode != "off"
+                              and str((getattr(cfg, "concordance_cfg", None) or {}).get("enabled", "1")).lower()
+                                  not in ("0", "off", "false", "no"))
+            if not concordance_on:
+                for k in _CONCORDANCE:
+                    reporter.skip_stage(k)
+            else:
+                import cluster_deploy
+                import concordance_deploy
+                download_root = (cluster_deploy._read_config_root(P)
+                                 or cluster_deploy._effective_root(cfg.cluster_cfg, deep))
+                dl_tag = (cfg.cluster_cfg or {}).get("JOB_TAG", "sra")
+                bam_out_root = f"{download_root.rstrip('/')}/STAR_bams"
+                concordance_built = None
+                if begin("concordance_bundle"):
+                    concordance_built = concordance_deploy.build_concordance_bundle(
+                        P, deep, bam_out_root, getattr(cfg, "concordance_cfg", None),
+                        download_job_tag=dl_tag, reporter=reporter)
+                    mark("concordance_bundle")
+                reporter.complete_stage("concordance_bundle")
+
+                concordance_submit_res = None
+                concordance_ready = (concordance_built is not None
+                                     or os.path.exists(os.path.join(P.concordance_dir, "config.sh")))
+                # arm the concordance launcher only if PSI actually went (submitted) OR was deliberately
+                # phase-range skipped (then pre-touch the PSI sentinel). A failed in-range PSI submit cascades
+                # the skip to concordance rather than arming a launcher that polls a sentinel that never appears.
+                _psi_res = locals().get("psi_submit_res")
+                psi_go = (not in_range("psi_submit")) or bool((_psi_res or {}).get("submitted"))
+                if not concordance_ready:
+                    reporter.skip_stage("concordance_submit")
+                elif not psi_go:
+                    reporter.skip_stage("concordance_submit")
+                    print("  CONCORDANCE SUBMIT: skipped — the upstream PSI submit failed/was off, so not arming "
+                          "a launcher that would poll a sentinel that never appears (fix PSI, then resume).")
+                    reporter.set_detail("Concordance submit skipped — PSI not submitted")
+                elif cfg.cluster_mode == "autonomous":
+                    if begin("concordance_submit"):
+                        concordance_submit_res = concordance_deploy.submit_concordance_over_ssh(
+                            P, cfg.cluster_cfg, secrets, bam_out_root, reporter=reporter,
+                            prior_skipped=not in_range("psi_submit"))
+                        _cres = concordance_submit_res or {}
+                        # mark done on a real submit OR a clean no-atlas SKIP (concordance is OPTIONAL — PSI is
+                        # the terminal stage; a cell line with no cancer atlas finishes cleanly at PSI).
+                        if _cres.get("submitted") or _cres.get("skipped"):
+                            mark("concordance_submit")
+                        if _cres.get("skipped"):
+                            reporter.set_detail("concordance skipped — no cancer atlas for this cell line "
+                                                "(PSI is the final output)")
+                    reporter.complete_stage("concordance_submit")
+                else:
+                    reporter.skip_stage("concordance_submit")
+                _save_concordance_status(P, cfg, concordance_built, concordance_submit_res)
 
     deep_dive = _deep_summary(P)
     if deep_dive:
@@ -1144,9 +1366,21 @@ def run_pipeline(cfg, P, reporter=NULL, select_fn=None, secrets=None, cluster_fi
                   f"{'grouped dPSI' if psi.get('grouped') else 'groupless PSI'}) ===")
         elif psi.get("bundle"):
             print(f"=== PSI BUNDLE -> {P.psi_bundle_zip} (species {psi.get('species')}) ===")
+    concordance = _concordance_summary(P)
+    if concordance:
+        summary = dict(summary or {}, concordance=concordance)
+        if concordance.get("submitted"):
+            print(f"=== CONCORDANCE: drug-vs-cancer concordance auto-chained on the cluster "
+                  f"(atlas {concordance.get('atlas')}, {concordance.get('n_queries')} query/queries) ===")
+        elif concordance.get("bundle"):
+            print(f"=== CONCORDANCE BUNDLE -> {P.concordance_bundle_zip} (atlas {concordance.get('atlas')}) ===")
 
     print(f"\n=== DONE. run_dir={P.run_dir} ===")
-    files = _list_outputs(P)
+    try:
+        files = _list_outputs(P)
+    except Exception as e:                  # a summary/listing error must not mask a successful run
+        print(f"  (warning: listing outputs failed: {e})")
+        files = []
     reporter.finish(result=summary, files=files)
     return {"summary": summary, "files": files, "run_dir": P.run_dir}
 

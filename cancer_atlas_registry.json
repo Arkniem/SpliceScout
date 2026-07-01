@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "_comment": "Maps a (normalized) cell-line name -> a cancer atlas of OncoSplice subtype signatures to score drug PSI concordance against. Keyed on cellline_match._norm(sel['canonical']) (lowercase, alnum-only). counts_kind: 'tsv' = a vendored subtype<TAB>patients table shipped in the bundle (counts_file is relative to the bundle); 'mergedresult' = an OncoSplice cluster membership matrix on the cluster (counts_file absolute, count = members per R*-V* cluster); 'none' = rank by overlapping events only. Edit/extend freely; the GUI 'cancer atlas' field overrides this auto-selection.",
+  "celllines": {
+    "mdsl": "aml_mds",
+    "mdsl1": "aml_mds",
+    "a549": "lung",
+    "h1299": "lung",
+    "h358": "lung",
+    "calu1": "lung",
+    "calu3": "lung",
+    "h1975": "lung",
+    "hcc827": "lung",
+    "pc9": "lung"
+  },
+  "atlases": {
+    "aml_mds": {
+      "species": "Hs",
+      "label": "AML/MDS (Leucegene OncoSplice subtypes)",
+      "queries": [
+        {
+          "name": "AML",
+          "query_dir": "/data/salomonis2/NCI-R01/AML-OncoSplice",
+          "counts_kind": "tsv",
+          "counts_file": "aml_subtype_counts.tsv"
+        }
+      ]
+    },
+    "lung": {
+      "species": "Hs",
+      "label": "Lung (TCGA LUAD + LUSC OncoSplice subtypes)",
+      "queries": [
+        {
+          "name": "LUAD",
+          "query_dir": "/data/salomonis2/NCI-R01/ONCObrowser/Temporary/LUAD/DE_splicing_events/Events-dPSI_0.1_adjp",
+          "counts_kind": "mergedresult",
+          "counts_file": "/data/salomonis2/NCI-R01/ONCObrowser/Temporary/LUAD/Oncosplice_clusters/MergedResult.txt"
+        },
+        {
+          "name": "LUSC",
+          "query_dir": "/data/salomonis2/NCI-R01/ONCObrowser/Completed/LUSC/DE_splicing_events/Events-dPSI_0.1_adjp",
+          "counts_kind": "mergedresult",
+          "counts_file": "/data/salomonis2/NCI-R01/ONCObrowser/Completed/LUSC/Oncosplice_clusters/MergedResult.txt"
+        }
+      ]
+    }
+  }
+}

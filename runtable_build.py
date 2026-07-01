@@ -107,10 +107,10 @@ def format_package_runs(p, gse):
         if run.attrib.get("is_public", "true") == "true" and fts:
             provs.add("ncbi"); regs.add("ncbi.public")
         create_dt = ver = ""
-        norm = next((sf for sf in run.findall("SRAFiles/SRAFile")
-                     if sf.attrib.get("semantic_name") == "SRA Normalized"), None)
+        sfs = run.findall("SRAFiles/SRAFile")            # walk the subtree ONCE (was up to twice per run)
+        norm = next((sf for sf in sfs if sf.attrib.get("semantic_name") == "SRA Normalized"), None)
         if norm is None:
-            sfs = run.findall("SRAFiles/SRAFile"); norm = sfs[0] if sfs else None
+            norm = sfs[0] if sfs else None
         if norm is not None:
             create_dt = iso_minute(norm.attrib.get("date", "")); ver = norm.attrib.get("version", "")
         if not create_dt: create_dt = iso_minute(run.attrib.get("published", ""))
@@ -179,7 +179,12 @@ def parse_study(gse, cache_dir):
     xmlf = os.path.join(cache_dir, gse + ".full.xml")
     if not os.path.exists(xmlf):
         return []
-    root = ET.fromstring(open(xmlf, encoding="utf-8", errors="replace").read())
+    try:
+        with open(xmlf, encoding="utf-8", errors="replace") as f:
+            root = ET.fromstring(C.clean_sra_xml(f.read()))           # strip any NCBI error pages injected mid-stream
+    except Exception as e:                                            # malformed/truncated XML -> log + skip, don't crash the build
+        print(f"  WARNING: {gse} XML parse failed ({e}); skipping study")
+        return []
     soft = geo_soft_map(os.path.join(cache_dir, gse + ".soft.txt"))   # empty unless ENA-brokered
     rows = []
     for p in root.findall("EXPERIMENT_PACKAGE"):
@@ -207,17 +212,77 @@ def cellline_columns(cols):
     return out
 
 
+def _xml_size(cache_dir, gse):
+    """Byte size of a study's cached XML (0 if absent); used to parse the biggest studies FIRST."""
+    try:
+        return os.path.getsize(os.path.join(cache_dir, gse + ".full.xml"))
+    except OSError:
+        return 0
+
+
 def run(P, sel, reporter=NULL):
-    """Reconstruct all runs for the selected studies; write the all-runs CSV + match candidates."""
+    """Reconstruct all runs for the selected studies; write the all-runs CSV + match candidates.
+
+    Parsing the cached SRA XML (tens of GB; individual studies can exceed 150 MB) is CPU-bound DOM work, so
+    studies are parsed in PARALLEL across PROCESSES -- threads can't help under the GIL. The worker count
+    SCALES TO THE MACHINE (one per core minus one, capped) so a 4-core laptop and a many-core server both
+    behave; set env RUNTABLE_BUILD_WORKERS to tune (lower it on a low-RAM box; =1 forces the sequential path)."""
     studies = sel.get("studies", [])
-    reporter.set_total(len(studies))
-    all_rows = []
-    for i, gse in enumerate(studies, 1):
-        rows = parse_study(gse, P.xml_cache_dir)
-        all_rows.extend(rows)
-        print(f"  {gse:<12} {len(rows)} runs")
-        reporter.advance(1)
-        reporter.set_detail(f"{gse}: {len(rows)} runs")
+    total = len(studies)
+    reporter.set_total(total)
+    cache_dir = P.xml_cache_dir
+
+    cpu = os.cpu_count() or 1
+    try:
+        env_workers = int(os.environ.get("RUNTABLE_BUILD_WORKERS", "0"))
+    except ValueError:
+        env_workers = 0
+    # one worker per core, leave one for the OS; cap so a many-core box doesn't hold dozens of multi-GB DOM
+    # trees at once -- on the 150 MB studies RAM is the limit, not cores.
+    workers = env_workers if env_workers > 0 else max(1, min(cpu - 1, 12))
+    workers = max(1, min(workers, total))                            # never more workers than studies
+
+    parsed = {}                                                      # gse -> rows (filled below, possibly out of order)
+    if workers == 1 or total <= 2:                                  # single core / tiny job: skip the pool overhead
+        for gse in studies:
+            parsed[gse] = parse_study(gse, cache_dir)
+            print(f"  {gse:<12} {len(parsed[gse])} runs")
+            reporter.advance(1)
+            reporter.set_detail(f"{gse}: {len(parsed[gse])} runs")
+    else:
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        order = sorted(studies, key=lambda g: _xml_size(cache_dir, g), reverse=True)   # biggest first
+        print(f"  parsing {total} studies across {workers} process(es) ({cpu} core(s) detected)")
+        try:
+            with ProcessPoolExecutor(max_workers=workers) as ex:
+                futs = {ex.submit(parse_study, gse, cache_dir): gse for gse in order}
+                done = 0
+                for fut in as_completed(futs):
+                    gse = futs[fut]
+                    try:
+                        rows = fut.result()
+                    except Exception as e:                          # one unparseable study must not kill the build
+                        print(f"  WARNING: {gse} parse failed in worker ({e}); skipping study")
+                        rows = []
+                    parsed[gse] = rows
+                    done += 1
+                    print(f"  [{done}/{total}] {gse:<12} {len(rows)} runs")
+                    reporter.advance(1)
+                    reporter.set_detail(f"{gse}: {len(rows)} runs")
+        except Exception as e:                                      # restricted env without a usable process pool
+            print(f"  WARNING: parallel parse unavailable ({e}); falling back to single process")
+            for gse in studies:
+                if gse not in parsed:
+                    parsed[gse] = parse_study(gse, cache_dir)
+                    reporter.advance(1)
+
+    all_rows = []                                                    # concat in ORIGINAL order -> deterministic CSV
+    for gse in studies:
+        all_rows.extend(parsed.get(gse, []))
+
+    if not all_rows:                                                  # header-only runtable -> nothing downstream can match
+        print("  !!! WARNING: ZERO run rows extracted across all studies -- runtable will be header-only "
+              "(check cached XML / study selection); downstream matching will find nothing.")
 
     keys = set()
     for r in all_rows:
@@ -244,7 +309,8 @@ def run(P, sel, reporter=NULL):
                "target_aliases": sorted(sel.get("raw_tags", {}).keys()),
                "cellline_columns": cl_cols,
                "candidates": candidates}
-    json.dump(payload, open(P.match_candidates, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    with open(P.match_candidates, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=1)
     print(f"  RUNTABLE: {len(all_rows)} runs, {len(cols)} cols -> {os.path.basename(P.runtable_all_csv)}"
           f" | {len(candidates)} distinct cell-line values")
     reporter.set_detail(f"{len(all_rows)} runs, {len(candidates)} cell-line values")

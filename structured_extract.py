@@ -40,15 +40,21 @@ SOURCE_TAGS = {"source_name", "source name", "tissue", "sample type",
 # then releases before the network call), so starts are spaced >= interval globally (rate <= 1/interval)
 # while responses overlap across threads — that's what makes the API key's higher rate actually pay off
 # WITHOUT ever exceeding NCBI's limit.
-_state = {"key": None, "interval": 0.34, "last": 0.0}
+_state = {"key": None, "interval": 0.34, "baseline": 0.34, "last": 0.0, "last_429": 0.0}
 _throttle_lock = threading.Lock()
+
+EXTRACT_RETRY_PASSES = 2   # in-run retry passes over failed studies before treating them as unfetchable
 
 
 def _configure(ncbi_key):
     _state["key"] = ncbi_key
-    # a touch under NCBI's cap (10/s keyed, 3/s keyless) for headroom; _slow_pacer() raises it on a 429
-    _state["interval"] = 0.13 if ncbi_key else 0.36
+    # a touch under NCBI's cap (10/s keyed, 3/s keyless) for headroom; _slow_pacer() raises it on a 429,
+    # and _recover_locked() ramps it back to this baseline after a quiet minute.
+    base = 0.13 if ncbi_key else 0.36
+    _state["interval"] = base
+    _state["baseline"] = base
     _state["last"] = 0.0
+    _state["last_429"] = 0.0
     _state["throttled_notice"] = False
 
 
@@ -69,14 +75,33 @@ def _retry_after(e, default):
 
 
 def _slow_pacer():
-    """On a 429, PERMANENTLY raise the GLOBAL request interval so EVERY parallel worker backs off and the
-    rate-limit storm quells itself (not just the one thread that got the 429)."""
+    """On a 429, raise the GLOBAL request interval so EVERY parallel worker backs off and the rate-limit
+    storm quells itself (not just the one thread that got the 429). NOT permanent: _recover_locked() ramps
+    the interval back toward baseline once a quiet minute has passed since the last 429."""
     with _throttle_lock:
         _state["interval"] = min(_state["interval"] + 0.05, 1.0)
+        _state["last_429"] = time.monotonic()
         if not _state.get("throttled_notice"):
             _state["throttled_notice"] = True
             print(f"  NCBI 429 rate-limit hit -> slowing ALL extract workers (req interval now "
-                  f"~{_state['interval']:.2f}s); automatic, the run keeps going.")
+                  f"~{_state['interval']:.2f}s); automatic + temporary (recovers ~1 min after the last 429).")
+
+
+def _recover_locked():
+    """Caller holds the throttle lock. Ramp the interval back DOWN toward the keyed/keyless baseline once a
+    full quiet minute has passed since the last 429 (halving the remaining excess each minute, snapping to
+    baseline when within ~0.02s). A fresh 429 re-raises it. Lets a brief throttle storm self-heal instead of
+    permanently slowing the rest of the extract."""
+    base = _state.get("baseline", _state["interval"])
+    if _state["interval"] <= base:
+        return
+    if time.monotonic() - _state.get("last_429", 0.0) < 60:
+        return
+    _state["interval"] = max(base, base + (_state["interval"] - base) * 0.5)
+    if _state["interval"] - base < 0.02:
+        _state["interval"] = base
+        _state["throttled_notice"] = False
+    _state["last_429"] = time.monotonic()
 
 
 def _ksuf():
@@ -84,8 +109,10 @@ def _ksuf():
 
 
 def _throttle():
-    """Block until this thread may START a request, keeping the GLOBAL rate <= 1/interval."""
+    """Block until this thread may START a request, keeping the GLOBAL rate <= 1/interval. Self-heals the
+    interval back toward baseline once throttling has been quiet for a minute (_recover_locked)."""
     with _throttle_lock:
+        _recover_locked()
         wait = _state["interval"] - (time.monotonic() - _state["last"])
         if wait > 0:
             time.sleep(wait)
@@ -170,8 +197,65 @@ def parse_samples(xml, study):
         }
 
 
-def sra_ids_for_study(uid, acc):
-    """SRA experiment UIDs for a GEO study: elink (reliable) then esearch fallback."""
+def _study_meta(uid, meta_item=None):
+    """(srp_or_bioproject, gsm_accessions, n_samples) from a gds esummary record. The GSMs drive the precise
+    per-sample SRA resolution; the SRP/BioProject is only a coarse fallback term that MUST be guarded by
+    n_samples before use -- a BioProject is frequently a SHARED umbrella (e.g. ENCODE PRJNA30709 spans 5867
+    runs across thousands of 2-sample sub-series). '' / [] / 0 on none / fetch failure.
+
+    PERF: Stage 1 (fetch_5000_ncbi) already loaded this study's esummary into raw_json with the IDENTICAL
+    schema (extrelations/bioproject/samples/n_samples), so when run() passes it in as `meta_item` we reuse it
+    and SKIP a redundant esummary round-trip per study (the common case, since path-2 esearch is ~always 0).
+    Falls back to a live esummary fetch when meta_item is missing/empty (a uid Stage 1 couldn't summarize)."""
+    rec = meta_item if isinstance(meta_item, dict) and meta_item else None
+    if rec is None:
+        s = fetch(f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+                  f"?db=gds&id={uid}&retmode=json")
+        if not s:
+            return "", [], 0
+        try:
+            rec = json.loads(s)["result"][str(uid)]
+        except Exception:
+            return "", [], 0
+    srp = ""
+    for r in (rec.get("extrelations") or []):
+        if (r.get("relationtype") or "").upper() == "SRA" and r.get("targetobject"):
+            srp = r["targetobject"]                        # e.g. SRP301436
+            break
+    if not srp:
+        srp = rec.get("bioproject") or ""                  # e.g. PRJNA691557 (may be a shared umbrella!)
+    gsms = [x.get("accession") for x in (rec.get("samples") or []) if x.get("accession")]
+    try:
+        n = int(rec.get("n_samples") or 0)
+    except Exception:
+        n = 0
+    return srp, gsms, n
+
+
+def _esearch_count(term):
+    """TOTAL SRA matches for a term (retmax=0) -- used to detect a shared-umbrella BioProject whose run count
+    dwarfs the study's real sample count. None on fetch failure."""
+    s = fetch(f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+              f"?db=sra&term={urllib.parse.quote(term)}&retmax=0&retmode=json")
+    if s is None:
+        return None
+    try:
+        return int(json.loads(s)["esearchresult"]["count"])
+    except Exception:
+        return None
+
+
+def sra_ids_for_study(uid, acc, meta_item=None):
+    """SRA experiment UIDs for a GEO study, via THREE resolution paths. The entrez gds->sra elink is
+    MISSING for some studies AND SRA's free-text index doesn't contain GEO accessions, which used to
+    SILENTLY DROP studies that DO have SRA data (e.g. GSE164788: elink=none, esearch 'GSE164788'=0 — yet
+    its SRA study SRP301436 has 765 runs). Order: (1) elink gds->sra; (2) esearch sra by the GSE
+    accession; (3) esearch sra by the study's SRP/BioProject — GUARDED: skipped when its run count dwarfs the
+    study's GEO sample count, since a BioProject is often a SHARED umbrella (ENCODE PRJNA30709 = 5867 runs
+    across thousands of 2-sample sub-series, which used to be mis-attributed wholesale, truncated at retmax);
+    (4) esearch sra by the study's OWN GSM accessions (from the esummary samples list) — the exact per-sample
+    resolution that recovers an umbrella sub-series as just its handful of runs. Returns [] for a genuinely
+    SRA-less study (e.g. a microarray series) and None only when EVERY esearch fetch failed (caller retries)."""
     e = fetch(f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/elink.fcgi"
               f"?dbfrom=gds&db=sra&id={uid}&retmode=json")
     if e is not None:
@@ -183,40 +267,95 @@ def sra_ids_for_study(uid, acc):
                     return ids
         except Exception:
             pass
-    s = fetch(f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
-              f"?db=sra&term={urllib.parse.quote(acc)}&retmax=2000&retmode=json")
-    if s is None:
-        return None
-    try:
-        return json.loads(s)["esearchresult"]["idlist"]
-    except Exception:
-        return None
+
+    def _esearch_ids(term):
+        s = fetch(f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+                  f"?db=sra&term={urllib.parse.quote(term)}&retmax=2000&retmode=json")
+        if s is None:
+            return None
+        try:
+            return json.loads(s)["esearchresult"]["idlist"]
+        except Exception:
+            return []
+
+    any_ok = False
+    ids = _esearch_ids(acc)                                # 2. by the GSE accession (usually 0 — SRA has no GEO accns)
+    if ids is not None:
+        any_ok = True
+        if ids:
+            return ids
+
+    srp, gsms, n_samples = _study_meta(uid, meta_item)     # reuse Stage-1 esummary (raw_json) if passed; else fetch
+
+    # 3. by SRP/BioProject — but SKIP a SHARED UMBRELLA whose SRA run count dwarfs the study's GEO samples
+    #    (ENCODE PRJNA30709: 5867 runs vs a 2-sample sub-series). count ~= n_samples => a real, dedicated study.
+    if srp and srp != acc:
+        cnt = _esearch_count(srp)
+        if cnt is not None and cnt > max(200, 10 * n_samples):
+            any_ok = True                                  # the fetch worked; we just refuse the umbrella's runs
+            print(f"  {acc}: SRA project {srp} has {cnt} runs >> {n_samples} GEO samples "
+                  f"(shared umbrella, e.g. ENCODE) -> resolving by the study's own GSMs instead")
+        else:
+            ids = _esearch_ids(srp)
+            if ids is not None:
+                any_ok = True
+                if ids:
+                    return ids
+
+    # 4. by the study's OWN GSMs — exact per-sample, so an umbrella sub-series resolves to just its runs.
+    gsm_ids = []
+    for i in range(0, len(gsms), 100):                     # batch so the OR'd esearch term URL stays a sane length
+        part = _esearch_ids(" OR ".join(gsms[i:i + 100]))
+        if part is None:
+            continue
+        any_ok = True
+        gsm_ids.extend(part)
+    if gsm_ids:
+        return list(dict.fromkeys(gsm_ids))
+
+    return [] if any_ok else None
 
 
-def process_study(uid, acc):
+def process_study(uid, acc, meta_item=None):
     """Return (rows, protocol_dict_or_None) for one study, or (None, None) on fetch failure."""
-    ids = sra_ids_for_study(uid, acc)
+    ids = sra_ids_for_study(uid, acc, meta_item)
     if ids is None:
         return None, None
     rows, protocol = [], None
+    any_batch_ok = False
     for i in range(0, len(ids), 50):
         batch = ",".join(ids[i:i + 50])
         xml = fetch(f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=sra&id={batch}")
         if not xml:
             continue
+        any_batch_ok = True
         if protocol is None:  # capture protocol from the first successful batch
             protocol = parse_protocol(xml)
         rows.extend(parse_samples(xml, acc))
+    # had SRA experiments but EVERY efetch batch failed -> a fetch failure to RETRY, not an empty study
+    if ids and not any_batch_ok:
+        return None, None
     return rows, (protocol or {"protocol": "", "strategy": "", "selection": "", "instrument": ""})
 
 
+def _atomic_json(path, obj):
+    """Write JSON atomically: temp file -> flush -> fsync -> os.replace. A kill mid-write then can't
+    truncate the file and break the next --resume's json.load (which would otherwise lose all progress)."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
 def _checkpoint(P, done, protocols):
-    """Persist the resume checkpoint (done-set + protocols). Called every N studies + at the end —
-    batching keeps these growing O(n) JSON dumps off the per-study hot path on big runs. Safe because
+    """Persist the resume checkpoint (done-set + protocols), atomically. Called every N studies + at the
+    end — batching keeps these growing O(n) JSON dumps off the per-study hot path on big runs. Safe because
     structured_samples.jsonl is keyed by GSM downstream (build_final), so a crash that re-fetches a few
     not-yet-checkpointed studies just rewrites the same rows (deduped), never corrupts the output."""
-    json.dump(sorted(done), open(P.done_set, "w", encoding="utf-8"))
-    json.dump(protocols, open(P.study_protocol, "w", encoding="utf-8"), ensure_ascii=False)
+    _atomic_json(P.done_set, sorted(done))
+    _atomic_json(P.study_protocol, protocols)
 
 
 def run(P, ncbi_key=None, cap=None, reporter=NULL, workers=8):
@@ -231,7 +370,8 @@ def run(P, ncbi_key=None, cap=None, reporter=NULL, workers=8):
     with open(P.raw_json, "r", encoding="utf-8") as f:
         result = json.load(f)["result"]
     uids = result["uids"]
-    pairs = [(u, result[u].get("accession")) for u in uids]
+    # carry each study's Stage-1 esummary record (meta_item) so _study_meta reuses it instead of re-fetching
+    pairs = [(u, result[u].get("accession"), result.get(u)) for u in uids]
     if cap:
         pairs = pairs[:cap]
 
@@ -250,39 +390,51 @@ def run(P, ncbi_key=None, cap=None, reporter=NULL, workers=8):
 
     # progress: total = all studies in scope; pre-credit ones already done / unaddressable
     reporter.set_total(len(pairs))
-    skipped = sum(1 for (_, acc) in pairs if (not acc) or (acc in done))
+    skipped = sum(1 for (_, acc, _m) in pairs if (not acc) or (acc in done))
     if skipped:
         reporter.advance(skipped)
-    todo = [(uid, acc) for (uid, acc) in pairs if acc and acc not in done]
+    todo = [(uid, acc, m) for (uid, acc, m) in pairs if acc and acc not in done]
     n_workers = max(1, min(int(workers or 8), 24))   # rate limiter caps req/s regardless of thread count
     reporter.set_detail(f"{len(todo)} studies to fetch · {n_workers} parallel · "
                         f"{'keyed ~10/s' if ncbi_key else 'keyless ~3/s'}")
     print(f"=== EXTRACT+PROTOCOL: {len(pairs)} studies (done already: {len(done)}; "
           f"{len(todo)} to fetch, {n_workers} parallel) ===")
 
+    # Studies that already failed on a PRIOR run of this run-dir. We still retry each once more; if it
+    # fails AGAIN it is treated as permanently unavailable and SKIPPED (warn) rather than blocking the
+    # pipeline forever -> auto-escape after one resume, while genuinely transient failures still re-run.
+    failed_path = os.path.join(os.path.dirname(os.path.abspath(P.done_set)), "failed_studies.json")
+    prev_failed = set()
+    if os.path.exists(failed_path):
+        try:
+            with open(failed_path, encoding="utf-8") as f:
+                prev_failed = set(json.load(f))
+        except Exception:
+            prev_failed = set()
+
     jf = open(P.samples_jsonl, "a", encoding="utf-8")
     write_lock = threading.Lock()
-    counters = {"processed": 0, "failed": 0, "seen": 0}
+    counters = {"processed": 0, "seen": 0}
 
-    def handle(uid, acc):
-        rows, protocol = process_study(uid, acc)
-        return acc, rows, protocol
+    def handle(uid, acc, meta_item):
+        try:
+            rows, protocol = process_study(uid, acc, meta_item)
+        except Exception:
+            return uid, acc, meta_item, None, None   # never let a parse/transport error escape the pool
+        return uid, acc, meta_item, rows, protocol
 
-    try:
+    def run_pass(work, advance):
+        """One parallel pass over (uid, acc, meta_item) triples. Returns the triples that FAILED (rows None)."""
+        failed_pairs = []
         with ThreadPoolExecutor(max_workers=n_workers) as ex:
-            futs = [ex.submit(handle, uid, acc) for (uid, acc) in todo]
+            futs = [ex.submit(handle, uid, acc, m) for (uid, acc, m) in work]
             for fut in as_completed(futs):
-                try:
-                    acc, rows, protocol = fut.result()
-                except Exception as e:
-                    counters["failed"] += 1
-                    reporter.advance(1)
-                    reporter.set_detail(f"fetch error: {str(e)[:80]}")
-                    continue
+                uid, acc, meta_item, rows, protocol = fut.result()   # handle() never raises
                 if rows is None:
-                    counters["failed"] += 1
-                    print(f"  {acc} FETCH FAILED (will retry next run)")
-                    reporter.advance(1)
+                    failed_pairs.append((uid, acc, meta_item))
+                    print(f"  {acc} FETCH FAILED (will retry)")
+                    if advance:
+                        reporter.advance(1)
                     reporter.set_detail(f"{acc}: fetch failed (will retry)")
                     continue
                 with write_lock:
@@ -296,16 +448,50 @@ def run(P, ncbi_key=None, cap=None, reporter=NULL, workers=8):
                     seen = counters["seen"]
                     if seen % 25 == 0:                 # periodic checkpoint (final one in finally)
                         _checkpoint(P, done, protocols)
-                reporter.advance(1)
+                if advance:
+                    reporter.advance(1)
                 reporter.set_detail(f"{acc} (+{len(rows)} samples)")
-                if seen % 20 == 0:
-                    print(f"  [{seen}/{len(todo)}] {acc}  (+{len(rows)} samples)")
+                if counters["seen"] % 20 == 0:
+                    print(f"  [{counters['seen']}/{len(todo)}] {acc}  (+{len(rows)} samples)")
+        return failed_pairs
+
+    failed = []
+    try:
+        failed = run_pass(todo, advance=True)
+        for rp in range(EXTRACT_RETRY_PASSES):         # in-run retry of transient NCBI failures
+            if not failed:
+                break
+            wait = 10 * (rp + 1)
+            print(f"  Retry pass {rp + 1}/{EXTRACT_RETRY_PASSES} for {len(failed)} failed studies "
+                  f"(waiting {wait}s)…")
+            reporter.set_detail(f"retrying {len(failed)} failed studies (pass {rp + 1})…")
+            time.sleep(wait)
+            failed = run_pass(failed, advance=False)
     finally:
         _checkpoint(P, done, protocols)               # always persist final progress
         jf.close()
+
+    now_failed = sorted({acc for (_uid, acc, _m) in failed})
+    _atomic_json(failed_path, now_failed)
+    new_failures = [a for a in now_failed if a not in prev_failed]
     print(f"  Done. Processed {counters['processed']} new studies "
-          f"({counters['failed']} fetch failures). Total: {len(done)}.")
-    return {"studies_done": len(done)}
+          f"({len(now_failed)} still failed). Total done: {len(done)}.")
+    if new_failures:
+        # WS2: raise so the caller does NOT mark this stage done -> a --resume retries ONLY these
+        # (the done-set is checkpointed). NCBI was likely throttling/down and the failures persisted.
+        raise RuntimeError(
+            f"extract: {len(now_failed)} study(ies) could not be fetched after {EXTRACT_RETRY_PASSES} "
+            f"retries ({len(new_failures)} new this run, e.g. "
+            f"{', '.join(new_failures[:10])}{' …' if len(new_failures) > 10 else ''}). "
+            f"Progress is checkpointed — resume to retry only these.")
+    if now_failed:
+        # every remaining failure already failed on a prior run -> permanently unavailable: PROCEED
+        # (loud warning) instead of blocking forever on deleted/restricted GEO studies.
+        msg = (f"{len(now_failed)} study(ies) failed again across runs; SKIPPING as permanently "
+               f"unavailable: {', '.join(now_failed[:10])}{' …' if len(now_failed) > 10 else ''}")
+        print(f"  WARNING: {msg}")
+        reporter.set_detail("proceeding; " + msg)
+    return {"studies_done": len(done), "failed": now_failed}
 
 
 def main():

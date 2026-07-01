@@ -38,7 +38,7 @@ BED_CONFIG_DEFAULTS = {
     "DELETE_BAM_AFTER_BED": "0",    # UI toggle: delete each BAM once its BEDs are made+verified (default OFF)
     "THREADS": 1,                  # BAMtoBED is a single Python process; 1 slot packs the node
     "MEM_MB": 32000,
-    "WALL": "16:00",
+    "WALL": "1108:00",   # default -W: queue MAX (66480 min) so deep-BAM bed jobs never die to walltime
     "LSF_QUEUE": "",
     "JOB_TAG": "bed",
     "WATCHDOG_INTERVAL_MIN": 30,
@@ -129,7 +129,7 @@ def _bed_launch_sh(bam_out_root, bed_tag, check_min=30, max_wait_hours=168):
         "fi\n"
         "when=$(date -d \"+$CHECK_MIN min\" '+%Y:%m:%d:%H:%M' 2>/dev/null) || "
         "when=$(date -v+\"${CHECK_MIN}\"M '+%Y:%m:%d:%H:%M' 2>/dev/null)\n"
-        'bsub -L /bin/bash -n 1 -M 1000 -W 120 -b "$when" -J "${JT}_launch" \\\n'
+        'bsub -L /bin/bash -n 1 -M 1000 -W 66480 -b "$when" -J "${JT}_launch" \\\n'
         '     -o "$BAM_OUT/bed/launch.out" -e "$BAM_OUT/bed/launch.err" \\\n'
         '     "$HERE/bed_launch.sh" >/dev/null 2>&1\n'
         'echo "[bed_launch] not done / will retry -> next check scheduled for $when"\n'
@@ -212,6 +212,8 @@ def build_bed_bundle(P, sel, bam_out_root, bed_cfg, star_job_tag="sra_star", rep
     _mode = str(vals.get("BED_MODE", "")).strip().lower()
     vals["BED_MODE"] = _mode if _mode in ("intron", "exon", "both") else "intron"
 
+    vals["ALERT_EMAIL"] = vals.get("ALERT_EMAIL") or cluster_deploy._alert_email()   # cluster-side email
+    cluster_deploy.bake_diagnose_model(vals)                                         # optional diagnose-AI model path / cache dir
     template = open(os.path.join(BED_TEMPLATE_DIR, "config.sh"), encoding="utf-8").read()
     with open(os.path.join(P.bed_dir, "config.sh"), "w", encoding="utf-8", newline="\n") as f:
         f.write(cluster_deploy.fill_config(template, vals, numeric=BED_NUMERIC, defaults=BED_CONFIG_DEFAULTS))
@@ -264,6 +266,7 @@ def _upload_ref_idempotent(host, port, user, keyfile, password, bed_root, specie
         cli.connect(**kw)
         try:
             sftp = cli.open_sftp()
+            sftp.get_channel().settimeout(600)   # ~100 MB exon-ref put can't hang the worker forever
             try:
                 rsize = sftp.stat(remote).st_size
             except Exception:
@@ -271,7 +274,8 @@ def _upload_ref_idempotent(host, port, user, keyfile, password, bed_root, specie
             if rsize == lsize:
                 print(f"  BED SUBMIT: exon ref already present on cluster ({lsize} bytes) -> skip upload")
             else:
-                _i, _o, _e = cli.exec_command(f"mkdir -p {cluster_deploy.shq(rdir)}")
+                _i, _o, _e = cli.exec_command(f"mkdir -p {cluster_deploy.shq(rdir)}", timeout=600)
+                _o.channel.settimeout(60)   # cap the exit-status wait so a stalled network can't hang
                 _o.channel.recv_exit_status()
                 reporter.set_detail(f"uploading {species} exon ref (~{lmb} MB)…")
                 sftp.put(local, remote)
@@ -325,9 +329,14 @@ def submit_bed_over_ssh(P, cluster_cfg, secrets, bam_out_root, reporter=NULL, pr
 
     species = _read_bundle_species(P)
     shq = cluster_deploy.shq
+    # DETACH the launcher bsub (setsid, backgrounded in a subshell so only the bsub is async) so the deploy
+    # ssh returns immediately instead of hanging on "Pending job threshold reached. Retrying in 60s" under a
+    # saturated pending-job quota. See star_deploy.submit_star_over_ssh for the full rationale.
+    _lo = shq(bed_root + '/launch.out')
     launch = (
-        f"bsub -L /bin/bash -n 1 -M 1000 -W 120 -J {shq(bed_tag + '_launch')} "
-        f"-o {shq(bed_root + '/launch.out')} -e {shq(bed_root + '/launch.err')} {shq(bed_root + '/bed_launch.sh')}"
+        f"( setsid bsub -L /bin/bash -n 1 -M 1000 -W 66480 -J {shq(bed_tag + '_launch')} "
+        f"-o {_lo} -e {shq(bed_root + '/launch.err')} {shq(bed_root + '/bed_launch.sh')} "
+        f"</dev/null >>{_lo} 2>&1 & )"
     )
     if prior_skipped:
         # START at BAM->BED (STAR skipped): the launcher polls <BAM_OUT>/PIPELINE_COMPLETE.txt, which no
@@ -347,6 +356,13 @@ def submit_bed_over_ssh(P, cluster_cfg, secrets, bam_out_root, reporter=NULL, pr
         else:
             res = cluster_deploy._submit_systemssh(P, host, port, user, keyfile, bed_root,
                                                    reporter, src_dir=P.bed_dir, launch_cmd=launch)
+        # guard: the submit helpers return {"submitted": True, ...} only on success (they raise otherwise),
+        # but never report submitted=True if the result doesn't actually confirm the launch.
+        if not (isinstance(res, dict) and res.get("submitted")):
+            reason = (res or {}).get("reason", "submit did not confirm launch") if isinstance(res, dict) else "submit did not confirm launch"
+            print(f"  BED SUBMIT: launch not confirmed -> {reason}")
+            return {"submitted": False, "reason": reason,
+                    "diagnosis": cluster_deploy.diagnose_failure("", reason)}
         # ship the heavy exon ref AFTER the bundle upload, so <bed_root>/altanalyze already exists and the
         # refs/ merges cleanly into it (no scp -r nesting). Non-fatal: the launcher self-heals (retries)
         # if the ref isn't there yet, and STAR is still running so there is time to spare.

@@ -209,4 +209,26 @@ STAGE_DOCS = {
         "inputs": "psi_bundle.zip, your SSH settings, AltAnalyze on the cluster, the running/finished BAM->BED stage",
         "outputs": "(remote) <psi_root>/output/AltResults PSI/dPSI tables; psi_submit.json",
     },
+    "concordance_bundle": {
+        "title": "Build concordance bundle",
+        "what": "(Bulk RNA-seq module) Assembles the self-driving drug-concordance bundle: the vendored scorer "
+                "(splicingConcordance_advanced.py), the ranker (rank_concordance.py), config.sh, and a queries.tsv "
+                "listing the CANCER-SUBTYPE atlases to score against. The atlas is auto-selected from the cell line "
+                "via cancer_atlas_registry.json (MDS-L -> AML/MDS Leucegene, A549 -> lung LUAD+LUSC); the GUI 'cancer "
+                "atlas' field overrides it. For AML a vendored patient-count table ships too; for lung the counts are "
+                "derived cluster-side from the OncoSplice MergedResult matrix. JOB_TAG is the download tag + '_concordance'.",
+        "inputs": "the PSI stage's Events-dPSI drug signatures (<psi_root>/output/AltResults/AlternativeOutput), the cell-line selection",
+        "outputs": "runtable/concordance/ + concordance_bundle.zip (scorer, ranker, config.sh, queries.tsv)",
+    },
+    "concordance_submit": {
+        "title": "Run drug-vs-cancer concordance",
+        "what": "(Autonomous mode only) Resolves the AltAnalyze install carrying export/UI/unique (for the scorer's "
+                "PYTHONPATH; reuses what PSI resolved), uploads the concordance bundle, and queues a launcher that WAITS "
+                "for AltAnalyze PSI to finish (polls <psi_root>/PIPELINE_COMPLETE.txt), then gathers the per-drug PSI "
+                "signatures and scores each against every cancer atlas -> a ranked reversal-candidate summary per atlas "
+                "(concordance 1=mimics, 0=reverses; candidates below the threshold, ranked by overlapping events + "
+                "patient count). Skips cleanly when no atlas is configured for the cell line. Non-fatal.",
+        "inputs": "concordance_bundle.zip, your SSH settings, the cancer atlas signatures on the cluster, the running/finished PSI stage",
+        "outputs": "(remote) <concord_root>/results/<atlas>/concordance.txt + ranked_concordance_summary.txt; concordance_submit.json",
+    },
 }

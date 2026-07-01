@@ -42,6 +42,9 @@ STAGES = [
     # AltAnalyze splicing (PSI; auto-chained after BAM->BED)
     ("psi_bundle", "Build AltAnalyze (PSI) bundle"),
     ("psi_submit", "Run AltAnalyze splicing"),
+    # splicing concordance (drug PSI vs cancer atlas; auto-chained after PSI)
+    ("concordance_bundle", "Build concordance bundle"),
+    ("concordance_submit", "Run drug-vs-cancer concordance"),
 ]
 
 # Rough fraction-of-wall-time weights used only to drive the *overall* progress bar
@@ -68,6 +71,8 @@ WEIGHTS = {
     "bed_submit": 0.02,
     "psi_bundle": 0.01,
     "psi_submit": 0.02,
+    "concordance_bundle": 0.01,
+    "concordance_submit": 0.02,
 }
 
 # ---------------------------------------------------------------------------
@@ -117,6 +122,8 @@ CHECKPOINTS = [
      "inputs": [_SEL_INPUT]},
     {"key": "psi_bundle", "label": "AltAnalyze PSI", "stage": "psi_bundle", "end_stage": "psi_submit",
      "inputs": [_SEL_INPUT]},
+    {"key": "concordance_bundle", "label": "Drug concordance", "stage": "concordance_bundle",
+     "end_stage": "concordance_submit", "inputs": [_SEL_INPUT]},
 ]
 
 
@@ -285,7 +292,7 @@ class RunReporter:
             if not self._awaiting:
                 return False
             self._selected = canonical
-        self._select_event.set()
+            self._select_event.set()   # set under the lock to close the lost-wakeup race
         return True
 
     # ---- cluster upload retry (collect corrected SSH/cluster info; no full rerun) ---------
@@ -316,7 +323,7 @@ class RunReporter:
             if not self._awaiting_cluster:
                 return False
             self._cluster_fix = payload
-        self._cluster_event.set()
+            self._cluster_event.set()   # set under the lock to close the lost-wakeup race
         return True
 
     # ---- AI preflight fix (bad provider/model/key -> correct it or turn AI off) ----------
@@ -346,7 +353,7 @@ class RunReporter:
             if not self._awaiting_ai:
                 return False
             self._ai_fix = payload
-        self._ai_event.set()
+            self._ai_event.set()   # set under the lock to close the lost-wakeup race
         return True
 
     # ---- terminal states -------------------------------------------------
@@ -459,8 +466,9 @@ class RunReporter:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(self.snapshot(), f)   # RLock is reentrant in this thread
             os.replace(tmp, self.progress_path)
-        except Exception:
-            pass  # progress flush is best-effort; never let it break a run
+        except Exception as e:
+            # best-effort; never let it break a run, but don't be fully silent on ENOSPC/EACCES
+            print(f"WARN: progress flush failed ({self.progress_path}): {e}")
 
 
 class _NullReporter:

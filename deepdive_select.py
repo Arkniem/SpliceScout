@@ -26,7 +26,8 @@ def _load_index(P):
     if not os.path.exists(P.cellline_index):
         return {}
     try:
-        return json.load(open(P.cellline_index, encoding="utf-8"))
+        with open(P.cellline_index, encoding="utf-8") as f:
+            return json.load(f)
     except Exception:
         return {}
 
@@ -97,8 +98,14 @@ def consolidate(P, reporter=NULL):
         if len(names) > 1:
             n_groups += 1
 
-    json.dump(merged, open(P.cellline_index, "w", encoding="utf-8"), ensure_ascii=False)
-    json.dump(merge_map, open(P.cellline_merge, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    tmp = P.cellline_index + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(merged, f, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, P.cellline_index)
+    with open(P.cellline_merge, "w", encoding="utf-8") as f:
+        json.dump(merge_map, f, ensure_ascii=False, indent=1)
     if len(index) != len(merged):
         print(f"  CONSOLIDATE: merged cell-line name variants {len(index)} -> {len(merged)} "
               f"({n_groups} group(s) merged)")
@@ -152,7 +159,12 @@ def select(P, canonical, reporter=NULL):
         "aliases": d.get("aliases", []),   # other spellings merged into this line (-> cellline_match)
     }
     os.makedirs(P.runtable_dir, exist_ok=True)
-    json.dump(sel, open(P.cellline_selection, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    tmp = P.cellline_selection + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(sel, f, ensure_ascii=False, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, P.cellline_selection)
     reporter.set_detail(f"{canonical}: {sel['total']} samples, {len(sel['studies'])} studies, "
                         f"{sel['total_spots']:,} reads")
     print(f"  SELECT: {canonical} | {len(sel['compounds'])} compounds | "

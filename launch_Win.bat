@@ -100,22 +100,44 @@ REM ---- 4) Launch: prefer the system tray (no console window); fall back to a c
 set "PYW=pythonw"
 if /I "%PY%"=="py" set "PYW=pyw"
 %PY% -c "import pystray, PIL" >nul 2>&1
+if errorlevel 1 goto run_console
+goto run_tray
+
+:run_console
+echo Starting the web UI in this window ^(tray libraries unavailable^).
+echo Keep this window open while you work; close it ^(or press Ctrl+C^) to stop.
+echo TIP: run launch_Win.bat again for ANOTHER instance ^(it prompts for its own name + own port^).
+echo.
+%PY% server.py
 if errorlevel 1 (
-  echo Starting the web UI in this window ^(tray libraries unavailable^).
-  echo Keep this window open while you work; close it ^(or press Ctrl+C^) to stop.
-  echo TIP: run launch_Win.bat again for ANOTHER instance ^(it prompts for its own name + own port^).
   echo.
-  %PY% server.py
-  if errorlevel 1 (
-    echo.
-    echo The server exited with an error - see the messages above.
-  )
-  echo.
-  pause
-) else (
-  echo Starting SpliceScout in the system tray - look for the blue "S" icon near the clock.
-  echo Right-click it for Open / Quit. You can close this window. Run launch_Win.bat again for
-  echo another concurrent instance ^(it prompts for its own name + own port^).
-  start "SpliceScout" %PYW% "%~dp0tray.py"
-  timeout /t 4 >nul
+  echo The server exited with an error - see the messages above.
 )
+echo.
+pause
+goto :eof
+
+:run_tray
+echo Starting SpliceScout in the system tray - look for the blue "S" icon near the clock.
+echo Right-click it for Open / Quit. You can close this window. Run launch_Win.bat again for
+echo another concurrent instance ^(it prompts for its own name + own port^).
+REM The tray runs windowless (pythonw); under pythonw the app's own browser auto-open can silently
+REM no-op, so the app writes its URL to _last_url.txt and WE open the browser from here (a reliable
+REM console context). SPLICESCOUT_OPENED_BY_LAUNCHER tells tray.py not to also open it (avoids 2 tabs).
+del "%~dp0_last_url.txt" >nul 2>&1
+set "SPLICESCOUT_OPENED_BY_LAUNCHER=1"
+start "SpliceScout" %PYW% "%~dp0tray.py"
+echo Waiting for the server to come up, then opening it in your browser...
+set "SS_URL="
+for /L %%i in (1,1,30) do if not defined SS_URL (
+  if exist "%~dp0_last_url.txt" set /p SS_URL=<"%~dp0_last_url.txt"
+  if not defined SS_URL ping -n 2 127.0.0.1 >nul
+)
+if defined SS_URL (
+  echo SpliceScout is running at %SS_URL%
+  start "" "%SS_URL%"
+) else (
+  echo Could not auto-detect the URL; right-click the tray "S" icon near the clock and choose Open.
+)
+timeout /t 3 >nul
+goto :eof

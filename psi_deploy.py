@@ -9,9 +9,10 @@ runs ONE AltAnalyze job over the whole BED dir -> a per-sample PSI table (+ a di
 when a usable 2-group split exists).
 
 AltAnalyze itself is NOT shipped in the bundle (it is multi-GB with its species database). Instead, at
-submit time we PROBE the cluster: if AltAnalyze + its database are found at ALTANALYZE_HOME (default the
-lab install), we use them in place; otherwise, if the user pointed us at a LOCAL AltAnalyze copy, we upload
-it once to <psi_root>/altanalyze_home (idempotent). An explicit ALTANALYZE_DB path override is supported
+submit time we PROBE the cluster: if AltAnalyze + its database are found at ALTANALYZE_HOME (default:
+$PIPELINE_ROOT/altanalyze_home -- set it to an existing cluster install to reuse that), we use them in
+place; otherwise, if the user pointed us at a LOCAL AltAnalyze copy, we upload it once to
+<psi_root>/altanalyze_home (idempotent). An explicit ALTANALYZE_DB path override is supported
 for when the database lives outside the AltAnalyze folder.
 
 The comparison groups are computed from the run: build_psi_bundle writes sample_groups.tsv (BioSample ->
@@ -39,7 +40,7 @@ PSI_TEMPLATE_DIR = os.path.join(HERE, "psi_template")
 PSI_CONFIG_DEFAULTS = {
     "BED_INPUT_DIR": "/data/CHANGE_ME/STAR_beds",
     "PIPELINE_ROOT": "/data/CHANGE_ME/psi",
-    "ALTANALYZE_HOME": "/data/salomonis2/software/AltAnalyze-91/AltAnalyze",
+    "ALTANALYZE_HOME": "",          # "" => $PIPELINE_ROOT/altanalyze_home (portable; set to a cluster install to reuse)
     "ALTANALYZE_DB": "",            # "" => $ALTANALYZE_HOME/AltDatabase ; else an external DB path
     "ORGANISM": "Homo sapiens",
     "SPECIES": "",                  # "" => config.sh derives from ORGANISM (default Hs)
@@ -49,17 +50,21 @@ PSI_CONFIG_DEFAULTS = {
     "GROUP_KEY_SUFFIX": ".bed",
     "THREADS": 4,
     "MEM_MB": 128000,
-    "WALL": "10:00",
+    "WALL": "1108:00",   # default -W: queue MAX (66480 min) so the AltAnalyze job never dies to walltime
     "LSF_QUEUE": "",
     "JOB_TAG": "psi",
     "WATCHDOG_INTERVAL_MIN": 30,
     "MAX_RESUBMITS": 2,
     "CLEANUP_TOOLS_WHEN_DONE": "0",
+    "COMPRESS_WHEN_DONE": "gzip",   # gzip | xz (LZMA2) | off -- compress kept data after PSI COMPLETE
+    "COMPRESS_DIR": "",             # "" => parent of PIPELINE_ROOT (the whole project tree)
+    "COMPRESS_MIN_MB": 1,
+    "COMPRESS_THREADS": 8,
     "PYTHON_MODULE": "python/2.7.5",
     "SAMTOOLS_MODULE": "samtools",
     "R_MODULE": "R",
 }
-PSI_NUMERIC = {"THREADS", "MEM_MB", "WATCHDOG_INTERVAL_MIN", "MAX_RESUBMITS"}
+PSI_NUMERIC = {"THREADS", "MEM_MB", "WATCHDOG_INTERVAL_MIN", "MAX_RESUBMITS", "COMPRESS_MIN_MB", "COMPRESS_THREADS"}
 
 # psi_cfg keys that are NOT config.sh vars (deploy-time only) -- stripped before fill_config.
 _DEPLOY_ONLY = ("enabled", "ALTANALYZE_LOCAL")
@@ -97,16 +102,301 @@ def _find_col(header, aliases):
 
 
 # ---- comparison groups: BioSample -> (group_num, group_label) -----------------------------------
-# Phase A default: collapse the annotated run table's per-run `drug_treated` column to one label per
-# BioSample (the BED stem), Not Drug Treated=group 1 (baseline), Drug Treated=group 2; Undetermined
-# dropped. Phase B replaces this with the user-defined `group` column (see group_assign.py).
+# DEFAULT (Phase A): each distinct drug CONDITION (drug x dose x timepoint, scoped by GSE) becomes its
+# own group compared against the pooled control baseline (group 1) -> AltAnalyze writes one
+# PSI.<GSE>.<drug>_<dose/time>_vs_control.txt per condition. The control baseline = every sample with NO
+# drug ("Not Drug Treated"); "Drug Treated" samples are SUBDIVIDED by condition (vs the old binary which
+# lumped all of them into one "drug_treated" group). If per-condition isn't viable (fewer than 2 groups
+# with >= 2 samples, e.g. all-singleton conditions or no replicated control), we FALL BACK to the binary
+# split so a run never ends up worse off than before. Phase B still overrides via the user `group` column.
 _DRUG_LABELMAP = {"not drug treated": (1, "not_drug_treated"), "drug treated": (2, "drug_treated")}
+
+# Original free-text condition columns (the timepoint/duration often lives ONLY here, e.g. MDSL's
+# "DB2115-treated 20h"), NOT the canonical drug/dose columns appended by runtable_annotate.
+_RAW_TREAT_COLS = ("treatment", "treatments", "agent", "agents", "compound", "compounds",
+                   "treated_with", "chemical", "perturbation", "small_molecule", "inhibitor",
+                   "stimulus", "drug_treatment")
+_TIME_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s*(h|hr|hrs|hour|hours|d|day|days|min|mins|minute|minutes|"
+                      r"wk|week|weeks)\b", re.I)
+_TIME_UNIT = {"hour": "h", "hours": "h", "hr": "h", "hrs": "h", "day": "d", "days": "d",
+              "minute": "min", "minutes": "min", "mins": "min", "week": "wk", "weeks": "wk"}
+MIN_PER_GROUP = 2   # mirrors build_groups.sh: a group needs >= this many samples to be compared
+
+# Technical covariates that drive RNA-seq batch effects -> used to pick the NEAREST control-bearing study
+# for a drug-GSE that has no controls of its own (col-alias tuple, weight). Higher weight = more important.
+_TECH_FEATS = (
+    (("instrument",), 3.0),
+    (("libraryselection", "library_selection"), 2.0),
+    (("librarylayout", "library_layout"), 2.0),
+    (("librarysource", "library_source"), 1.0),
+    (("platform",), 1.0),
+    (("assay type", "assay_type"), 1.0),
+    (("center name", "center_name"), 1.0),
+)
+_SPOTLEN_ALIASES = ("avgspotlen", "avg_spot_len", "avgspotlength")
+
+
+def _norm_token(s):
+    """Filename/AltAnalyze-safe token: keep alnum + . + - ; everything else -> single '_'."""
+    s = re.sub(r"[^0-9A-Za-z.\-]+", "_", str(s or "").strip())
+    return re.sub(r"_{2,}", "_", s).strip("_.")
+
+
+def _time_tokens(text):
+    """Distinct duration/timepoint tokens from free text: 'DB2115-treated 20h' -> ['20h']."""
+    out = []
+    for m in _TIME_RE.finditer(text or ""):
+        unit = m.group(2).lower()
+        out.append(f"{m.group(1)}{_TIME_UNIT.get(unit, unit)}")
+    return list(dict.fromkeys(out))
+
+
+def _raw_treatment(row, cols):
+    for c in cols:
+        v = (row.get(c) or "").strip()
+        if v:
+            return v
+    return ""
+
+
+def _condition_label(gse, drug, dose, raw):
+    """'<GSE>.<drug>[_<dose>][_<time>]' (falls back to slug of the raw treatment text when no canonical
+    drug). The label IS both the comparison group key and the output filename stem: AltAnalyze writes
+    PSI.<label>_vs_<control>.txt."""
+    gse_t = _norm_token(gse)
+    if drug:
+        base = _norm_token(drug)
+        variant = [_norm_token(re.sub(r"\s+", "", p)) for p in re.split(r"[;,]", dose or "")]
+        variant += _time_tokens(raw)
+        parts, low = [base], base.lower()
+        for t in variant:
+            if t and t.lower() not in low:
+                parts.append(t)
+                low += "_" + t.lower()
+        core = "_".join(p for p in parts if p)
+    else:
+        core = _norm_token(raw)
+    core = core or "treated"
+    return (gse_t + "." if gse_t else "") + core
+
+
+def _collapse_labelmap(per, lm):
+    """Collapse {bs: Counter(label)} via a {label.lower(): (num, name)} map (binary default / Phase B).
+    Returns (out, counts, dropped)."""
+    out, counts, dropped = [], Counter(), []
+    for bs, c in per.items():
+        known = [(lab, n) for lab, n in c.most_common() if lab.lower() in lm]
+        if not known:
+            dropped.append((bs, c.most_common(1)[0][0] if c else ""))
+            continue
+        num, name = lm[known[0][0].lower()]
+        out.append((bs, num, name))
+        counts[num] += 1
+    return out, counts, dropped
+
+
+def _tech_signature(sample_rows, feat_cols, spot_col):
+    """Modal categorical value per feature + mean AvgSpotLen across the given run rows (for NN matching)."""
+    sig = {}
+    for col, _w in feat_cols:
+        c = Counter((r.get(col) or "").strip() for r in sample_rows if (r.get(col) or "").strip())
+        sig[col] = c.most_common(1)[0][0] if c else ""
+    spots = []
+    if spot_col:
+        for r in sample_rows:
+            try:
+                spots.append(float((r.get(spot_col) or "").strip()))
+            except ValueError:
+                pass
+    sig["_spot"] = (sum(spots) / len(spots)) if spots else None
+    return sig
+
+
+def _sig_distance(a, b, feat_cols):
+    """Weighted distance between two technical signatures (lower = more similar)."""
+    d = 0.0
+    for col, w in feat_cols:
+        if (a.get(col) or "") != (b.get(col) or ""):
+            d += w
+    sa, sb = a.get("_spot"), b.get("_spot")
+    if sa is not None and sb is not None:
+        d += 3.0 * min(1.0, abs(sa - sb) / 50.0)   # read-length within ~50 bp counts as similar
+    return d
+
+
+def _nearest_control_gse(orphan_sig, cand_sigs, feat_cols):
+    """cand_sigs: {gse: (sig, n_controls)} -> nearest control-bearing gse (tie: more controls, then id)."""
+    best, best_key = None, None
+    for gse, (sig, nctrl) in cand_sigs.items():
+        key = (_sig_distance(orphan_sig, sig, feat_cols), -nctrl, gse)
+        if best_key is None or key < best_key:
+            best_key, best = key, gse
+    return best
+
+
+def _build_default_groups(rows, header):
+    """PURE core of the default grouping (no I/O; unit-testable). Subdivide 'Drug Treated' samples into
+    per-CONDITION groups (drug x dose/time, GSE-scoped) vs control. Baseline:
+      * single control-study  -> ONE pooled "control" group (build_groups does all-vs-control; no comps spec)
+      * multi control-study   -> PER-GSE control groups + an explicit `comps` list pairing each condition to
+                                 its OWN study's controls; a drug-GSE with no controls borrows the NEAREST
+                                 control-bearing study (technical-signature nearest-neighbor).
+    Falls back to the binary drug-vs-not split when per-condition isn't viable. Returns
+    {out, groups, mode, comparisons, baseline, comps?, orphans?} or None."""
+    bs_col = _find_col(header, ("biosample", "bio_sample", "biosample_accession", "sample", "sample_accession"))
+    dt_col = _find_col(header, ("drug_treated",))
+    if not bs_col or not dt_col:
+        return None
+    drug_col = _find_col(header, ("drug",))
+    dose_col = _find_col(header, ("dose",))
+    gse_col = _find_col(header, ("gse_series", "gse", "gse_accession (exp)", "gse_accession"))
+    raw_cols = [c for c in _RAW_TREAT_COLS if c in header]
+    feat_cols = [(_find_col(header, al), w) for al, w in _TECH_FEATS]
+    feat_cols = [(c, w) for c, w in feat_cols if c]
+    spot_col = _find_col(header, _SPOTLEN_ALIASES)
+
+    per_dt = defaultdict(Counter)       # bs -> Counter(drug_treated label)
+    per_label = defaultdict(Counter)    # bs -> Counter(condition label)  (treated only)
+    per_gse = defaultdict(Counter)      # bs -> Counter(GSE)
+    ctrl_rows_by_gse = defaultdict(list)   # gse -> control run rows (for candidate signatures)
+    treat_rows_by_gse = defaultdict(list)  # gse -> treated run rows (for orphan signatures)
+    for r in rows:
+        bs = (r.get(bs_col) or "").strip()
+        if not bs:
+            continue
+        dt = (r.get(dt_col) or "").strip()
+        gse = ((r.get(gse_col) or "").strip()) if gse_col else ""
+        if dt:
+            per_dt[bs][dt] += 1
+        if gse:
+            per_gse[bs][gse] += 1
+        if dt.lower() == "drug treated":
+            per_label[bs][_condition_label(gse, (r.get(drug_col) or "") if drug_col else "",
+                                           (r.get(dose_col) or "") if dose_col else "",
+                                           _raw_treatment(r, raw_cols))] += 1
+            treat_rows_by_gse[gse].append(r)
+        elif dt.lower() == "not drug treated":
+            ctrl_rows_by_gse[gse].append(r)
+
+    # collapse runs -> BioSample (majority vote); classify treated vs control vs undetermined(drop)
+    treated, controls, dropped = {}, [], []
+    bs_gse = {}
+    for bs in per_dt:
+        bs_gse[bs] = per_gse[bs].most_common(1)[0][0] if per_gse[bs] else ""
+        chosen = next((lab.lower() for lab, _n in per_dt[bs].most_common()
+                       if lab.lower() in ("drug treated", "not drug treated")), None)
+        if chosen is None:
+            dropped.append(bs)
+        elif chosen == "not drug treated":
+            controls.append(bs)
+        else:
+            treated[bs] = per_label[bs].most_common(1)[0][0] if per_label[bs] else "treated"
+
+    control_by_gse = defaultdict(list)
+    for bs in controls:
+        control_by_gse[bs_gse.get(bs, "")].append(bs)
+    cond_by_label = defaultdict(list)
+    cond_gse = {}
+    for bs, lab in treated.items():
+        cond_by_label[lab].append(bs)
+        cond_gse[lab] = bs_gse.get(bs, "")
+    usable_ctrl_gses = {g for g, b in control_by_gse.items() if g and len(b) >= MIN_PER_GROUP}
+
+    # -------- multi-study: PER-GSE controls + nearest-neighbor for control-less drug studies ----------
+    if len(usable_ctrl_gses) >= 2:
+        res = _pergse_groups(control_by_gse, usable_ctrl_gses, cond_by_label, cond_gse,
+                             ctrl_rows_by_gse, treat_rows_by_gse, feat_cols, spot_col, dropped)
+        if res:
+            return res
+        print("  PSI BUNDLE: per-GSE matching produced no usable comparison -> trying pooled control")
+
+    # -------- single control-study (or fallback): ONE pooled control baseline, all-vs-control ----------
+    labels = sorted(set(treated.values()), key=lambda s: (s.lower(), s))
+    lab_num = {lab: i for i, lab in enumerate(labels, start=2)}
+    out, counts = [], Counter()
+    for bs in controls:
+        out.append((bs, 1, "control")); counts[1] += 1
+    for bs, lab in treated.items():
+        out.append((bs, lab_num[lab], lab)); counts[lab_num[lab]] += 1
+    qualifying = [n for n, c in counts.items() if c >= MIN_PER_GROUP]
+    if counts.get(1, 0) >= MIN_PER_GROUP and len(qualifying) >= 2:
+        comparisons = [lab for lab in labels if counts[lab_num[lab]] >= MIN_PER_GROUP]
+        thin = [lab for lab in labels if counts[lab_num[lab]] < MIN_PER_GROUP]
+        if thin:
+            print(f"  PSI BUNDLE: {len(thin)} condition(s) with < {MIN_PER_GROUP} samples dropped (no reps)")
+        if dropped:
+            print(f"  PSI BUNDLE: dropped {len(dropped)} Undetermined sample(s) (no drug call)")
+        return {"out": out, "groups": dict(counts), "mode": "per_condition",
+                "comparisons": comparisons, "baseline": "control"}
+
+    # -------- FALLBACK: binary drug-vs-not (never worse than the old behavior) ----------
+    print("  PSI BUNDLE: per-condition split not viable -> binary drug_treated vs not_drug_treated")
+    bout, bcounts, _bd = _collapse_labelmap(per_dt, _DRUG_LABELMAP)
+    if not bout:
+        return None
+    return {"out": bout, "groups": dict(bcounts), "mode": "binary",
+            "comparisons": ["drug_treated"] if bcounts.get(2) else [], "baseline": "not_drug_treated"}
+
+
+def _pergse_groups(control_by_gse, usable_ctrl_gses, cond_by_label, cond_gse,
+                   ctrl_rows_by_gse, treat_rows_by_gse, feat_cols, spot_col, dropped):
+    """Multi-study path: per-GSE control groups + explicit matched comps (nearest-neighbor control study
+    for drug-GSEs that lack their own controls). Returns the result dict, or None if no usable comp."""
+    ctrl_label = {g: f"{_norm_token(g)}.control" for g in usable_ctrl_gses}
+    # number ALL groups (control + condition) by sorted label
+    all_labels = sorted(set(ctrl_label.values()) | set(cond_by_label.keys()), key=lambda s: (s.lower(), s))
+    lab_num = {lab: i for i, lab in enumerate(all_labels, start=1)}
+
+    out, counts = [], Counter()
+    for g in usable_ctrl_gses:
+        for bs in control_by_gse[g]:
+            out.append((bs, lab_num[ctrl_label[g]], ctrl_label[g])); counts[lab_num[ctrl_label[g]]] += 1
+    for lab, bslist in cond_by_label.items():
+        for bs in bslist:
+            out.append((bs, lab_num[lab], lab)); counts[lab_num[lab]] += 1
+
+    cand_sigs = {g: (_tech_signature(ctrl_rows_by_gse.get(g, []), feat_cols, spot_col),
+                     len(control_by_gse[g])) for g in usable_ctrl_gses}
+    orphan_base = {}   # orphan gse -> chosen nearest control gse (cached per gse)
+    comps, comparisons, orphans, thin = [], [], [], []
+    for lab in sorted(cond_by_label, key=lambda s: (s.lower(), s)):
+        if len(cond_by_label[lab]) < MIN_PER_GROUP:
+            thin.append(lab)
+            continue
+        gse = cond_gse[lab]
+        if gse in usable_ctrl_gses:
+            base = ctrl_label[gse]
+        else:
+            if gse not in orphan_base:
+                osig = _tech_signature(treat_rows_by_gse.get(gse, []), feat_cols, spot_col)
+                orphan_base[gse] = _nearest_control_gse(osig, cand_sigs, feat_cols)
+            nn = orphan_base[gse]
+            if not nn:
+                continue
+            base = ctrl_label[nn]
+            orphans.append((lab, gse, nn))
+        comps.append((lab_num[lab], lab_num[base]))
+        comparisons.append(lab)
+    if not comps:
+        return None
+    if thin:
+        print(f"  PSI BUNDLE: {len(thin)} condition(s) with < {MIN_PER_GROUP} samples dropped (no reps)")
+    if dropped:
+        print(f"  PSI BUNDLE: dropped {len(dropped)} Undetermined sample(s) (no drug call)")
+    for lab, gse, nn in orphans:
+        print(f"  PSI BUNDLE: {gse} has no own controls -> nearest-neighbor baseline {nn} for '{lab}'")
+    n_ctrl = len(usable_ctrl_gses)
+    print(f"  PSI BUNDLE: per-GSE matched comparisons: {len(comps)} (across {n_ctrl} control studies, "
+          f"{len(orphan_base)} borrowed via NN)")
+    return {"out": out, "groups": dict(counts), "mode": "per_condition_pergse",
+            "comparisons": comparisons, "baseline": "per-GSE", "comps": comps, "orphans": orphans}
 
 
 def _write_sample_groups(P, sel, dest, group_col=None, labelmap=None):
     """Write sample_groups.tsv (BioSample<TAB>group_num<TAB>label) from the annotated run table.
-    Returns a dict {n, groups:{num:count}} or None if no usable table/column. group_col/labelmap let
-    Phase B pass the user `group` column; default = drug_treated."""
+    DEFAULT = per-condition (drug x dose/time) vs control, binary fallback (see _build_default_groups).
+    Phase B (group_col + labelmap) overrides with the user `group` column. Returns
+    {n, groups:{num:count}, mode, comparisons} or None if no usable table."""
     if not sel:
         return None
     slug = _cl_slug(sel.get("canonical", "cellline"))
@@ -125,38 +415,50 @@ def _write_sample_groups(P, sel, dest, group_col=None, labelmap=None):
         return None
     header = list(rows[0].keys())
     bs_col = _find_col(header, ("biosample", "bio_sample", "biosample_accession", "sample", "sample_accession"))
-    val_col = group_col or _find_col(header, ("drug_treated",))
-    if not bs_col or not val_col or val_col not in header:
+    if not bs_col:
         return None
 
-    # collapse runs -> BioSample (majority vote of the per-run label; ties/unknown dropped)
-    per = defaultdict(Counter)
-    for r in rows:
-        bs = (r.get(bs_col) or "").strip()
-        val = (r.get(val_col) or "").strip()
-        if bs and val:
-            per[bs][val] += 1
-
-    out = []
-    counts = Counter()
     if group_col and labelmap:
         # Phase B: arbitrary user labels already numbered 1..N in `labelmap` (label -> (num, name))
+        if group_col not in header:
+            return None
+        per = defaultdict(Counter)
+        for r in rows:
+            bs = (r.get(bs_col) or "").strip()
+            val = (r.get(group_col) or "").strip()
+            if bs and val:
+                per[bs][val] += 1
         lm = {k.lower(): v for k, v in labelmap.items()}
+        out, counts, dropped = _collapse_labelmap(per, lm)
+        if dropped:
+            labs = sorted({lab for _bs, lab in dropped if lab})
+            print(f"  !! PSI BUNDLE WARNING: DROPPED {len(dropped)} sample(s) with unmapped group label(s) "
+                  f"{labs} (not in {sorted(lm.keys())}) -> EXCLUDED from sample_groups.tsv")
+        if not out:
+            return None
+        baseline = next((n for _l, (num, n) in lm.items() if num == 1), "control")
+        res = {"out": out, "groups": dict(counts), "mode": "phaseB",
+               "comparisons": [n for _l, (num, n) in lm.items() if num != 1], "baseline": baseline}
     else:
-        lm = _DRUG_LABELMAP
-    for bs, c in per.items():
-        known = [(lab, n) for lab, n in c.most_common() if lab.lower() in lm]
-        if not known:
-            continue
-        num, name = lm[known[0][0].lower()]
-        out.append((bs, num, name))
-        counts[num] += 1
-    if not out:
-        return None
+        res = _build_default_groups(rows, header)
+        if not res or not res["out"]:
+            return None
+
     with open(dest, "w", encoding="utf-8", newline="\n") as f:
-        for bs, num, name in sorted(out):
+        for bs, num, name in sorted(res["out"], key=lambda t: (t[1], t[0])):
             f.write(f"{bs}\t{num}\t{name}\n")
-    return {"n": len(out), "groups": dict(counts)}
+    # explicit matched comps (multi-study per-GSE path) -> sibling sample_comps.tsv; build_groups honors it
+    comps_path = os.path.join(os.path.dirname(dest), "sample_comps.tsv")
+    comps = res.get("comps")
+    if comps:
+        with open(comps_path, "w", encoding="utf-8", newline="\n") as f:
+            for exp_num, base_num in sorted(comps):
+                f.write(f"{exp_num}\t{base_num}\n")
+    elif os.path.exists(comps_path):
+        os.remove(comps_path)   # stale spec would wrongly force matched-comps mode on the cluster
+    return {"n": len(res["out"]), "groups": res["groups"], "mode": res["mode"],
+            "comparisons": res.get("comparisons", []), "baseline": res.get("baseline", "control"),
+            "comps": len(comps) if comps else 0, "orphans": res.get("orphans", [])}
 
 
 # ---- self-rescheduling launcher (waits on the BED stage's PIPELINE_COMPLETE.txt) ----------------
@@ -210,7 +512,7 @@ def _psi_launch_sh(bam_out_root, psi_root, psi_tag, check_min=30, max_wait_hours
         "fi\n"
         "when=$(date -d \"+$CHECK_MIN min\" '+%Y:%m:%d:%H:%M' 2>/dev/null) || "
         "when=$(date -v+\"${CHECK_MIN}\"M '+%Y:%m:%d:%H:%M' 2>/dev/null)\n"
-        'bsub -L /bin/bash -n 1 -M 1000 -W 120 -b "$when" -J "${JT}_launch" \\\n'
+        'bsub -L /bin/bash -n 1 -M 1000 -W 66480 -b "$when" -J "${JT}_launch" \\\n'
         '     -o "$PSI_ROOT/launch.out" -e "$PSI_ROOT/launch.err" \\\n'
         '     "$HERE/psi_launch.sh" >/dev/null 2>&1\n'
         'echo "[psi_launch] not done / will retry -> next check scheduled for $when"\n'
@@ -218,8 +520,16 @@ def _psi_launch_sh(bam_out_root, psi_root, psi_tag, check_min=30, max_wait_hours
 
 
 def _write_psi_instructions(P, vals, bam_out_root, psi_root, groups_info):
-    gtxt = ("default treated-vs-control (from the run table)" if groups_info
-            else "groupless (no usable run-table split shipped) -> per-sample PSI table only")
+    if not groups_info:
+        gtxt = "groupless (no usable run-table split shipped) -> per-sample PSI table only"
+    elif groups_info.get("mode") == "per_condition":
+        base = groups_info.get("baseline", "control")
+        comps = groups_info.get("comparisons", [])
+        gtxt = (f"per-condition: {len(comps)} comparison(s) vs {base} -> "
+                + ", ".join(f"PSI.{c}_vs_{base}.txt" for c in comps[:8])
+                + (" ..." if len(comps) > 8 else ""))
+    else:
+        gtxt = f"{groups_info.get('mode', 'binary')} treated-vs-control (from the run table)"
     txt = (
         "AltAnalyze splicing (PSI) bundle (Bulk RNA-seq module)\n"
         "=====================================================\n"
@@ -277,6 +587,8 @@ def build_psi_bundle(P, sel, bam_out_root, psi_cfg, download_job_tag="sra", repo
     for k in _DEPLOY_ONLY:
         vals.pop(k, None)
 
+    vals["ALERT_EMAIL"] = vals.get("ALERT_EMAIL") or cluster_deploy._alert_email()   # cluster-side email
+    cluster_deploy.bake_diagnose_model(vals)                                         # optional diagnose-AI model path / cache dir
     template = open(os.path.join(PSI_TEMPLATE_DIR, "config.sh"), encoding="utf-8").read()
     with open(os.path.join(P.psi_dir, "config.sh"), "w", encoding="utf-8", newline="\n") as f:
         f.write(cluster_deploy.fill_config(template, vals, numeric=PSI_NUMERIC, defaults=PSI_CONFIG_DEFAULTS))
@@ -287,7 +599,17 @@ def build_psi_bundle(P, sel, bam_out_root, psi_cfg, download_job_tag="sra", repo
     groups_info = _write_sample_groups(P, sel, os.path.join(P.psi_dir, "sample_groups.tsv"),
                                        group_col=group_col, labelmap=labelmap)
     if groups_info:
-        print(f"  PSI BUNDLE: sample_groups.tsv -> {groups_info['n']} samples, groups={groups_info['groups']}")
+        ncomp = len(groups_info.get("comparisons", []))
+        norph = len(groups_info.get("orphans", []))
+        print(f"  PSI BUNDLE: sample_groups.tsv -> {groups_info['n']} samples, "
+              f"mode={groups_info.get('mode')}, {len(groups_info['groups'])} groups, {ncomp} comparison(s)"
+              + (f", {norph} via nearest-neighbor control" if norph else ""))
+        if groups_info.get("mode") in ("per_condition", "binary"):
+            base = groups_info.get("baseline", "control")
+            for comp in groups_info.get("comparisons", [])[:12]:
+                print(f"               -> PSI.{comp}_vs_{base}.txt")
+            if ncomp > 12:
+                print(f"               -> ... (+{ncomp - 12} more)")
     else:
         print("  PSI BUNDLE: no usable run-table grouping -> GROUPLESS PSI (per-sample table only)")
 
@@ -343,10 +665,16 @@ def _upload_altanalyze(host, port, user, keyfile, password, local_dir, dest_home
         cli.connect(**kw)
         try:
             sftp = cli.open_sftp()
+            sftp.get_channel().settimeout(600)          # don't hang forever on a stalled SFTP transfer
             for base, _dirs, files in os.walk(local_dir):
                 rel = os.path.relpath(base, local_dir)
                 rdir = dest_home if rel == "." else f"{dest_home}/" + rel.replace(os.sep, "/")
-                _i, _o, _e = cli.exec_command(f"mkdir -p {shq(rdir)}"); _o.channel.recv_exit_status()
+                _i, _o, _e = cli.exec_command(f"mkdir -p {shq(rdir)}")
+                _o.channel.settimeout(60)               # don't block indefinitely on recv_exit_status
+                rc = _o.channel.recv_exit_status()
+                if rc != 0:
+                    err = (_e.read().decode("utf-8", "replace").strip() if _e else "")
+                    raise RuntimeError(f"mkdir -p {rdir} failed (rc={rc}): {err}")
                 for fn in files:
                     sftp.put(os.path.join(base, fn), f"{rdir}/{fn}")
             sftp.close()
@@ -389,7 +717,9 @@ def submit_psi_over_ssh(P, cluster_cfg, secrets, bam_out_root, reporter=NULL, pr
                 "diagnosis": cluster_deploy.diagnose_failure("", "no bundle")}
 
     cfg_path = os.path.join(P.psi_dir, "config.sh")
-    alt_home = _read_cfg_var(cfg_path, "ALTANALYZE_HOME") or PSI_CONFIG_DEFAULTS["ALTANALYZE_HOME"]
+    alt_home = (_read_cfg_var(cfg_path, "ALTANALYZE_HOME") or "").strip()
+    if not alt_home:                                    # portable default: under the pipeline root (psi_root)
+        alt_home = f"{psi_root}/altanalyze_home"
     alt_db = _read_cfg_var(cfg_path, "ALTANALYZE_DB") or ""
     local_dir = (cfg.get("ALTANALYZE_LOCAL") or "").strip()
 
@@ -411,9 +741,14 @@ def submit_psi_over_ssh(P, cluster_cfg, secrets, bam_out_root, reporter=NULL, pr
               "ALTANALYZE_LOCAL at a local copy to upload).")
 
     shq = cluster_deploy.shq
+    # DETACH the launcher bsub (setsid, backgrounded in a subshell so only the bsub is async) so the deploy
+    # ssh returns immediately instead of hanging on "Pending job threshold reached. Retrying in 60s" under a
+    # saturated pending-job quota. See star_deploy.submit_star_over_ssh for the full rationale.
+    _lo = shq(psi_root + '/launch.out')
     launch = (
-        f"bsub -L /bin/bash -n 1 -M 1000 -W 120 -J {shq(psi_tag + '_launch')} "
-        f"-o {shq(psi_root + '/launch.out')} -e {shq(psi_root + '/launch.err')} {shq(psi_root + '/psi_launch.sh')}"
+        f"( setsid bsub -L /bin/bash -n 1 -M 1000 -W 66480 -J {shq(psi_tag + '_launch')} "
+        f"-o {_lo} -e {shq(psi_root + '/launch.err')} {shq(psi_root + '/psi_launch.sh')} "
+        f"</dev/null >>{_lo} 2>&1 & )"
     )
     if prior_skipped:
         # BED was phase-range skipped -> the launcher polls <BAM_OUT>/bed/PIPELINE_COMPLETE.txt which no BED

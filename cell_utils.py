@@ -18,6 +18,18 @@ def clean_struct_cell(val):
     v = val.split(",")[0].strip()  # pooled multi-line value -> take first
     if v.lower() in BAD_CELL or len(v) > 40:
         return None
+    # A verbose description names the line as a parenthetical CODE or a "<CODE> cell line" phrase, e.g.
+    # "MDS-derived cell line (MDS-L)" / "the MDS-L cell line" -> extract the CODE. WITHOUT this, a line whose
+    # code has NO DIGIT (e.g. MDS-L) is wrongly rejected by the tissue/descriptor heuristic below (it contains
+    # the word "cell" and has no digit), so prep_ai falls back to classifying the TITLE and the AI mis-reads
+    # the experimental condition as the cell line (hit LIVE: GSE61052's 23 MDS-L samples were bucketed as
+    # P95H/Delta_8aa/Unknown, so the whole study dropped out of the MDS-L selection).
+    m = (re.search(r'cell\s*lines?\s*\(\s*([A-Za-z0-9][\w.\-/ ]{0,24}?)\s*\)', v, re.I)
+         or re.search(r'(?:^|\bthe\s+)([A-Za-z0-9][\w.\-/]{1,24})\s+cell\s*lines?\b', v, re.I))
+    if m:
+        code = m.group(1).strip()
+        if re.search(r'[A-Za-z]', code) and code.lower() not in BAD_CELL:
+            return code
     # looks like a cell *type* / tissue / patient descriptor (no alphanumeric code) -> not a line
     if re.search(r'\bcells?\b|tissue|biopsy|tumou?r|patient|donor|pbmc|organoid', v, re.I) \
             and not re.search(r'\d', v):

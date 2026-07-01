@@ -13,6 +13,17 @@ import os
 from progress import NULL
 
 
+def _atomic_json(path, obj):
+    """Write JSON atomically (temp -> fsync -> os.replace) so a kill mid-write can't leave raw_json
+    truncated and break every downstream stage's json.load."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
 def _key_suffix(ncbi_key):
     return f"&api_key={ncbi_key}" if ncbi_key else ""
 
@@ -49,6 +60,8 @@ def search_all_ids(query, db="gds", max_results=5000, ncbi_key=None):
                f"&retmax={min(batch, max_results - retstart)}&retstart={retstart}"
                f"{_key_suffix(ncbi_key)}")
         ids = []
+        ok = False
+        last_err = None
         for attempt in range(6):
             try:
                 req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
@@ -57,13 +70,21 @@ def search_all_ids(query, db="gds", max_results=5000, ncbi_key=None):
                 ids = data['esearchresult']['idlist']
                 total = int(data['esearchresult']['count'])
                 all_ids.extend(ids)
+                ok = True
                 print(f"  Fetched IDs {retstart}-{retstart+len(ids)} of {total}")
                 break
             except Exception as e:
+                last_err = e
                 wait = _retry_after_secs(e, min(60.0, 2 ** attempt)) if _is_rate_limited(e) else 2 * (attempt + 1)
                 tag = "429 rate-limited" if _is_rate_limited(e) else "error"
                 print(f"  esearch {tag} at retstart={retstart}: {e}; waiting {wait:.0f}s...")
                 time.sleep(wait)
+        if not ok:
+            # all 6 attempts on this page failed -> NCBI unreachable/throttling. Raise a CLEAR error
+            # rather than silently truncating the ID list (or surfacing a misleading 'No results found').
+            raise RuntimeError(
+                f"esearch failed at retstart={retstart} after 6 retries: {last_err}. NCBI is unreachable "
+                f"or throttling — check your network / NCBI status, then retry.")
         retstart += batch
         if retstart >= total or not ids:
             break
@@ -71,12 +92,13 @@ def search_all_ids(query, db="gds", max_results=5000, ncbi_key=None):
     return all_ids[:max_results]
 
 
-def fetch_summaries_batch(id_list, db="gds", batch_size=50, ncbi_key=None, reporter=NULL):
+def fetch_summaries_batch(id_list, db="gds", batch_size=200, ncbi_key=None, reporter=NULL):
     """Fetch esummary for all IDs in batches."""
     all_results = {}
     total_batches = (len(id_list) + batch_size - 1) // batch_size
     reporter.set_total(total_batches)
     extra_pace = 0.0   # adaptive: grows on each 429 so the WHOLE run slows down and stops tripping the cap
+    last_429_ts = 0.0  # when the last 429 hit -> after a quiet minute, extra_pace decays back toward 0
     missing = []
     for i in range(0, len(id_list), batch_size):
         batch_ids = id_list[i:i + batch_size]
@@ -97,9 +119,11 @@ def fetch_summaries_batch(id_list, db="gds", batch_size=50, ncbi_key=None, repor
             except Exception as e:
                 attempt += 1
                 if _is_rate_limited(e):
-                    # 429 is transient: back off (honor Retry-After), PERMANENTLY slow the steady pace so we
-                    # stop hitting the cap, and keep retrying for a while rather than dropping these studies.
+                    # 429 is transient: back off (honor Retry-After), slow the steady pace so we stop hitting
+                    # the cap, and keep retrying rather than dropping these studies. The slow-down is temporary
+                    # -- extra_pace decays back toward 0 a minute after the last 429 (see below).
                     extra_pace = min(extra_pace + 0.1, 1.0)
+                    last_429_ts = time.monotonic()
                     wait = _retry_after_secs(e, min(60.0, 1.5 * (2 ** min(attempt, 5))))
                     if attempt <= 15:
                         print(f"  esummary batch {batch_num}: HTTP 429 Too Many Requests -> waiting {wait:.0f}s, "
@@ -117,6 +141,11 @@ def fetch_summaries_batch(id_list, db="gds", batch_size=50, ncbi_key=None, repor
                 wait = 2 ** (attempt - 1)
                 print(f"  esummary error batch {batch_num}: {e}; waiting {wait}s...")
                 time.sleep(wait)
+        # recovery: once a full quiet minute has passed since the last 429, halve the extra pace each minute
+        # (snapping to 0 below 0.05s) so a brief throttle storm doesn't slow the rest of the run forever.
+        if extra_pace > 0 and (time.monotonic() - last_429_ts) >= 60:
+            extra_pace = 0.0 if extra_pace < 0.05 else extra_pace * 0.5
+            last_429_ts = time.monotonic()
         reporter.advance(1)
         reporter.set_detail(f"summaries {batch_num}/{total_batches}"
                             + (f" (throttled +{extra_pace:.1f}s)" if extra_pace else ""))
@@ -137,7 +166,23 @@ def run(query, max_results, P, ncbi_key=None, reporter=NULL):
         raise RuntimeError("No results found for query")
 
     reporter.set_detail(f"{len(ids)} studies found; fetching summaries…")
-    summaries = fetch_summaries_batch(ids, batch_size=50, ncbi_key=ncbi_key, reporter=reporter)
+    # 200 UIDs/esummary (was 50): ~4x fewer round-trips on the dominant phase; the GET URL (~200x8-char UIDs
+    # ~1.8KB) stays well under limits, and the per-batch 429/throttle logic is batch-count-agnostic.
+    summaries = fetch_summaries_batch(ids, batch_size=200, ncbi_key=ncbi_key, reporter=reporter)
+
+    missing_ids = [u for u in ids if u not in summaries]
+    if missing_ids:
+        # esummary for these studies could not be fetched after retries (NCBI throttling). Surface it
+        # LOUDLY (console + UI) and record the IDs so the gap isn't silent; a re-run fills them in.
+        try:
+            _atomic_json(os.path.join(os.path.dirname(os.path.abspath(P.raw_json)),
+                                      "missing_summaries.json"), missing_ids)
+        except Exception:
+            pass
+        warn = (f"{len(missing_ids)}/{len(ids)} study summaries could NOT be fetched (NCBI throttling); "
+                f"recorded in missing_summaries.json — re-run to fill the gaps.")
+        print(f"  WARNING: {warn}")
+        reporter.set_detail("WARNING: " + warn)
 
     unique_titles, total_samples, study_count = set(), 0, 0
     raw_data = {"uids": ids}
@@ -152,14 +197,12 @@ def run(query, max_results, P, ncbi_key=None, reporter=NULL):
                     unique_titles.add(t)
             study_count += 1
 
-    with open(P.raw_json, "w", encoding="utf-8") as f:
-        json.dump({"result": raw_data}, f)
-    with open(P.unique_titles, "w", encoding="utf-8") as f:
-        json.dump(sorted(unique_titles), f)
+    _atomic_json(P.raw_json, {"result": raw_data})
+    _atomic_json(P.unique_titles, sorted(unique_titles))
     print(f"  Studies with data: {study_count} | samples: {total_samples} | "
           f"unique titles: {len(unique_titles)}")
     print(f"  Wrote {P.raw_json}")
-    return {"studies": study_count, "samples": total_samples, "ids": len(ids)}
+    return {"studies": study_count, "samples": total_samples, "ids": len(ids), "missing": len(missing_ids)}
 
 
 def main():

@@ -14,7 +14,8 @@ import glob
 
 
 def load_json_loose(path):
-    txt = open(path, encoding="utf-8").read().strip()
+    with open(path, encoding="utf-8") as f:
+        txt = f.read().strip()
     try:
         return json.loads(txt)
     except Exception:
@@ -43,7 +44,12 @@ def _merge_dir(folder, prefix):
 
 def merge_compounds(P):
     merged, ok, total, bad = _merge_dir(P.compound_results, "cmpd")
-    json.dump(merged, open(P.compound_map, "w", encoding="utf-8"), ensure_ascii=False)
+    tmp = P.compound_map + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(merged, f, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, P.compound_map)
     print(f"  MERGE compounds: {ok}/{total} batches ok -> {len(merged):,} entries"
           + (f"  bad={bad}" if bad else ""))
     return merged
@@ -53,13 +59,19 @@ def merge_samples(P):
     reps, ok, total, bad = _merge_dir(P.sample_results, "samp")
     index = {}
     if os.path.exists(P.sample_index):
-        index = json.load(open(P.sample_index, encoding="utf-8"))
+        with open(P.sample_index, encoding="utf-8") as f:
+            index = json.load(f)
     sample_map = {}
     for rep, info in reps.items():
         members = index.get(rep, [rep])
         for raw in members:
             sample_map[raw] = info
-    json.dump(sample_map, open(P.sample_map, "w", encoding="utf-8"), ensure_ascii=False)
+    tmp = P.sample_map + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(sample_map, f, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, P.sample_map)
     print(f"  MERGE samples: {ok}/{total} batches ok -> {len(reps):,} reps -> "
           f"{len(sample_map):,} raw entries" + (f"  bad={bad}" if bad else ""))
     return sample_map

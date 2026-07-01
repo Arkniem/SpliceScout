@@ -20,8 +20,6 @@ from collections import defaultdict, Counter
 from normalize_v2 import clean_compound
 from cell_utils import clean_struct_cell, extract_cell_line
 
-HIGH = 40_000_000
-
 # regex cell-line bucket -> Sample Type category
 REGEX_CATEGORY = {
     "UNRESOLVED": "Unknown", "PATIENT_SAMPLE": "Patient/Tumor", "ORGANOID": "Organoid",
@@ -81,12 +79,30 @@ def build(P, mode="", is_headline=False):
     module's headline pass, which also writes cellline_index.json (the deep-dive input). Returns a
     summary dict."""
     struct = {}
+    _bad = 0
     for line in open(P.samples_jsonl, encoding="utf-8"):
-        if line.strip():
-            r = json.loads(line)
-            if r.get("gsm"):
-                struct[r["gsm"]] = r
-    result = json.load(open(P.raw_json, encoding="utf-8"))["result"]
+        if not line.strip():
+            continue
+        try:
+            r = json.loads(line)   # was unguarded -> ONE malformed line crashed the whole build; now skip+count
+        except Exception:
+            _bad += 1
+            continue
+        if r.get("gsm"):
+            struct[r["gsm"]] = r
+    if _bad:
+        print(f"  build: skipped {_bad} malformed line(s) in {os.path.basename(P.samples_jsonl)}")
+    if not os.path.exists(P.raw_json):
+        raise RuntimeError(
+            f"raw_json not found: {P.raw_json} (produced by the FETCH/extract stage that writes "
+            f"ncbi_raw.json) — cannot build tables without the canonical sample set")
+    try:
+        raw = json.load(open(P.raw_json, encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"raw_json is not valid JSON: {P.raw_json} ({e}) — re-run the FETCH stage")
+    result = raw.get("result")
+    if result is None:
+        raise RuntimeError(f"raw_json missing 'result' key: {P.raw_json} — re-run the FETCH stage")
 
     compound_map, sample_map, study_protocol = {}, {}, {}
     if os.path.exists(P.compound_map):
@@ -137,7 +153,12 @@ def build(P, mode="", is_headline=False):
     removed_class = Counter()
     n_struct_cell = n_ai_cell = n_regex_cell = 0
 
-    for u in result["uids"]:
+    uids = result.get("uids")
+    if uids is None:
+        raise RuntimeError(
+            f"raw_json result missing 'uids' list: {P.raw_json} (produced by the FETCH stage) — "
+            f"the file is malformed; re-run the FETCH stage")
+    for u in uids:
         item = result[u]
         gse = item.get("accession", "")
         for s in item.get("samples", []):
@@ -211,10 +232,60 @@ def build(P, mode="", is_headline=False):
                 d["total_spots"] += sp
             cat_counter[cell][category] += 1
 
+    # collapse cell-line spelling variants (MDS-L == MDSL, A549 == A-549 == 'A549 cells') BEFORE both the
+    # index and the ranking, so the same line never splits into two rows. (The deep-dive consolidate also
+    # merges variants, but only AFTER selection; this fixes the ranking + index the user actually reads.)
+    cl, cat_counter = _merge_variants(cl, cat_counter)
     if is_headline:
         _write_cellline_index(P, cl, cat_counter)
     return _write_tables(P, mode, cl, cat_counter, study_maxreads, removed_class,
                          n_struct_cell, n_ai_cell, n_regex_cell)
+
+
+def _cl_norm(s):
+    """Normalized cell-line key: lowercase, alphanumerics only -> 'MDS-L'/'MDSL'/'mds l' all == 'mdsl'
+    (same rule as cellline_match._norm; A549 == A-549 == 'A549 cells')."""
+    return "".join(ch for ch in (s or "").lower() if ch.isalnum())
+
+
+def _merge_variants(cl, cat_counter):
+    """Merge cell-line entries whose normalized name collides, keeping the spelling with the MOST samples
+    (tie -> longest, then lexical) as the display name. Returns (cl, cat_counter) rekeyed by that display
+    name. A no-op (returns the originals) when no two raw names normalize to the same key."""
+    groups = defaultdict(list)        # norm_key -> [raw cell names]
+    for cell in cl:
+        groups[_cl_norm(cell) or cell].append(cell)
+    if all(len(v) == 1 for v in groups.values()):
+        return cl, cat_counter        # nothing collides -> unchanged
+    _SET_KEYS = ("compounds", "studies", "gsms")
+    _INT_KEYS = ("total", "treated", "not", "pending", "total_spots")
+    new_cl, new_cat = {}, defaultdict(Counter)
+    for cells in groups.values():
+        disp = sorted(cells, key=lambda c: (cl[c]["total"], len(c), c))[-1]
+        if len(cells) == 1:
+            new_cl[disp] = cl[cells[0]]
+            new_cat[disp] = cat_counter.get(cells[0], Counter())
+            continue
+        m = {"compounds": set(), "studies": set(), "gsms": set(), "total": 0, "treated": 0, "not": 0,
+             "pending": 0, "max_spots": 0, "total_spots": 0, "gsms_by_study": {}, "raw_tags": {},
+             "uids_by_study": {}}
+        cc = Counter()
+        for c in cells:
+            d = cl[c]
+            for k in _SET_KEYS:
+                m[k] |= d[k]
+            for k in _INT_KEYS:
+                m[k] += d[k]
+            m["max_spots"] = max(m["max_spots"], d["max_spots"])
+            for g, s in d["gsms_by_study"].items():
+                m["gsms_by_study"].setdefault(g, set()).update(s)
+            for t, n in d["raw_tags"].items():
+                m["raw_tags"][t] = m["raw_tags"].get(t, 0) + n
+            m["uids_by_study"].update(d["uids_by_study"])
+            cc.update(cat_counter.get(c, Counter()))
+        new_cl[disp] = m
+        new_cat[disp] = cc
+    return new_cl, new_cat
 
 
 def _safe_open(path):
@@ -244,7 +315,7 @@ def _write_tables(P, mode, cl, cat_counter, study_maxreads, removed_class,
         parts = []
         for g in sorted(studies)[:10]:
             mr = study_maxreads.get(g, 0)
-            parts.append(f"{g}:{mr:,}" + (" (**HIGH**)" if mr > HIGH else "") if mr else f"{g}:N/A")
+            parts.append(f"{g}:{mr:,}" if mr else f"{g}:N/A")
         if len(studies) > 10:
             parts.append(f"(+{len(studies)-10} more)")
         return "; ".join(parts)
@@ -341,10 +412,74 @@ def _write_cellline_index(P, cl, cat_counter):
             "uids_by_study": d["uids_by_study"],
         }
     try:
-        json.dump(index, open(P.cellline_index, "w", encoding="utf-8"), ensure_ascii=False)
+        tmp = str(P.cellline_index) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(index, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, P.cellline_index)
         print(f"  wrote {P.cellline_index} ({len(index)} cell lines)")
     except Exception as e:
         print(f"  ** could not write cellline_index.json: {e} **")
+
+
+def skipped_no_sra(P):
+    """Studies FETCHED from GEO (they have GEO sample records) that yielded ZERO downloadable samples in
+    extraction — i.e. they have NO raw SRA sequencing runs (microarray, processed-only, or computational
+    re-analysis studies), so a download→align→splice pipeline has nothing to fetch for them. This is why a
+    study you can see in GEO can legitimately show "0 samples" here. Returns a list of
+    {gse, title, n_geo_samples, gdstype} sorted by size. Reads ncbi_raw.json + structured_samples.jsonl
+    (+ study_protocol.json to gate on PROCESSED studies), so it works for any run post-extraction."""
+    if not os.path.exists(P.raw_json):
+        return []
+    try:
+        raw = json.load(open(P.raw_json, encoding="utf-8")).get("result", {})
+    except Exception:
+        return []
+    studies = {}
+    for uid in raw.get("uids", []):
+        s = raw.get(uid) or {}
+        acc = (s.get("accession") or "").strip()
+        if acc.startswith("GSE"):
+            studies[acc] = {"gse": acc, "title": (s.get("title") or "").strip(),
+                            "n_geo_samples": int(s.get("n_samples", 0) or 0),
+                            "gdstype": (s.get("gdstype") or "").strip()}
+    extracted = set()
+    if os.path.exists(P.samples_jsonl):
+        for line in open(P.samples_jsonl, encoding="utf-8"):
+            try:
+                g = (json.loads(line).get("study") or "").strip()
+            except Exception:
+                g = ""
+            if g:
+                extracted.add(g)
+    processed = None
+    try:                       # only flag PROCESSED studies, so a mid-run doesn't list not-yet-extracted ones
+        processed = set(json.load(open(P.study_protocol, encoding="utf-8")).keys())
+    except Exception:
+        processed = None
+    out = [info for acc, info in studies.items()
+           if info["n_geo_samples"] > 0 and acc not in extracted
+           and (processed is None or acc in processed)]
+    out.sort(key=lambda d: -d["n_geo_samples"])
+    return out
+
+
+def _write_skipped_no_sra(P):
+    """Per-run transparency report: which fetched studies were skipped for having no SRA runs, + why."""
+    rows = skipped_no_sra(P)
+    path = _safe_open(os.path.join(P.tables_dir, "skipped_no_sra.csv"))
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["Study", "GEO Samples", "Assay Type (gdsType)", "Reason", "Title"])
+        for r in rows:
+            w.writerow([r["gse"], r["n_geo_samples"], r["gdstype"],
+                        "0 SRA samples extracted (array=none; sequencing-labeled may need re-extract)",
+                        r["title"]])
+    n_studies, n_samples = len(rows), sum(r["n_geo_samples"] for r in rows)
+    print(f"  wrote {path} ({n_studies} studies / {n_samples:,} GEO samples skipped: no SRA runs)")
+    return {"studies": n_studies, "geo_samples": n_samples,
+            "csv": os.path.relpath(path, P.run_dir).replace("\\", "/")}
 
 
 def build_all(P, module=DEFAULT_MODULE):
@@ -356,7 +491,8 @@ def build_all(P, module=DEFAULT_MODULE):
     allp = build(P, "")
     truseq = build(P, "truseq")
     _write_protocol_audit(P)
-    return {"splicing": splicing, "all": allp, "truseq": truseq, "module": module}
+    skipped = _write_skipped_no_sra(P)   # transparency: fetched-but-no-SRA studies (why a GEO study shows 0 samples)
+    return {"splicing": splicing, "all": allp, "truseq": truseq, "module": module, "skipped_no_sra": skipped}
 
 
 def main():

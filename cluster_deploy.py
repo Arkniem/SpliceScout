@@ -16,6 +16,8 @@ submit_over_ssh (stage 'cluster_submit', autonomous only): ssh mkdir -> scp the 
   ./run_pipeline.sh. System ssh/scp (key/agent) by default; paramiko if a password is supplied and
   importable. Non-fatal: any failure leaves the downloadable bundle intact.
 """
+import base64
+import json
 import os
 import re
 import shutil
@@ -34,9 +36,9 @@ CONFIG_DEFAULTS = {
     "SRATOOLKIT_MODULE": "sratoolkit/3.0.0",
     "ASPERA_MODULE": "aspera/3.9.1",
     "LSF_QUEUE": "",
-    "THREADS": 6,
+    "THREADS": 5,
     "MEM_MB": 32000,
-    "WALL": "50:00",
+    "WALL": "1108:00",   # default -W: normal-queue MAX (66480 min) so jobs never die to walltime
     "PREFETCH_MEM_MB": 132000,
     "WATCHDOG_INTERVAL_MIN": 30,
     "JOB_TAG": "sra",
@@ -95,22 +97,83 @@ def _resolve_cfg(cluster_cfg):
     return vals
 
 
+def _alert_email():
+    """The user's alert email from the PC settings, baked into each stage's config.sh at deploy so a
+    CLUSTER job can email the user DIRECTLY on an error/milestone via the cluster's own `mail` -- the PC
+    poller only ever saw PIPELINE_* MARKER files, so a RUN-but-frozen job (and any cluster error) emailed
+    nothing. Best-effort; '' = email OFF."""
+    try:
+        p = os.path.join(os.path.expanduser("~"), ".geo_pipeline_settings.json")
+        return str((json.load(open(p, encoding="utf-8")).get("alert_email") or "")).strip()
+    except Exception:
+        return ""
+
+
+def _diagnose_model_cfg():
+    """Optional diagnose-AI model settings from the PC settings file, baked into each stage's config.sh so the
+    cluster CPU LLM can find a model without re-uploading one every run:
+      diagnose_model_path -> a specific .gguf to use (a CLUSTER path; overrides the search).
+      diagnose_model_dir  -> a dir to CACHE the model in so future runs reuse it ('' -> per-stage
+                             <PIPELINE_ROOT>/.splicescout_ai/models, auto-populated from the shared install on
+                             first need by diagnose_job.sh).
+    Returns (model_path, model_dir); '' for either when unset. Best-effort."""
+    try:
+        p = os.path.join(os.path.expanduser("~"), ".geo_pipeline_settings.json")
+        s = json.load(open(p, encoding="utf-8"))
+        return (str((s.get("diagnose_model_path") or "")).strip(),
+                str((s.get("diagnose_model_dir") or "")).strip())
+    except Exception:
+        return "", ""
+
+
+def bake_diagnose_model(vals):
+    """Stamp the optional diagnose-AI model settings into `vals` (only when configured) so fill_config writes
+    them into the stage's config.sh. No-op when neither is set (the template defaults '' stay, and the model
+    is found via the shared install + auto-cached into the pipeline dir). Returns `vals` for chaining."""
+    mp, md = _diagnose_model_cfg()
+    if mp:
+        vals["DIAGNOSE_MODEL_PATH"] = mp
+    if md:
+        vals["DIAGNOSE_MODEL_DIR"] = md
+    return vals
+
+
 def _slug(name):
     return re.sub(r"[^A-Za-z0-9._-]+", "_", str(name)).strip("_") or "cellline"
 
 
+def project_job_tag(base_tag, sel):
+    """Scope an instance-level JOB_TAG by the cell line so REUSING one instance name for a DIFFERENT
+    project gets a DISTINCT cluster folder + LSF job names (no interference), while the SAME project (same
+    line) stays STABLE across runs/phase-starts (it resumes its folder). The cell-line slug is NORMALIZED
+    (alnum, lowercase) so it is immune to the AI spelling the line differently between runs (MDS-L == MDSL
+    == 'MDS-L cells' -> 'mdsl') — the exact fragmentation that made plain cell-line keying unsafe before.
+    Idempotent: a tag already ending in the slug (or an instance name that already IS the line, e.g. an
+    'A549' instance analysing A549) is returned unchanged."""
+    base = re.sub(r"[^A-Za-z0-9._-]+", "_", str(base_tag or "").strip()).strip("_")
+    name = (sel or {}).get("canonical", "") if isinstance(sel, dict) else ""
+    slug = re.sub(r"[^a-z0-9]+", "", (name or "").lower())
+    slug = re.sub(r"(?:celllines?|cells?)$", "", slug) or slug   # 'MDS-L cells' == 'MDS-L' (AI suffix variance)
+    if not slug:
+        return base                                  # no cell line known -> instance tag unchanged
+    if not base:
+        return slug
+    if base.lower() == slug or base.lower().endswith("_" + slug):
+        return base                                  # already project-scoped / instance name == the line
+    return f"{base}_{slug}"
+
+
 def _effective_root(cluster_cfg, sel=None):
-    """The form's PIPELINE_ROOT + a per-INSTANCE subfolder (the JOB_TAG / instance tag), so each run is
-    ISOLATED *and* STABLE: every stage (download -> STAR -> BED -> PSI) and every re-run or phase-start of
-    the SAME instance resolves to the SAME folder, no matter how the AI happens to name the cell line that
-    run. It used to key on the cell-line slug, which fragmented ONE project across folders (e.g. MDS-L /
-    MDSL_Cell_line / MDSL) when the AI matcher named the line differently between runs — so a later
-    phase-start's STAR/BED/PSI launchers polled a folder the download never populated, and the auto-chain
-    silently never fired. `sel` is accepted for call-site compatibility but no longer used."""
+    """The form's PIPELINE_ROOT + a per-PROJECT subfolder = the JOB_TAG scoped by the (normalized) cell
+    line (`project_job_tag`). So reusing ONE instance name for DIFFERENT cell lines gives each its own
+    folder (they never share/clobber), while the SAME line resumes the SAME folder regardless of how the
+    AI spells it that run (MDS-L/MDSL -> 'mdsl'). Used only as the FALLBACK root for a FRESH run; an
+    already-deployed run resolves its real folder from the baked config.sh via `_read_config_root`, so this
+    can never relocate an in-flight run."""
     cfg = _resolve_cfg(cluster_cfg)
     base = cfg["PIPELINE_ROOT"].rstrip("/")
     raw = str(cfg.get("JOB_TAG", "") or "").strip()
-    tag = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("_") if raw else ""
+    tag = project_job_tag(raw, sel) if (raw or (sel or {}).get("canonical")) else ""
     return f"{base}/{tag}" if tag else base
 
 
@@ -119,7 +182,25 @@ def _read_config_root(P):
     for where submit_over_ssh uploads + launches)."""
     cfgsh = os.path.join(P.cluster_dir, "config.sh")
     if os.path.exists(cfgsh):
-        m = re.search(r'(?m)^PIPELINE_ROOT="?(.*?)"?\s*$', open(cfgsh, encoding="utf-8").read())
+        try:
+            m = re.search(r'(?m)^PIPELINE_ROOT="?(.*?)"?\s*$', open(cfgsh, encoding="utf-8").read())
+        except Exception:
+            return None
+        if m and m.group(1).strip():
+            return m.group(1).strip()
+    return None
+
+
+def _read_config_jobtag(P):
+    """The JOB_TAG actually baked into the deployed download bundle's config.sh (the project-scoped tag, if
+    this run was deployed by a build that scopes by cell line). Lets a resume / status read the SAME tag the
+    cluster jobs were launched under, instead of re-deriving and possibly mismatching."""
+    cfgsh = os.path.join(P.cluster_dir, "config.sh")
+    if os.path.exists(cfgsh):
+        try:
+            m = re.search(r'(?m)^JOB_TAG="?(.*?)"?\s*$', open(cfgsh, encoding="utf-8").read())
+        except Exception:
+            return None
         if m and m.group(1).strip():
             return m.group(1).strip()
     return None
@@ -189,11 +270,21 @@ def _write_instructions(P, vals, n_studies, n_acc, canonical=""):
 def _zip_dir(src_dir, zip_path):
     if os.path.exists(zip_path):
         os.remove(zip_path)
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
-        for root, _, files in os.walk(src_dir):
-            for fn in files:
-                fp = os.path.join(root, fn)
-                z.write(fp, os.path.relpath(fp, src_dir))   # bundle contents at the zip root
+    # An I/O failure mid-write would otherwise leave a silent partial zip; on any error remove the
+    # half-written file and raise a clear message so build_bundle fails loudly instead of "succeeding".
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+            for root, _, files in os.walk(src_dir):
+                for fn in files:
+                    fp = os.path.join(root, fn)
+                    z.write(fp, os.path.relpath(fp, src_dir))   # bundle contents at the zip root
+    except Exception as e:
+        try:
+            if os.path.exists(zip_path):
+                os.remove(zip_path)
+        except OSError:
+            pass
+        raise RuntimeError(f"failed to write cluster bundle zip {zip_path}: {e}")
 
 
 def build_bundle(P, sel, cluster_cfg, reporter=NULL):
@@ -221,6 +312,8 @@ def build_bundle(P, sel, cluster_cfg, reporter=NULL):
     # (the cell-line name, which the AI can resolve differently between runs, no longer steers the path).
     vals = _resolve_cfg(cluster_cfg)
     vals["PIPELINE_ROOT"] = _effective_root(cluster_cfg, sel)
+    vals["ALERT_EMAIL"] = vals.get("ALERT_EMAIL") or _alert_email()   # cluster-side email on error/milestone
+    bake_diagnose_model(vals)                                         # optional diagnose-AI model path / cache dir
     template_text = open(os.path.join(TEMPLATE_DIR, "config.sh"), encoding="utf-8").read()
     with open(os.path.join(P.cluster_dir, "config.sh"), "w", encoding="utf-8", newline="\n") as f:
         f.write(fill_config(template_text, vals))
@@ -345,14 +438,45 @@ def diagnose_failure(text, reason=""):
              ["ssh_host", "ssh_user", "ssh_port", "ssh_key", "ssh_password", "PIPELINE_ROOT"])
 
 
+# The cluster emits a long SSH login banner (CCHMC acceptable-use policy) + a post-quantum warning on EVERY
+# connection. Strip those lines from captured ssh/scp output so the GUI live log shows pipeline output (not
+# the legal banner) and so diagnose_failure doesn't read the banner.
+_SSH_NOISE = re.compile(
+    r"post-quantum|store now|decrypt later|openssh\.com/pq|may need to be upgraded|vulnerable to|"
+    r"II-105|Acceptable Use of Information|CCHMC Personnel|community physicians|business partner|"
+    r"Medical Staff|Federal, state|disciplinary action|Refer to CCHMC|Personnel Policy|sanctioned|"
+    r"cancellation of any contractual|denial of access", re.I)
+
+
+def _strip_ssh_noise(text):
+    """Drop the cluster's SSH login banner + post-quantum warning lines from captured ssh/scp output."""
+    if not text:
+        return text
+    return "\n".join(ln for ln in text.splitlines() if not _SSH_NOISE.search(ln))
+
+
 def _run(argv, timeout=180):
     p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
-    out = (p.stdout or "") + (p.stderr or "")
+    out = _strip_ssh_noise((p.stdout or "") + (p.stderr or ""))
     if out.strip():
         print("    " + out.strip().replace("\n", "\n    "))
     if p.returncode != 0:
         raise _SubmitError(f"{os.path.basename(argv[0])} exit {p.returncode}: {out.strip()[:400]}", out)
     return out
+
+
+def _make_bundle_tar(src_dir):
+    """Pack src_dir's CONTENTS into ONE local .tar.gz (entries relative to src_dir) so the upload is a single
+    transfer + a single remote untar, NOT thousands of per-file scp/sftp round-trips. A big run's by_study/
+    holds one tiny SraAccList.txt per study (e.g. A549 = 766 files); scp -r of them is hundreds of handshakes
+    that blow past the timeout ('stuck on upload'). Returns the temp tar path; the caller removes it."""
+    import tarfile, tempfile
+    fd, tarpath = tempfile.mkstemp(prefix="ss_bundle_", suffix=".tar.gz")
+    os.close(fd)
+    with tarfile.open(tarpath, "w:gz") as tf:
+        for n in sorted(os.listdir(src_dir)):
+            tf.add(os.path.join(src_dir, n), arcname=n)
+    return tarpath
 
 
 def _submit_systemssh(P, host, port, user, keyfile, root, reporter, src_dir=None,
@@ -361,11 +485,18 @@ def _submit_systemssh(P, host, port, user, keyfile, root, reporter, src_dir=None
     target = f"{user}@{host}"
     common = ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=20"]
     ssh = ["ssh", "-p", str(port)] + common + (["-i", keyfile] if keyfile else [])
-    scp = ["scp", "-r", "-P", str(port)] + common + (["-i", keyfile] if keyfile else [])
+    scp = ["scp", "-P", str(port)] + common + (["-i", keyfile] if keyfile else [])
     _run(ssh + [target, f"mkdir -p {shq(root)}"])
-    items = [os.path.join(src_dir, n) for n in sorted(os.listdir(src_dir))]
-    _run(scp + items + [f"{target}:{root}/"], timeout=600)
-    out = _run(ssh + [target, f"cd {shq(root)} && chmod +x *.sh && {launch_cmd}"], timeout=600)
+    # ONE tar.gz transfer + a remote untar instead of scp -r of the whole tree (scp -r of a big by_study/ is
+    # thousands of per-file round-trips -> times out). Untar is generous (many small files on NFS).
+    tarpath = _make_bundle_tar(src_dir)
+    try:
+        _run(scp + [tarpath, f"{target}:{root}/_bundle.tar.gz"], timeout=600)
+    finally:
+        try: os.remove(tarpath)
+        except OSError: pass
+    out = _run(ssh + [target, f"cd {shq(root)} && tar xzf _bundle.tar.gz && rm -f _bundle.tar.gz "
+                              f"&& chmod +x *.sh && {launch_cmd}"], timeout=900)
     print(f"  CLUSTER SUBMIT: launched on {target}:{root}")
     reporter.set_detail(f"launched on {host}")
     return {"submitted": True, "host": host, "root": root, "output": out[-2000:]}
@@ -384,9 +515,12 @@ def _submit_paramiko(P, host, port, user, password, keyfile, root, reporter, src
         kw["key_filename"] = keyfile
     cli.connect(**kw)
 
-    def ex(cmd, timeout=600):
+    def ex(cmd, timeout=900):
         _in, _out, _err = cli.exec_command(cmd, timeout=timeout)
-        out = _out.read().decode("utf-8", "replace") + _err.read().decode("utf-8", "replace")
+        out = _strip_ssh_noise(_out.read().decode("utf-8", "replace") + _err.read().decode("utf-8", "replace"))
+        # cap the exit-status wait so a stalled network can't hang the worker forever (generous: a remote untar
+        # of many small files on NFS can take a bit)
+        _out.channel.settimeout(120)
         rc = _out.channel.recv_exit_status()
         if out.strip():
             print("    " + out.strip().replace("\n", "\n    "))
@@ -394,21 +528,18 @@ def _submit_paramiko(P, host, port, user, password, keyfile, root, reporter, src
             raise _SubmitError(f"remote exit {rc}: {out.strip()[:400]}", out)
         return out
 
+    tarpath = _make_bundle_tar(src_dir)
     try:
         ex(f"mkdir -p {shq(root)}")
+        # ONE tar.gz upload + remote untar, NOT a per-file sftp.put walk (thousands of small files -> timeout)
         sftp = cli.open_sftp()
-        for base, _dirs, files in os.walk(src_dir):
-            rel = os.path.relpath(base, src_dir)
-            rdir = root if rel == "." else f"{root}/" + rel.replace(os.sep, "/")
-            try:
-                sftp.mkdir(rdir)
-            except Exception:
-                pass
-            for fn in files:
-                sftp.put(os.path.join(base, fn), f"{rdir}/{fn}")
+        sftp.get_channel().settimeout(600)   # so a stalled transfer can't hang the worker forever
+        sftp.put(tarpath, f"{root}/_bundle.tar.gz")
         sftp.close()
-        out = ex(f"cd {shq(root)} && chmod +x *.sh && {launch_cmd}")
+        out = ex(f"cd {shq(root)} && tar xzf _bundle.tar.gz && rm -f _bundle.tar.gz && chmod +x *.sh && {launch_cmd}")
     finally:
+        try: os.remove(tarpath)
+        except OSError: pass
         cli.close()
     print(f"  CLUSTER SUBMIT: launched on {user}@{host}:{root}")
     reporter.set_detail(f"launched on {host}")
@@ -465,10 +596,10 @@ def _ssh_capture_systemssh(host, port, user, keyfile, command, timeout=60):
     common = ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=20"]
     ssh = ["ssh", "-p", str(port)] + common + (["-i", keyfile] if keyfile else [])
     p = subprocess.run(ssh + [target, command], capture_output=True, text=True, timeout=timeout)
-    out = (p.stdout or "") + (p.stderr or "")
+    out = _strip_ssh_noise((p.stdout or "") + (p.stderr or ""))
     if p.returncode != 0 and not (p.stdout or "").strip():
         raise _SubmitError(f"ssh exit {p.returncode}: {out.strip()[:400]}", out)
-    return p.stdout or ""
+    return _strip_ssh_noise(p.stdout or "")
 
 
 def _ssh_capture_paramiko(host, port, user, password, keyfile, command, timeout=60):
@@ -487,7 +618,7 @@ def _ssh_capture_paramiko(host, port, user, password, keyfile, command, timeout=
         err = _err.read().decode("utf-8", "replace")
     finally:
         cli.close()
-    return out or err
+    return _strip_ssh_noise(out or err)
 
 
 def _eta_from_watchdog(wd_text, overall):
@@ -621,6 +752,91 @@ def remote_status(host, user, port, keyfile, password, job_tag, fallback_root=""
     parsed = parse_status(text)
     parsed.update({"ok": True, "host": host, "job_tag": job_tag})
     return parsed
+
+
+# ---------- cross-stage STALL/FAILURE alert scan (turn a silent stall into a heads-up) ----------
+# The per-stage status probes already detect STALLED/ORPHANED/LAUNCH_TIMEOUT, but a downstream stall
+# (e.g. BED) was invisible to the download-centric GUI check -> A549 sat dead for 5 days. This ONE find
+# scans `root` for any stage's FAILURE marker so the GUI/Assistant can flag it RED on every poll.
+# Callers MUST pass a per-RUN effective root (PIPELINE_ROOT/<JOB_TAG>), NOT the bare shared PIPELINE_ROOT:
+# scanning the shared root would surface SIBLING/abandoned runs' stalls as false alerts on one run's panel.
+# A second find lists stage dirs that reached PIPELINE_COMPLETE.txt so a STALLED marker that was later
+# RESOLVED (re-armed -> completed, stale marker left behind) is suppressed instead of re-alerting forever.
+_ALERTS_PROBE = r"""R=%ROOT%
+if [ -n "$R" ] && [ -d "$R" ]; then
+  find "$R" -maxdepth 6 \( -name PIPELINE_STALLED.txt -o -name PIPELINE_ORPHANED.txt -o -name PIPELINE_LAUNCH_TIMEOUT.txt -o -name PIPELINE_COMPRESS_FAILED.txt \) -printf 'MARK\t%p\t%TY-%Tm-%Td %TH:%TM\n' 2>/dev/null | sort
+  find "$R" -maxdepth 6 -name PIPELINE_COMPLETE.txt -printf 'DONE\t%h\n' 2>/dev/null | sort
+fi
+true"""
+
+
+def remote_alerts(host, user, port, keyfile, password, root):
+    """SSH-scan `root` for ANY stage FAILURE marker (PIPELINE_STALLED / _ORPHANED / _LAUNCH_TIMEOUT) under
+    it. Returns {"ok", "alerts":[{kind,stage,path,when}], "root", ...}. Cheap (two finds). Non-fatal. This
+    is the 'same-hour heads-up' the silent 5-day BED stall lacked. `root` should be a per-RUN effective
+    root (the caller scopes it) so one run's panel never inherits a sibling run's stall. A marker whose
+    stage dir also holds PIPELINE_COMPLETE.txt is skipped (the stall was resolved -> stale marker)."""
+    host = (host or "").strip(); user = (user or "").strip()
+    root = (root or "").strip().rstrip("/")
+    if not host or not user:
+        return {"ok": False, "error": "missing SSH host/user", "alerts": []}
+    if not root:
+        return {"ok": False, "error": "no PIPELINE_ROOT configured to scan", "alerts": []}
+    port = str(port or "22").strip() or "22"; keyfile = (keyfile or "").strip()
+    cmd = _ALERTS_PROBE.replace("%ROOT%", shq(root))
+    try:
+        if password:
+            text = _ssh_capture_paramiko(host, port, user, password, keyfile, cmd)
+        else:
+            text = _ssh_capture_systemssh(host, port, user, keyfile, cmd)
+    except Exception as e:
+        return {"ok": False, "error": str(e), "alerts": []}
+    done_dirs = set(); raw_marks = []
+    for line in (text or "").splitlines():
+        line = line.rstrip("\n")
+        if line.startswith("DONE\t"):
+            d = line[5:].strip().rstrip("/")
+            if d:
+                done_dirs.add(d)
+        elif line.startswith("MARK\t"):
+            raw_marks.append(line[5:])
+    alerts = []
+    for rec in raw_marks:
+        if "\t" not in rec or "PIPELINE_" not in rec:
+            continue
+        path, when = rec.split("\t", 1)
+        if path.rsplit("/", 1)[0].rstrip("/") in done_dirs:   # stage later reached COMPLETE -> stale marker
+            continue
+        base = path.rsplit("/", 1)[-1]
+        kind = ("STALLED" if "STALLED" in base else "ORPHANED" if "ORPHANED" in base
+                else "LAUNCH_TIMEOUT" if "LAUNCH_TIMEOUT" in base
+                else "COMPRESS_FAILED" if "COMPRESS_FAILED" in base else "FAILURE")
+        low = path.lower()
+        stage = ("CONCORDANCE" if "/concordance/" in low else "PSI" if "/psi/" in low
+                 else "BED" if "/bed/" in low else "STAR" if "/star" in low else "download")
+        alerts.append({"kind": kind, "stage": stage, "path": path, "when": when.strip()})
+    return {"ok": True, "alerts": alerts, "root": root, "host": host}
+
+
+def send_alert_email(host, user, port, keyfile, password, email, subject, body):
+    """Send a plain-text alert to `email` using the CLUSTER's own `mail` (no SMTP/app-password needed on
+    the PC). Body is base64'd to dodge shell-quoting. Returns True if the cluster accepted it (delivery to
+    an external inbox still depends on the cluster's mail relay — may land in spam). Best-effort."""
+    host = (host or "").strip(); user = (user or "").strip(); email = (email or "").strip()
+    if not host or not user or not email:
+        return False
+    port = str(port or "22").strip() or "22"; keyfile = (keyfile or "").strip()
+    b64 = base64.b64encode((body or "").encode("utf-8")).decode("ascii")
+    cmd = ("printf %s " + shq(b64) + " | base64 -d | mail -s " + shq(subject or "SpliceScout alert")
+           + " " + shq(email))
+    try:
+        if password:
+            _ssh_capture_paramiko(host, port, user, password, keyfile, cmd)
+        else:
+            _ssh_capture_systemssh(host, port, user, keyfile, cmd)
+        return True
+    except Exception:
+        return False
 
 
 # ---------- STAR alignment progress (the analysis stage after the download) ----------
@@ -843,6 +1059,68 @@ def remote_psi_status(host, user, port, keyfile, password, psi_job_tag, psi_root
         return {"ok": False, "error": str(e)}
     parsed = parse_psi_status(text)
     parsed.update({"ok": True, "job_tag": psi_job_tag})
+    return parsed
+
+
+_CONCORDANCE_STATUS_PROBE = r'''TAG=%TAG%; CR=%CR%
+echo "CONCROOT $CR"
+if [ -n "$CR" ]; then
+  echo "NATLAS $(ls "$CR"/results/*/concordance.txt 2>/dev/null | wc -l)"
+fi
+echo "---META---"
+[ -n "$CR" ] && [ -f "$CR/PIPELINE_COMPLETE.txt" ] && echo COMPLETE
+[ -n "$CR" ] && [ -f "$CR/PIPELINE_STALLED.txt" ] && echo STALLED
+[ -n "$CR" ] && [ -f "$CR/PIPELINE_INCOMPLETE_UPSTREAM.txt" ] && echo UPSTREAMPARTIAL
+[ -n "$CR" ] && [ -f "$CR/PIPELINE_ORPHANED.txt" ] && echo ORPHANED
+[ -n "$CR" ] && [ -f "$CR/PIPELINE_LAUNCH_TIMEOUT.txt" ] && echo LAUNCHTIMEOUT
+echo "LIVE $(bjobs -noheader -o stat -J "${TAG}_*" 2>/dev/null | grep -cE 'RUN|PEND')"
+echo "LAUNCHPEND $(bjobs -noheader -o stat -J "${TAG}_launch" 2>/dev/null | grep -c PEND)"
+echo "JOBRUN $(bjobs -noheader -o stat -J "${TAG}_job" 2>/dev/null | grep -c RUN)"
+echo "---WATCHDOG---"
+[ -n "$CR" ] && tail -n 40 "$CR/watchdog.log" 2>/dev/null
+true'''
+
+
+def parse_concordance_status(text):
+    """Parse the concordance progress probe into a dict (unit-testable, no SSH)."""
+    head, _, _wd = text.partition("---WATCHDOG---")
+    body, _, meta = head.partition("---META---")
+    na = re.search(r"(?m)^NATLAS\s+(\d+)", body)
+    lm = re.search(r"(?m)^LIVE\s+(\d+)", meta)
+    lp = re.search(r"(?m)^LAUNCHPEND\s+(\d+)", meta)
+    jr = re.search(r"(?m)^JOBRUN\s+(\d+)", meta)
+    return {"n_atlases": int(na.group(1)) if na else None,
+            "live_jobs": int(lm.group(1)) if lm else None,
+            "launch_pending": bool(lp and int(lp.group(1)) > 0),
+            "job_running": bool(jr and int(jr.group(1)) > 0),
+            "complete": "COMPLETE" in meta, "stalled": "STALLED" in meta,
+            "incomplete_upstream": "UPSTREAMPARTIAL" in meta,
+            "orphaned": "ORPHANED" in meta, "launch_timeout": "LAUNCHTIMEOUT" in meta,
+            "raw": text[-2000:]}
+
+
+def remote_concordance_status(host, user, port, keyfile, password, concord_job_tag, concord_root=""):
+    """SSH to the submit host and report splicing-concordance progress for `concord_job_tag`
+    (= '<dlTag>_concordance'). Non-fatal (returns {"ok": False, ...} on SSH error)."""
+    host = (host or "").strip(); user = (user or "").strip()
+    if not host or not user:
+        return {"ok": False, "error": "missing SSH host/user"}
+    port = str(port or "22").strip() or "22"
+    cmd = (_CONCORDANCE_STATUS_PROBE.replace("%TAG%", shq(concord_job_tag or "sra_concordance"))
+                                    .replace("%CR%", shq(concord_root or "")))
+    try:
+        if password:
+            try:
+                import paramiko  # noqa: F401
+            except Exception:
+                raise _SubmitError("password auth needs paramiko", "")
+            text = _ssh_capture_paramiko(host, port, user, password, keyfile, cmd)
+        else:
+            text = _ssh_capture_systemssh(host, port, user, keyfile, cmd)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    parsed = parse_concordance_status(text)
+    parsed.update({"ok": True, "job_tag": concord_job_tag})
     return parsed
 
 

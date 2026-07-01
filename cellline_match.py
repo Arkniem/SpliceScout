@@ -75,8 +75,55 @@ TOOL = {
 }
 
 
+_NORM_SUB = re.compile(r"[^a-z0-9]")    # precompiled once: the hot per-row field normalizer in the gate
+
+
 def _norm(s):
-    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+    return _NORM_SUB.sub("", (s or "").lower())
+
+
+# ---- run-level splicing-suitability gate (only applied when the caller passes assay_keep, i.e. the
+# bulk_rna_seq/splicing module) -------------------------------------------------------------------------
+# The reconstructed runtable carries SRA's per-run controlled-vocab columns, which let us drop — at RUN
+# granularity — exactly what the upstream study-level filter (build_final.is_splicing_amenable, which works
+# off LIBRARY_CONSTRUCTION_PROTOCOL text + the AI 'Single-cell' category + title) cannot see reliably:
+#   1. Assay Type  (LIBRARY_STRATEGY): keep only the wanted strategy (RNA-Seq) -> drops ChIP/MeDIP/ATAC/WGS/
+#      Bisulfite/OTHER(RASL etc.). A controlled vocabulary, so the broad class is distinguished precisely.
+#   2. Platform / Instrument: drop LONG-READ (Oxford Nanopore, PacBio). STAR is a SHORT-READ aligner, so
+#      these break alignment outright; the instrument names them exactly (MinION/GridION/PromethION, Sequel/
+#      PacBio RS). This is the highest-value add — long-read is NOT caught upstream and is common in big sets.
+#   3. LibrarySelection: drop non-full-length-transcript RNA methods unfit for PSI — CAGE (5'-cap tags), RACE
+#      (targeted), size fractionation (small-RNA). Standard selections (cDNA/PolyA/Oligo-dT/RANDOM/Inverse
+#      rRNA ribo-depletion) are kept; these are the splicing-friendly preps.
+#   4. scRNA/droplet backstop: single-cell is PRIMARILY excluded upstream, but a run can re-enter here by
+#      matching the target cell-line VALUE even though its GSM was filtered out of the splicing table. Drop it
+#      if its runtable text carries a single-cell platform marker. NOTE: platform/instrument/LibrarySelection
+#      do NOT separate scRNA from bulk (both are Illumina + cDNA) — the only run-level signal is this text.
+# Library STRATEGY alone cannot tell bulk from single-cell; that distinction lives in the protocol/title text.
+_LONGREAD_PLAT = {"oxfordnanopore", "pacbiosmrt"}
+_LONGREAD_INSTR = re.compile(r"min\s*ion|grid\s*ion|prometh\s*ion|\bsequel\b|pac\s*bio|\brs\s*ii\b", re.I)
+_BAD_SELECTION = {"cage", "race", "sizefractionation"}    # non-splicing RNA library selections (drop)
+_SC_RUN = re.compile(r"10\s*x\b|chromium|single[\s_-]*cell|single[\s_-]*nucle|\bscrna\b|\bsnrna\b|"
+                     r"drop[\s_-]*seq|cel[\s_-]*seq|smart[\s_-]*seq|mars[\s_-]*seq|sci[\s_-]*rna|"
+                     r"seq[\s_-]*well|indrop|microwell|\bnuclei\b|visium|multiome|cite[\s_-]*seq", re.I)
+_SC_TEXT_COLS = ("Library Name", "source_name", "Sample Name", "cell_type", "Experiment")
+
+
+def _splice_drop_reason(r, assay_keep):
+    """Return None to KEEP a target-line run for short-read splicing PSI, else a short 'reason:detail' string
+    explaining why it is unfit. Only consulted when assay_keep is set (the splicing module)."""
+    if not assay_keep:                       # non-splicing module -> no run-level gate, keep everything
+        return None
+    if _NORM_SUB.sub("", (r.get("Assay Type") or "").lower()) not in assay_keep:
+        return f"assay:{r.get('Assay Type') or '?'}"
+    if (_NORM_SUB.sub("", (r.get("Platform") or "").lower()) in _LONGREAD_PLAT
+            or _LONGREAD_INSTR.search(r.get("Instrument") or "")):
+        return f"longread:{r.get('Instrument') or r.get('Platform') or '?'}"
+    if _NORM_SUB.sub("", (r.get("LibrarySelection") or "").lower()) in _BAD_SELECTION:
+        return f"selection:{r.get('LibrarySelection')}"
+    if _SC_RUN.search(" ".join((r.get(c) or "") for c in _SC_TEXT_COLS)):
+        return "single-cell"
+    return None
 
 
 def _deterministic(target, aliases, candidate_values):
@@ -149,13 +196,22 @@ def _write_acc_lists(P, keep_rows):
     return combined, by_study
 
 
-def run(P, sel, ai_cfg=None, skip_ai=False, reporter=NULL):
-    """Match cell-line names, filter the run table to the target line, emit SraAccList + filtered CSV."""
+def run(P, sel, ai_cfg=None, skip_ai=False, reporter=NULL, assay_keep=None):
+    """Match cell-line names, filter the run table to the target line, emit SraAccList + filtered CSV.
+    `assay_keep`: optional set of NORMALIZED library strategies to keep (e.g. {"rnaseq"}). When set (the
+    splicing/bulk_rna_seq module passes it), it ALSO arms the full run-level splicing-suitability gate
+    (_splice_drop_reason): drops non-RNA-Seq strategies, long-read platforms (Nanopore/PacBio, which STAR
+    can't align), non-splicing LibrarySelections (CAGE/RACE/size-fractionation), and any single-cell run
+    that slipped past the upstream study-level filter — so only short-read bulk RNA-seq reaches STAR/
+    AltAnalyze. None keeps every run (non-splicing modules)."""
     if not os.path.exists(P.match_candidates) or not os.path.exists(P.runtable_all_csv):
         print("  CMATCH: missing inputs (no candidates / run table) -> skipping")
         return None
-    payload = json.load(open(P.match_candidates, encoding="utf-8"))
-    all_rows = list(csv.DictReader(open(P.runtable_all_csv, encoding="utf-8")))
+    if sel is None:
+        print("  CMATCH: missing cell-line selection (sel is None) -> skipping")
+        return None
+    with open(P.match_candidates, encoding="utf-8") as f:
+        payload = json.load(f)
     cand_values = [c["value"] if isinstance(c, dict) else c for c in payload.get("candidates", [])]
     target = payload.get("target", sel.get("canonical", ""))
     aliases = list(payload.get("target_aliases", []))
@@ -184,41 +240,94 @@ def run(P, sel, ai_cfg=None, skip_ai=False, reporter=NULL):
             mode = "deterministic(fallback)"
     reporter.advance(1)
 
-    json.dump({"target": target, "mode": mode, "matches": match},
-              open(P.cellline_match, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    _tmp = P.cellline_match + ".tmp"
+    with open(_tmp, "w", encoding="utf-8") as f:
+        json.dump({"target": target, "mode": mode, "matches": match},
+                  f, ensure_ascii=False, indent=1)
+        f.flush(); os.fsync(f.fileno())
+    os.replace(_tmp, P.cellline_match)
 
     # hybrid keep: GSM floor (already classified) OR agent-blessed cell-line value
     keep_gsms = {strip_rep(g) for g in sel.get("gsms", [])}
     match_vals = {v for v, info in match.items() if info.get("matches")}
 
-    def is_target(r):
+    def is_line(r):
         if strip_rep((r.get("GEO_Accession (exp)") or "")) in keep_gsms:
             return True
         return any((r.get(c) or "").strip() in match_vals for c in cl_cols)
 
-    keep_rows = [r for r in all_rows if is_target(r)]
+    # SPLICING SUITABILITY GATE (splicing modules only): keep a target-line run only if it is usable for
+    # short-read splicing PSI — right strategy (RNA-Seq), short-read (not Nanopore/PacBio), a splicing-
+    # friendly LibrarySelection, and not single-cell. See _splice_drop_reason for the rationale per check.
+    # PERF: ONE streaming pass over the runtable — was two (a keep pass + a separate drop-reason pass) that each
+    # re-evaluated is_line/_splice_drop_reason over every row (~210k for A549). is_line runs once per row,
+    # _splice_drop_reason once per target-line row; keep_rows / _drop / the log are bit-identical to before.
+    from collections import Counter as _Counter
+    # STREAM the runtable row-by-row. It can be GBs (this study set's SraRunTable_all.csv was 3.9 GB), and
+    # list(csv.DictReader(...)) inflated it several-fold and blew past RAM -> MemoryError on a 15 GB box. We
+    # keep only the target-line subset, so peak memory is O(kept), not O(all runs). n_all just counts the scan.
+    keep_rows, _drop, n_all = [], [], 0
+    with open(P.runtable_all_csv, encoding="utf-8", newline="") as f:
+        for r in csv.DictReader(f):
+            n_all += 1
+            if not is_line(r):
+                continue
+            why = _splice_drop_reason(r, assay_keep) if assay_keep else None
+            if why is None:
+                keep_rows.append(r)
+            else:
+                _drop.append((r, why))
+    if assay_keep and _drop:
+        _by = _Counter(why.split(":")[0] for _, why in _drop)
+        _ex = {}
+        for _, why in _drop:                      # one example detail per reason, for the log
+            k, _, v = why.partition(":")
+            _ex.setdefault(k, v)
+        print(f"  CMATCH SPLICE GATE: dropped {len(_drop)} target-line run(s) unfit for short-read "
+              f"splicing PSI -> {dict(_by)} (keep strategy={sorted(assay_keep)}; e.g. {_ex})")
 
-    # filtered run table (same column rules as the validated reconstruction)
+    if not keep_rows:
+        print("  " + "!" * 70)
+        print(f"  CMATCH WARNING: ZERO runs matched target={target!r} "
+              f"(mode={mode}; scanned {n_all} runs, "
+              f"{len(keep_gsms)} GSM floor, {len(match_vals)} matched value(s)).")
+        print("  CMATCH WARNING: emitting an EMPTY SraAccList.txt — nothing will be downloaded.")
+        print("  " + "!" * 70)
+
+    # filtered run table -- ONE row per unique RUN. The reconstruction emits a row per (run x series), so a
+    # heavily-reused line like K562 (8,421 runs shared across ~1,128 series -> ~136 rows/run -> 1.15M rows)
+    # balloons the table. The Run Selector format is one-row-per-run, and everything that reads this table
+    # (annotate, the workbook, PSI grouping) wants unique runs -- collapse duplicates here. The acc list
+    # already dedups, and by_study still sees every run's series because _write_acc_lists gets full keep_rows.
     keys = set()
     for r in keep_rows:
         keys.update(r)
     cols = order_columns(keys, add_gse=True) if keys else order_columns(set(), add_gse=True)
     slug = _slug(target)
     out_csv = _safe_open(P.runtable_filtered_csv(slug))
+    _seen, _ndup = set(), 0
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore"); w.writeheader()
         for r in keep_rows:
+            acc = r.get("Run", "")
+            if acc and acc in _seen:                    # same run under another series -> already written
+                _ndup += 1
+                continue
+            _seen.add(acc)
             w.writerow(r)
+    if _ndup:
+        print(f"  CMATCH: filtered table collapsed {_ndup:,} duplicate (run x series) rows -> "
+              f"{len(_seen):,} unique runs")
 
     combined, by_study = _write_acc_lists(P, keep_rows)
 
     matched_names = sorted(match_vals)
     print(f"  CMATCH ({mode}): target={target!r} | matched values={matched_names} | "
-          f"kept {len(keep_rows)}/{len(all_rows)} runs across {len(by_study)} studies")
+          f"kept {len(keep_rows)}/{n_all} runs across {len(by_study)} studies")
     print(f"  MAIN OUTPUT -> {P.sra_acc_list} ({len(combined)} run accessions)")
     reporter.set_detail(f"{len(combined)} runs kept ({mode}); matched: {', '.join(matched_names) or 'GSM-only'}")
     return {"target": target, "slug": slug, "mode": mode,
-            "n_runs_all": len(all_rows), "n_runs_kept": len(keep_rows),
+            "n_runs_all": n_all, "n_runs_kept": len(keep_rows),
             "n_accessions": len(combined), "n_studies": len(by_study),
             "matched_values": matched_names, "filtered_csv": out_csv}
 
@@ -233,7 +342,8 @@ def main():
     ap.add_argument("--skip-ai", action="store_true")
     a = ap.parse_args()
     P = Paths(a.run_dir).ensure_dirs()
-    sel = json.load(open(P.cellline_selection, encoding="utf-8"))
+    with open(P.cellline_selection, encoding="utf-8") as f:
+        sel = json.load(f)
     run(P, sel, {"provider": a.provider, "model": a.model}, a.skip_ai)
 
 

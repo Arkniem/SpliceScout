@@ -40,6 +40,7 @@ import llm_providers
 import cluster_deploy
 import plot_data
 import stage_docs
+import chat_assist
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -180,6 +181,63 @@ def _release_instance_slot():
             pass
 
 
+def _cluster_tag_busy(host, port, user, keyfile, base_root, tag):
+    """Best-effort, key/agent SSH only: True if <base_root>/<tag> on the cluster has a PIPELINE_COMPLETE.txt
+    (a finished prior run) OR live <tag>_* LSF jobs (a concurrent run); False if free; None if the SSH probe
+    is unavailable/failed (so the caller treats 'unknown' as 'don't bump')."""
+    root = base_root.rstrip("/") + "/" + tag
+    probe = ("R=%s; T=%s; d=0; [ -f \"$R/PIPELINE_COMPLETE.txt\" ] && d=1; "
+             "L=$(bjobs -noheader -o stat -J \"${T}_*\" 2>/dev/null | grep -E 'RUN|PEND' | wc -l); "
+             "echo OCC $d ${L:-0}") % (cluster_deploy.shq(root), cluster_deploy.shq(tag))
+    try:
+        txt = cluster_deploy._ssh_capture_systemssh(host, port, user, keyfile, probe, timeout=25)
+    except Exception:
+        return None
+    m = re.search(r"OCC\s+(\d+)\s+(\d+)", txt or "")
+    if not m:
+        return None
+    return (int(m.group(1)) > 0) or (int(m.group(2)) > 0)
+
+
+def _claim_cluster_aware(preferred):
+    """Claim an instance tag that is free BOTH locally (no live PC instance, via _claim_instance_slot) AND on
+    the cluster (no COMPLETED folder / live jobs for it) — so a fresh launch doesn't clobber a finished run or
+    collide with a running one (the A549-onto-existing-A549 bug). BULLETPROOF: any failure (no saved creds,
+    SSH down, unreachable cluster) falls back to the plain local claim so the server ALWAYS starts. Uses the
+    SAVED cluster creds + PIPELINE_ROOT; only catches the common case where the instance name == the folder
+    name (e.g. 'A549'), since the cell line that scopes other names isn't known until the run resolves it."""
+    tag, lock = _claim_instance_slot(preferred)
+    try:
+        cl = (_load_settings().get("cluster") or {})
+        host = (cl.get("ssh_host") or "").strip(); user = (cl.get("ssh_user") or "").strip()
+        base = (cl.get("PIPELINE_ROOT") or "").strip()
+        if not (host and user and base):
+            return tag, lock                       # no saved cluster creds -> plain local claim
+        port = str(cl.get("ssh_port") or "22").strip() or "22"; keyfile = (cl.get("ssh_key") or "").strip()
+        if _cluster_tag_busy(host, port, user, keyfile, base, tag) is not True:
+            return tag, lock                       # free, or SSH unavailable -> keep it
+        base_name = tag
+        for i in range(2, 40):
+            t2, l2 = _claim_instance_slot(f"{base_name}-{i}")
+            if _cluster_tag_busy(host, port, user, keyfile, base, t2) is not True:
+                try:
+                    if lock:
+                        os.remove(lock)             # drop the original (occupied) claim
+                except Exception:
+                    pass
+                print(f"   NOTE: cluster folder/jobs for \"{base_name}\" already exist -> this instance is "
+                      f"\"{t2}\" so a fresh run won't clobber/collide (override with --instance).")
+                return t2, l2
+            try:
+                if l2:
+                    os.remove(l2)                   # candidate also busy -> release + try the next
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"   (cluster-aware instance check skipped: {e!r})")
+    return tag, lock
+
+
 def _port_in_use(host, port):
     """True if something is already listening on host:port. Probe by CONNECT, not by bind —
     HTTPServer sets allow_reuse_address, and on Windows that lets two sockets share a port, so a
@@ -310,15 +368,18 @@ def _start_run(body):
         bed_cfg = {k: str(bed_in.get(k)).strip() for k in _bk if str(bed_in.get(k) or "").strip()} or None
         psi_in = body.get("psi") or {}
         _pk = ("ALTANALYZE_HOME", "ALTANALYZE_DB", "ALTANALYZE_LOCAL", "SPECIES", "ORGANISM", "EXPNAME",
-               "MEM_MB", "WALL", "RUN_GOELITE", "enabled")
+               "MEM_MB", "WALL", "RUN_GOELITE", "COMPRESS_WHEN_DONE", "enabled")
         psi_cfg = {k: str(psi_in.get(k)).strip() for k in _pk if str(psi_in.get(k) or "").strip()} or None
+        concordance_in = body.get("concordance") or {}
+        _ck = ("CANCER_ATLAS", "DPSI", "RAWP", "REMOVE_IR", "CONC_THRESHOLD", "MEM_MB", "WALL", "enabled")
+        concordance_cfg = {k: str(concordance_in.get(k)).strip() for k in _ck if str(concordance_in.get(k) or "").strip()} or None
         # user-defined comparison groups (Phase B): [{name, control?, match:[...]}, ...] + compared pair
         group_in = body.get("groups") if isinstance(body.get("groups"), dict) else None
         group_cfg = group_in or None
         # phase range: validate start/end against the canonical stage order + check supplied inputs exist
         _order = [k for k, _ in progress.STAGES]
         start_stage = (body.get("start_stage") or "fetch").strip() or "fetch"
-        end_stage = (body.get("end_stage") or "psi_submit").strip() or "psi_submit"
+        end_stage = (body.get("end_stage") or "concordance_submit").strip() or "concordance_submit"
         if start_stage not in _order or end_stage not in _order:
             return 400, {"error": "unknown start/end stage"}
         if _order.index(start_stage) > _order.index(end_stage):
@@ -331,13 +392,23 @@ def _start_run(body):
                 if not _p:
                     if _spec.get("optional"):
                         continue
-                    return self._send_json(400, {"error": "start at '%s' needs %s" % (_scp["label"], _spec["label"])})
+                    return 400, {"error": "start at '%s' needs %s" % (_scp["label"], _spec["label"])}
                 if not os.path.exists(os.path.expanduser(_p)):
-                    return self._send_json(400, {"error": "supplied path not found: %s" % _p})
+                    return 400, {"error": "supplied path not found: %s" % _p}
         try:
-            concurrency = max(1, min(99, int(body.get("concurrency", 8))))
+            concurrency = max(1, int(body.get("concurrency", 8)))   # no upper cap on concurrent AI batches
         except Exception:
             concurrency = 8
+        # per-model max OUTPUT tokens for the AI cleaning calls (UI: model_max_tokens = {model: int}).
+        # Blank/unset -> 60000 (the long-standing default). Raise it for verbose reasoning models so a
+        # chain-of-thought doesn't truncate the tool call; lower it to cut cost / stay under a TPM limit.
+        max_tokens = 60000
+        try:
+            _mt = (body.get("model_max_tokens") or {}).get(model) or body.get("max_tokens")
+            if str(_mt or "").strip():
+                max_tokens = max(256, int(_mt))
+        except Exception:
+            max_tokens = 60000
 
         if not skip_ai:
             if api_key:
@@ -379,7 +450,8 @@ def _start_run(body):
                  ("SSH key path", cluster_cfg.get("ssh_key"))]
                 + [("STAR " + k, (star_cfg or {}).get(k)) for k in ("GENOME_DIR", "STAR_INDEX_ROOT", "ORGANISM")]
                 + [("BED " + k, (bed_cfg or {}).get(k)) for k in ("ALTANALYZE_DIR", "SPECIES", "ORGANISM")]
-                + [("PSI " + k, (psi_cfg or {}).get(k)) for k in ("ALTANALYZE_HOME", "ALTANALYZE_DB", "SPECIES", "ORGANISM", "EXPNAME")])
+                + [("PSI " + k, (psi_cfg or {}).get(k)) for k in ("ALTANALYZE_HOME", "ALTANALYZE_DB", "SPECIES", "ORGANISM", "EXPNAME")]
+                + [("Concordance " + k, (concordance_cfg or {}).get(k)) for k in ("CANCER_ATLAS",)])
             if _bad:
                 return _bad
             pw = body.get("ssh_password") or ""      # secret -> memory for the run; saved only if remembered
@@ -391,14 +463,17 @@ def _start_run(body):
         # to include it (never shrinks). Without this, a stale saved end_stage (e.g. "bed_submit" from
         # before the PSI stage existed) silently skips PSI even with its box ticked. A run that ends BEFORE
         # the chain (download-only / stop-at-STAR via the slider) is untouched; uncheck a box to stop earlier.
-        if module == "bulk_rna_seq" and cluster_mode != "off" and end_stage in ("star_submit", "bed_submit", "psi_submit"):
+        if module == "bulk_rna_seq" and cluster_mode != "off" and end_stage in ("star_submit", "bed_submit", "psi_submit", "concordance_submit"):
             _bed_en = str((bed_cfg or {}).get("enabled", "1")).lower() not in ("0", "off", "false", "no")
             _psi_en = str((psi_cfg or {}).get("enabled", "1")).lower() not in ("0", "off", "false", "no")
+            _conc_en = str((concordance_cfg or {}).get("enabled", "1")).lower() not in ("0", "off", "false", "no")
             _target = end_stage
             if _bed_en and _order.index("bed_submit") > _order.index(_target):
                 _target = "bed_submit"
             if _psi_en and _order.index("psi_submit") > _order.index(_target):
                 _target = "psi_submit"
+            if _psi_en and _conc_en and _order.index("concordance_submit") > _order.index(_target):
+                _target = "concordance_submit"
             if _order.index(_target) > _order.index(end_stage):
                 print(f"  PHASE RANGE: end '{end_stage}' -> '{_target}' (enabled analysis toggles extend the range)")
                 end_stage = _target
@@ -411,14 +486,15 @@ def _start_run(body):
         P = Paths(run_dir).ensure_dirs()
         cfg = pipeline.RunConfig(query=query, cap=cap, ncbi_key=ncbi_key, model=model,
                                  provider=provider, base_url=base_url, disable_reasoning=disable_reasoning,
-                                 module=module,
+                                 max_tokens=max_tokens, module=module,
                                  concurrency=concurrency, run_dir=P.run_dir, skip_ai=skip_ai,
                                  deep_dive=deep_dive, pick_mode=pick_mode,
                                  cluster_mode=cluster_mode, cluster_cfg=cluster_cfg, star_cfg=star_cfg,
-                                 bed_cfg=bed_cfg, psi_cfg=psi_cfg, group_cfg=group_cfg,
+                                 bed_cfg=bed_cfg, psi_cfg=psi_cfg, concordance_cfg=concordance_cfg, group_cfg=group_cfg,
                                  start_stage=start_stage, end_stage=end_stage, supplied_inputs=supplied_inputs)
         # config.json mirrors the CLI (ncbi_key + cluster_cfg stored; Anthropic key + SSH password NOT)
-        json.dump(asdict(cfg), open(P.config, "w", encoding="utf-8"), indent=2)
+        with open(P.config, "w", encoding="utf-8") as f:
+            json.dump(asdict(cfg), f, indent=2)
 
         reporter = RunReporter(run_dir=P.run_dir)
         _REPORTER = reporter
@@ -427,6 +503,74 @@ def _start_run(body):
         _WORKER = t
         t.start()
         return 200, {"ok": True, "run_dir": P.run_dir}
+
+
+def _latest_run_dir():
+    """The most recent runs/* dir for THIS instance (so a server RESTART resumes the right run). None if none."""
+    try:
+        cand = []
+        for n in os.listdir("runs"):
+            d = os.path.join("runs", n)
+            if (os.path.isdir(d) and n.endswith("_" + _INSTANCE_TAG)
+                    and os.path.isfile(os.path.join(d, "config.json"))):
+                cand.append((os.path.getmtime(d), d))
+        cand.sort()
+        return cand[-1][1] if cand else None
+    except Exception:
+        return None
+
+
+def _resume_run(body):
+    """Re-attach + CONTINUE an existing run dir instead of minting a NEW one (the gap that made a server
+    restart un-resumable: /api/start always created a fresh runs/<...> folder). Reconstructs RunConfig from
+    the run's saved config.json; the pipeline's per-stage done-checks (begin()) skip completed stages, so it
+    resumes from where it stopped. Run dir = body['run_dir'] if given, else _RUN_DIR, else this instance's
+    most recent runs/* dir. Resume may also OVERRIDE the AI provider/model/base_url or turn AI off -- handy
+    when the configured OpenAI-compatible proxy is down (switch to a local Ollama, or skip AI, and continue)."""
+    global _REPORTER, _WORKER, _RUN_DIR
+    with _LOCK:
+        if _WORKER and _WORKER.is_alive():
+            return 409, {"error": "A run is already in progress."}
+        rd = (body.get("run_dir") or "").strip() or _RUN_DIR or _latest_run_dir()
+        if not rd or not os.path.isdir(rd):
+            return 404, {"error": "No existing run found to resume — start a run first."}
+        cfgpath = os.path.join(rd, "config.json")
+        if not os.path.isfile(cfgpath):
+            return 400, {"error": f"No config.json in {rd} — cannot resume."}
+        try:
+            cfg = pipeline.RunConfig(**json.load(open(cfgpath, encoding="utf-8")))
+        except Exception as e:
+            return 400, {"error": f"Could not load the saved run config ({e})."}
+        P = Paths(rd).ensure_dirs()
+        # optional fresh overrides on resume (e.g. the AI proxy is down -> switch provider / skip AI)
+        if (body.get("provider") or "").strip():
+            cfg.provider = llm_providers.normalize_provider(body.get("provider"))
+        if (body.get("model") or "").strip():
+            cfg.model = body.get("model").strip()
+        if "base_url" in body:
+            cfg.base_url = (body.get("base_url") or "").strip()
+        if body.get("disable_reasoning") is not None:
+            cfg.disable_reasoning = bool(body.get("disable_reasoning"))
+        if body.get("skip_ai"):
+            cfg.skip_ai = True
+        secrets = {}
+        if body.get("api_key"):
+            secrets["api_key"] = body.get("api_key")
+        pw = (body.get("ssh_password") or _load_settings().get("ssh_password") or "")
+        if pw:
+            secrets["ssh_password"] = pw
+        try:                                  # persist overrides so a further restart resumes with them
+            json.dump(asdict(cfg), open(P.config, "w", encoding="utf-8"), indent=2)
+        except Exception as e:
+            print(f"  WARN: could not persist resumed config ({e})")
+        reporter = RunReporter(run_dir=P.run_dir)
+        _REPORTER = reporter
+        _RUN_DIR = P.run_dir
+        t = threading.Thread(target=_worker, args=(cfg, P, reporter, secrets), daemon=True)
+        _WORKER = t
+        t.start()
+        print(f"Resuming run {P.run_dir} (provider={cfg.provider}, skip_ai={cfg.skip_ai})")
+        return 200, {"ok": True, "run_dir": P.run_dir, "resumed": True}
 
 
 def _status():
@@ -479,7 +623,18 @@ def _save_settings(body):
     # largest (full pipeline) and is a per-run override, never a saved preference.
     keep = {k: body[k] for k in
             ("query", "scope", "cap", "skip_ai", "provider", "api_keys", "ncbi_key", "model",
-             "base_url", "disable_reasoning", "module", "concurrency", "pick_mode", "cluster_mode") if k in body}
+             "model_history", "base_urls", "base_url", "disable_reasoning", "model_max_tokens",
+             "module", "concurrency", "pick_mode", "cluster_mode", "alert_email",
+             "diagnose_model_path", "diagnose_model_dir") if k in body}
+    # Strip whitespace from secrets BEFORE persisting — a stray leading/trailing space or TAB from a paste
+    # makes the gateway reject the key (e.g. LiteLLM master-key auth fails -> the confusing "No connected db").
+    if isinstance(keep.get("api_keys"), dict):
+        keep["api_keys"] = {p: (v.strip() if isinstance(v, str) else v) for p, v in keep["api_keys"].items()}
+    for _kk in ("ncbi_key", "base_url"):
+        if isinstance(keep.get(_kk), str):
+            keep[_kk] = keep[_kk].strip()
+    if isinstance(keep.get("base_urls"), dict):
+        keep["base_urls"] = {p: (v.strip() if isinstance(v, str) else v) for p, v in keep["base_urls"].items()}
     if isinstance(body.get("cluster"), dict):
         keep["cluster"] = {k: v for k, v in body["cluster"].items() if k != "ssh_password"}
     if isinstance(body.get("star"), dict):
@@ -488,13 +643,17 @@ def _save_settings(body):
         keep["bed"] = body["bed"]
     if isinstance(body.get("psi"), dict):
         keep["psi"] = body["psi"]
+    if isinstance(body.get("concordance"), dict):
+        keep["concordance"] = body["concordance"]
     if isinstance(body.get("groups"), dict):
         keep["groups"] = body["groups"]
     try:
+        merged = dict(_load_settings())   # overlay onto existing so a partial save never drops other settings
+        merged.update(keep)
         p = _settings_path()
         tmp = p + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(keep, f, indent=2)
+            json.dump(merged, f, indent=2)
         try:
             os.chmod(tmp, 0o600)
         except Exception:
@@ -583,7 +742,7 @@ class Handler(BaseHTTPRequestHandler):
             md = "README.md not found."
         html = ("<!DOCTYPE html><html><head><meta charset='utf-8'><title>SpliceScout — User Guide</title>"
                 "<style>body{background:#0f1420;color:#e7ecf5;font:14px/1.6 ui-monospace,Consolas,"
-                "monospace;max-width:920px;margin:0 auto;padding:32px 22px}a{color:#5b8cff}"
+                "monospace;max-width:920px;margin:0 auto;padding:32px 22px}a{color:#5fb6c0}"
                 "pre{white-space:pre-wrap;word-wrap:break-word}</style></head><body><pre>"
                 + _html_attr(md) + "</pre></body></html>")
         self._send_html(html)
@@ -664,12 +823,64 @@ class Handler(BaseHTTPRequestHandler):
         route = urlparse(self.path)
         if not self._guard(csrf=True):     # token (non-loopback) + CSRF origin check on every state change
             return
+        if route.path == "/api/shutdown":
+            # Stop the WHOLE program. Respond FIRST, then terminate from a background thread. We must
+            # os._exit() (a HARD exit): self.server.shutdown() alone only ends the HTTP accept loop, but
+            # under the system-tray launcher (tray.py) the MAIN thread is the pystray icon loop and
+            # serve_forever() runs in a daemon thread -- so stopping the server leaves the tray (and thus
+            # the process) alive. os._exit kills the tray loop + serve_forever + any worker. Cluster runs
+            # are self-driving and keep going on their own.
+            self._send_json(200, {"ok": True, "message": "SpliceScout server shutting down"})
+            try:
+                self.wfile.flush()
+            except Exception:
+                pass
+
+            def _stop():
+                try:
+                    self.server.shutdown()       # end the accept loop cleanly (also lets the 200 flush)
+                except Exception:
+                    pass
+                try:
+                    _release_instance_slot()     # free this instance's tag (os._exit skips atexit)
+                except Exception:
+                    pass
+                os._exit(0)                      # HARD-exit the entire process (tray icon loop included)
+
+            threading.Thread(target=_stop, daemon=True).start()
+            return
+        if route.path == "/api/settings":          # persist UI prefs (per-provider model history etc.) sans run
+            try:
+                body = self._read_body()
+            except Exception:
+                return self._send_json(400, {"error": "invalid JSON"})
+            _save_settings(body)
+            return self._send_json(200, {"ok": True})
+        if route.path == "/api/chat":          # the Assistant — agentic chat over the pipeline (prepare-only)
+            try:
+                body = self._read_body()
+            except Exception:
+                return self._send_json(400, {"error": "invalid JSON"})
+            messages = body.get("messages")
+            if not isinstance(messages, list):
+                return self._send_json(400, {"error": "messages must be a list of {role, content}"})
+            # run_turn never raises (it self-diagnoses into {error,reply}); pass the save callback so the
+            # assistant's update_settings writes to the SAME local store as the form.
+            return self._send_json(200, chat_assist.run_turn(messages, _load_settings(),
+                                                             _save_settings, _INSTANCE_TAG))
         if route.path == "/api/start":
             try:
                 body = self._read_body()
             except Exception:
                 return self._send_json(400, {"error": "invalid JSON"})
             code, obj = _start_run(body)
+            return self._send_json(code, obj)
+        if route.path == "/api/resume":
+            try:
+                body = self._read_body()
+            except Exception:
+                return self._send_json(400, {"error": "invalid JSON"})
+            code, obj = _resume_run(body)
             return self._send_json(code, obj)
         if route.path == "/api/select":
             try:
@@ -721,6 +932,8 @@ class Handler(BaseHTTPRequestHandler):
                     v = str(body.get(k) or "").strip()
                     if v:
                         fix[k] = v
+                if "base_url" in body:        # OpenAI-compatible endpoint; present-but-blank clears it (-> provider default)
+                    fix["base_url"] = str(body.get("base_url") or "").strip()
                 if body.get("api_key"):       # secret -> transient only, never written to config.json
                     fix["api_key"] = body.get("api_key")
                 ok = rep.provide_ai_fix(fix)
@@ -758,6 +971,15 @@ class Handler(BaseHTTPRequestHandler):
             job_tag = (body.get("job_tag") or cfg.get("JOB_TAG") or _INSTANCE_TAG or "").strip()
             if not job_tag:
                 return self._send_json(400, {"error": "instance job tag not set — cannot scope the status check"})
+            # the deployed bundle scopes JOB_TAG by the cell line (project isolation) -> prefer the EFFECTIVE
+            # tag baked into THIS run's cluster config.sh so the per-stage probes match the real job names.
+            if run_dir:
+                try:
+                    _eff = cluster_deploy._read_config_jobtag(Paths(run_dir))
+                    if _eff:
+                        job_tag = _eff
+                except Exception:
+                    pass
             if not fallback_root:
                 fallback_root = (sc.get("PIPELINE_ROOT") or "").strip()
             status = cluster_deploy.remote_status(host, user, port, keyfile, password, job_tag, fallback_root)
@@ -806,9 +1028,59 @@ class Handler(BaseHTTPRequestHandler):
                                                                            f"{job_tag}_psi", psi_root)
                                     if psi and psi.get("ok"):
                                         status["psi"] = psi
+                                        # once PSI is done, also report the splicing-concordance stage
+                                        if psi.get("complete"):
+                                            concord_root = bam_out.rstrip("/").rsplit("/", 1)[0] + "/concordance"
+                                            conc = cluster_deploy.remote_concordance_status(
+                                                host, user, port, keyfile, password,
+                                                f"{job_tag}_concordance", concord_root)
+                                            if conc and conc.get("ok"):
+                                                status["concordance"] = conc
                 except Exception:
                     pass
+            # Cross-stage STALL alert scan (UNCONDITIONAL — independent of the nested STAR/BED/PSI probes
+            # above, which only run when the prior stage completed): scan THIS run's folder for ANY stage's
+            # PIPELINE_STALLED/_ORPHANED/_LAUNCH_TIMEOUT marker so a silent downstream stall (the 5-day BED
+            # death) is surfaced RED on every poll, not hidden.
+            # SCOPED to this run's OWN effective root (the discovered job CWD, else the JOB_TAG-scoped root
+            # baked into config.sh) — NEVER the bare shared PIPELINE_ROOT. Sibling runs (and abandoned old
+            # test folders) live under that shared root, so scanning it would surface THEIR stalls as FALSE
+            # alerts here (e.g. a run still DOWNLOADING would 'inherit' another project's BED stall). If all
+            # we can resolve is the bare shared root, we refuse to scan: a stall we can't attribute to THIS
+            # run is not this run's alert.
+            try:
+                _bare = (sc.get("PIPELINE_ROOT") or "").strip().rstrip("/")
+                _scope = (status.get("root") or fallback_root or "").strip().rstrip("/")
+                if _scope and _scope != _bare:
+                    _al = cluster_deploy.remote_alerts(host, user, port, keyfile, password, _scope)
+                    if _al.get("ok"):
+                        status["alerts"] = _al.get("alerts") or []
+            except Exception:
+                pass
             return self._send_json(200, status)
+        if route.path == "/api/alert_test":
+            try:
+                body = self._read_body()
+            except Exception:
+                return self._send_json(400, {"error": "invalid JSON"})
+            settings = _load_settings(); sc = settings.get("cluster") or {}
+            email = (body.get("alert_email") or settings.get("alert_email") or "").strip()
+            host = (sc.get("ssh_host") or "").strip(); user = (sc.get("ssh_user") or "").strip()
+            if not email:
+                return self._send_json(400, {"error": "Enter an alert email first."})
+            if not host or not user:
+                return self._send_json(400, {"error": "Set the cluster SSH host + user first — alerts are "
+                                             "sent via the cluster's own mail."})
+            port = str(sc.get("ssh_port") or "22").strip() or "22"
+            keyfile = (sc.get("ssh_key") or "").strip()
+            password = (body.get("ssh_password") or settings.get("ssh_password") or "").strip()
+            ok = cluster_deploy.send_alert_email(
+                host, user, port, keyfile, password, email, "SpliceScout test alert",
+                "This is a SpliceScout test alert. If you received it, cluster→email alerts work "
+                "(check spam too).")
+            return self._send_json(200, {"ok": ok, "email": email, "note": (
+                "Queued via the cluster's mail — check your inbox AND spam (external delivery depends "
+                "on the cluster's mail relay)." if ok else "The cluster wouldn't accept the message.")})
         self._send_json(404, {"error": "not found"})
 
 
@@ -820,6 +1092,7 @@ def _page():
             "anthropic": "Anthropic key (sk-ant-…) — console.anthropic.com",
             "openai": "OpenAI key (sk-…) — platform.openai.com/api-keys",
             "gemini": "Gemini key (AI…) — aistudio.google.com/apikey",
+            "ollama": "No key needed — Ollama runs locally at localhost:11434 (set the OLLAMA_HOST env var before launching for a custom host/port).",
         },
     }
     return (PAGE.replace("__DEFAULT_QUERY__", _html_attr(pipeline.DEFAULT_QUERY))
@@ -833,6 +1106,71 @@ def _page():
 def _html_attr(s):
     return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             .replace('"', "&quot;"))
+
+
+# ---- background STALL-alert poller: email the user when a cluster stage stalls (the proactive heads-up) ----
+_ALERT_SEEN_PATH = os.path.join(os.path.expanduser("~"), ".geo_pipeline_alert_seen.json")
+_ALERT_POLL_SECONDS = 1200   # 20 min (the cluster watchdogs poll on the same order; finer is just noise)
+
+
+def _alert_seen_load():
+    try:
+        return set(json.load(open(_ALERT_SEEN_PATH, encoding="utf-8")))
+    except Exception:
+        return set()
+
+
+def _alert_seen_save(seen):
+    try:
+        json.dump(sorted(seen), open(_ALERT_SEEN_PATH, "w", encoding="utf-8"))
+    except Exception:
+        pass
+
+
+def _alert_poll_once():
+    """One scan: if a cluster stage has newly STALLED/ORPHANED/timed-out, email the configured address via
+    the cluster's own mail. Deduped by marker path+time (a persistent stall isn't re-emailed every cycle)."""
+    s = _load_settings(); sc = s.get("cluster") or {}
+    email = (s.get("alert_email") or "").strip()
+    host = (sc.get("ssh_host") or "").strip(); user = (sc.get("ssh_user") or "").strip()
+    root = (sc.get("PIPELINE_ROOT") or "").strip()
+    if not (email and host and user and root):
+        return
+    port = str(sc.get("ssh_port") or "22").strip() or "22"
+    keyfile = (sc.get("ssh_key") or "").strip(); password = (s.get("ssh_password") or "").strip()
+    r = cluster_deploy.remote_alerts(host, user, port, keyfile, password, root)
+    if not r.get("ok"):
+        print("WARN: alert poll could not reach the cluster (%s) -- stalls won't be emailed until it recovers"
+              % (r.get("error") or "ssh/remote error"))
+        return
+    seen = _alert_seen_load()
+    new = [a for a in (r.get("alerts") or []) if (a["path"] + "|" + a["when"]) not in seen]
+    if not new:
+        return
+    body = ("SpliceScout detected stalled/failed cluster stage(s):\n\n"
+            + "\n".join("  [%s] %s  (%s)\n    %s" % (a["stage"], a["kind"], a["when"], a["path"]) for a in new)
+            + "\n\nA stalled stage does NOT auto-advance to the next. Open SpliceScout (or ask the Assistant "
+              "\"is anything stuck?\") and fix + re-arm that stage.\nRoot: " + (r.get("root") or ""))
+    if cluster_deploy.send_alert_email(host, user, port, keyfile, password, email,
+                                       "SpliceScout: %d cluster stage(s) stalled" % len(new), body):
+        for a in new:
+            seen.add(a["path"] + "|" + a["when"])
+        _alert_seen_save(seen)
+    else:
+        print("WARN: detected %d new cluster stall(s) but the alert email could not be sent (cluster mail "
+              "refused it) -- will retry next cycle" % len(new))
+
+
+def _alert_poller():
+    import time
+    while True:
+        try:
+            _alert_poll_once()
+        except Exception as e:
+            # was silently swallowed -> SSH errors (host down, bad/missing key) made the whole alert poller a
+            # no-op with NO trace, so the user thought alerts were on when they were dead. Log it.
+            print("WARN: alert poller pass failed: %r" % (e,))
+        time.sleep(_ALERT_POLL_SECONDS)
 
 
 def main():
@@ -857,7 +1195,7 @@ def main():
     # claim this instance's identity -> the name from the launcher ($SPLICESCOUT_INSTANCE / --instance),
     # else the lowest free sra1 / sra2 / sra3 ... (released on exit; a dead instance's tag is reclaimed)
     preferred = (a.instance or "").strip() or _resolve_instance_name()
-    _INSTANCE_TAG, _INSTANCE_LOCK_PATH = _claim_instance_slot(preferred)
+    _INSTANCE_TAG, _INSTANCE_LOCK_PATH = _claim_cluster_aware(preferred)
     atexit.register(_release_instance_slot)
 
     # auto-pick a free port so EVERY launch starts its own instance (run concurrent projects)
@@ -880,6 +1218,7 @@ def main():
             threading.Timer(0.6, lambda: webbrowser.open(url)).start()
         except Exception:
             pass
+    threading.Thread(target=_alert_poller, daemon=True).start()   # email on a new cluster STALL (if configured)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -897,17 +1236,26 @@ PAGE = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>GEO RNA-seq Pipeline</title>
+<title>SpliceSCOUT</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Exo+2:wght@300;400;500;600;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
 <style>
   :root{
-    --bg:#0f1420; --panel:#171d2b; --panel2:#1e2435; --line:#2b3450;
-    --txt:#e7ecf5; --mut:#9aa6c0; --accent:#5b8cff; --accent2:#7c5bff;
-    --ok:#37c98b; --warn:#f0b429; --err:#ff5d6c; --chip:#222b42;
+    --bg:#0a0a0b; --panel:#141417; --panel2:#1b1b1f; --line:#2b2b31;
+    --txt:#ededee; --mut:#8b8b93; --accent:#5fb6c0; --accent2:#5fb6c0;
+    --ok:#5cb890; --warn:#d6ab4f; --err:#d6606e; --chip:#1b1b1f;
+    --glow:transparent; --glow2:transparent;
   }
   *{box-sizing:border-box}
-  body{margin:0;background:linear-gradient(180deg,#0d111b,#0f1420 240px);color:var(--txt);
-    font:15px/1.5 ui-sans-serif,system-ui,"Segoe UI",Roboto,Arial,sans-serif}
-  .wrap{max-width:860px;margin:0 auto;padding:32px 20px 80px}
+  body{margin:0;color:var(--txt);background:#0a0a0b;
+    font:clamp(15px,0.30vw+12.4px,19px)/1.55 'Exo 2',ui-sans-serif,system-ui,"Segoe UI",Roboto,Arial,sans-serif}
+  /* full-viewport animated DNA background (mouse-reactive); sits BEHIND all content */
+  #dnafx{position:fixed;inset:0;width:100%;height:100%;z-index:0;pointer-events:none;display:block}
+  /* fluid: scale with the monitor — use more of a wide/ultrawide screen, shrink on small.
+     Content sits above the DNA canvas (z-index 1). */
+  .wrap{width:min(1100px,92vw);max-width:none;margin:0 auto;
+    padding:clamp(24px,2.2vw,44px) clamp(16px,1.8vw,30px) 90px;position:relative;z-index:1}
   header h1{margin:0 0 4px;font-size:24px;letter-spacing:.2px}
   .ibadge{display:inline-block;font-size:12px;font-weight:600;color:var(--accent);
     background:rgba(91,140,255,.12);border:1px solid var(--line);border-radius:20px;
@@ -1046,18 +1394,81 @@ PAGE = r"""<!DOCTYPE html>
   .railtick.inrange{color:var(--txt)}
   .railtick.edge{color:var(--accent);font-weight:600}
   #startInputs .startinput{margin-top:8px}
+
+  /* ============================ MINIMALIST FUTURISTIC (matte black) ============================ */
+  /* Flat. No gradients, no glow, no neon. One restrained accent, hairline borders. */
+  header{position:relative}
+  .brand{font-family:'Orbitron',ui-sans-serif,sans-serif;font-weight:800;
+    font-size:clamp(28px,4vw,44px);letter-spacing:4px;line-height:1;margin:0 0 10px;
+    display:flex;align-items:center;gap:14px;flex-wrap:wrap;color:var(--txt)}
+  .wordmark{color:var(--txt)}
+  .wordmark b{font-weight:800;letter-spacing:5px;color:var(--accent)}
+  .tagline{font-family:'Share Tech Mono',ui-monospace,monospace;color:var(--mut);font-size:12px;
+    letter-spacing:2.5px;text-transform:uppercase;margin:0 0 26px}
+  .tagline::before{content:"\2014  ";color:var(--accent)}
+  h2,.modal h2{font-family:'Orbitron',ui-sans-serif,sans-serif;letter-spacing:.6px;font-weight:700}
+
+  /* Flat matte panels — solid surface, hairline border, no shadow/blur/gradient */
+  .card,.modal .box{background:var(--panel);border:1px solid var(--line);border-radius:13px;
+    box-shadow:none;backdrop-filter:none;-webkit-backdrop-filter:none;position:relative;overflow:hidden}
+  .card::before{content:"";position:absolute;top:0;left:0;width:36px;height:2px;background:var(--accent)}
+
+  /* ibadge — flat outline */
+  .ibadge{font-family:'Share Tech Mono',monospace;color:var(--accent);background:transparent;
+    border:1px solid var(--line);letter-spacing:1px;box-shadow:none}
+
+  /* inputs — flat, hairline border, accent border on focus (no glow) */
+  input[type=text],input[type=number],input[type=password],textarea,select{
+    background:#101013;border:1px solid var(--line);border-radius:8px;box-shadow:none;
+    transition:border-color .14s}
+  input:focus,textarea:focus,select:focus{border-color:var(--accent);box-shadow:none}
+
+  /* buttons / download / active tab — solid accent fill, no gradient/glow */
+  button.primary,a.dl,.tabs button.on{background:var(--accent);background-image:none;color:#08171a;
+    box-shadow:none;letter-spacing:.4px;text-shadow:none;transition:filter .14s,background-color .14s}
+  button.primary{font-family:'Orbitron',sans-serif;font-weight:700;font-size:13.5px;letter-spacing:1px}
+  button.primary:hover,a.dl:hover{filter:brightness(1.1)}
+  button.primary:disabled{filter:grayscale(.4) brightness(.8)}
+  button.ghost,.tabs button{box-shadow:none;transition:border-color .14s,color .14s}
+  button.ghost:hover,.tabs button:hover{border-color:var(--accent);color:var(--txt);box-shadow:none}
+
+  /* progress + numerics — flat accent fill, solid mono text (no gradient/glow) */
+  .obar,.sbar{border-color:var(--line);background:#101013}
+  .obar>span,.sbar>span,.railfill{background:var(--accent);background-image:none;box-shadow:none}
+  .ohead .pct,.stat .n{font-family:'Orbitron',ui-sans-serif,sans-serif;color:var(--txt);
+    background:none;-webkit-text-fill-color:currentColor}
+  .stage.active{background:var(--panel2);box-shadow:none}
+
+  /* selected states — thin solid accent border, no glow */
+  .scope label.sel,.studyitem.sel,.file.head{box-shadow:none;border-color:var(--accent)}
+  .chip:hover{box-shadow:none;border-color:var(--accent)}
+  .railhandle{background:var(--accent);background-image:none;border-color:var(--txt);box-shadow:none}
+
+  /* flat surfaces (no blur), flat log */
+  .banner{backdrop-filter:none}
+  .stat,.scope label,.studyitem,.chart,#phaserail,.tabs button,.file{backdrop-filter:none}
+  .log{background:#0c0c0e;backdrop-filter:none}
+  ::selection{background:var(--accent);color:#08171a}
+  /* minimal scrollbars */
+  *{scrollbar-width:thin;scrollbar-color:var(--line) transparent}
+  *::-webkit-scrollbar{width:8px;height:8px}
+  *::-webkit-scrollbar-thumb{background:var(--line);background-image:none;border-radius:5px}
+  *::-webkit-scrollbar-track{background:transparent}
 </style>
 </head>
 <body>
+<canvas id="dnafx" aria-hidden="true"></canvas>
 <div class="wrap">
   <header>
-    <h1>GEO RNA-seq Pipeline <span class="ibadge" title="This instance's cluster JOB_TAG — the instance name you chose at launch (or an auto sra1/sra2/... if you left it blank). It namespaces this project's LSF jobs so concurrent projects never collide.">JOB_TAG __INSTANCE_TAG__</span></h1>
-    <p>Submit an NCBI GEO search and get cleaned, splicing-amenable, cell-line-grouped compound tables.</p>
+    <button type="button" id="shutdownBtn" title="Stop the SpliceScout web server (cluster runs keep going on their own)" style="position:absolute;top:0;right:0;padding:6px 12px;font-size:13px;cursor:pointer;background:var(--panel2);color:var(--mut);border:1px solid var(--line);border-radius:9px">&#9211; Shut down</button>
+    <h1 class="brand"><span class="wordmark">Splice<b>SCOUT</b></span> <span class="ibadge" title="This instance's cluster JOB_TAG — the instance name you chose at launch (or an auto sra1/sra2/... if you left it blank). It namespaces this project's LSF jobs so concurrent projects never collide.">JOB_TAG __INSTANCE_TAG__</span></h1>
+    <p class="tagline">GEO&#8202;&rarr;&#8202;splicing-amenable, cell-line-grouped compound intelligence</p>
   </header>
 
   <div class="tabs" id="tabs">
     <button id="tabRun" class="on" type="button">Run</button>
     <button id="tabPlots" type="button" hidden>Plots</button>
+    <button id="tabAssistant" type="button">Assistant</button>
   </div>
 
   <div id="runtab">
@@ -1114,17 +1525,28 @@ PAGE = r"""<!DOCTYPE html>
             <option value="anthropic">Anthropic (Claude)</option>
             <option value="openai">OpenAI (ChatGPT)</option>
             <option value="gemini">Google Gemini</option>
+            <option value="ollama">Ollama (local)</option>
           </select>
-          <input type="text" id="model" list="modellist" autocomplete="off" spellcheck="false"
-                 placeholder="model name (editable — type any model)">
-          <datalist id="modellist"></datalist>
+          <div id="modelcombo" style="position:relative;flex:1;min-width:200px">
+            <input type="text" id="model" autocomplete="off" spellcheck="false"
+                   placeholder="model name (editable — type any model)" style="width:100%;padding-right:30px">
+            <button type="button" id="modeldrop" title="Models used with this provider"
+                    style="position:absolute;right:1px;top:1px;bottom:1px;width:28px;border:none;border-radius:0 8px 8px 0;background:transparent;color:var(--mut);cursor:pointer;font-size:12px">&#9662;</button>
+            <div id="modelmenu" style="display:none;position:absolute;z-index:30;left:0;right:0;top:calc(100% + 4px);background:var(--panel2);border:1px solid var(--line);border-radius:9px;box-shadow:0 8px 24px rgba(0,0,0,.45);max-height:240px;overflow:auto;padding:5px"></div>
+          </div>
+        </div>
+        <div class="row" style="margin-top:10px;align-items:center;gap:8px">
+          <span class="lbl" style="margin:0;white-space:nowrap;font-size:12px">Max output tokens</span>
+          <input type="number" id="maxtokens" min="256" step="256" autocomplete="off"
+                 placeholder="default 60000" style="max-width:150px">
+          <span class="hint" style="margin:0">per model — caps each AI call&#39;s output. Raise for reasoning models (avoids truncation); lower to cut cost / stay under a rate limit.</span>
         </div>
         <input type="password" id="akey" autocomplete="off" placeholder="API key" style="margin-top:10px">
         <div class="hint" id="keyhint">Used for the AI cleaning passes (drug-name canonicalization + sample classification).</div>
         <div id="baseurlrow" style="margin-top:10px;display:none">
           <input type="text" id="baseurl" autocomplete="off" spellcheck="false" style="width:100%"
                  placeholder="Custom OpenAI-compatible base URL (optional)">
-          <div class="hint">Point the OpenAI provider at a custom OpenAI-compatible endpoint — a MiMo/Qwen host, a local vLLM/LM-Studio server, or OpenRouter <code>https://openrouter.ai/api/v1</code>. Blank = <code>api.openai.com</code>. The API key above is sent to this endpoint.</div>
+          <div class="hint">Point the OpenAI provider at a custom OpenAI-compatible endpoint — a MiMo/Qwen host, a local vLLM/LM-Studio server, or OpenRouter <code>https://openrouter.ai/api/v1</code>. Blank = <code>api.openai.com</code>. For <b>Ollama</b>, blank = <code>http://localhost:11434/v1</code> — set it only if Ollama runs on another host/port. The API key above (if any) is sent to this endpoint.</div>
           <label class="check" style="margin-top:8px"><input type="checkbox" id="noreason"> <span>Disable model reasoning (chain-of-thought). Needed for reasoning models like <b>MiMo</b> whose &ldquo;thinking&rdquo; can use up the token budget and truncate a batch (logged as &ldquo;no output&rdquo;). Leave off for non-reasoning models.</span></label>
         </div>
         <label class="check"><input type="checkbox" id="skip"> <span>Skip AI cleaning — run the deterministic stages only (no key needed). Tables will lack canonical drug names &amp; recovered cell lines.</span></label>
@@ -1148,9 +1570,9 @@ PAGE = r"""<!DOCTYPE html>
             </div>
             <input type="text" id="star_indexroot" placeholder="STAR_INDEX_ROOT (where a build-once index is written)" autocomplete="off" style="width:100%;margin-top:8px">
             <div class="row" style="margin-top:8px">
-              <input type="number" id="star_threads" placeholder="threads (6)" min="1" max="32">
+              <input type="number" id="star_threads" placeholder="threads (5)" min="1" max="32">
               <input type="number" id="star_mem" placeholder="mem MB (64000)" min="1000">
-              <input type="text" id="star_wall" placeholder="wall (24:00)">
+              <input type="text" id="star_wall" placeholder="wall — blank = queue max">
             </div>
           </details>
           <label class="sel" style="display:block;margin-top:10px"><input type="checkbox" id="bed_enable" checked> Then convert BAMs &rarr; AltAnalyze junction/exon BEDs (the BAM&rarr;BED stage, after STAR)</label>
@@ -1159,7 +1581,7 @@ PAGE = r"""<!DOCTYPE html>
             <div class="row" style="margin-top:8px">
               <input type="text" id="bed_species" placeholder="species (blank = auto from organism: Hs/Mm/Rn/Dr/Ss/Ma)" autocomplete="off">
               <input type="number" id="bed_mem" placeholder="mem MB (32000)" min="1000">
-              <input type="text" id="bed_wall" placeholder="wall (16:00)">
+              <input type="text" id="bed_wall" placeholder="wall — blank = queue max">
             </div>
             <div class="scope" id="bedmodesel" style="margin-top:8px">
               <label class="sel"><input type="radio" name="bedmode" value="intron" checked> Intron-retention (__intronJunction.bed)</label>
@@ -1169,10 +1591,10 @@ PAGE = r"""<!DOCTYPE html>
             <div class="hint">__junction.bed is always produced; this picks the BAMtoExonBED pass. Default is intron-retention (AltAnalyze's own default).</div>
           </details>
           <label class="sel" style="display:block;margin-top:10px"><input type="checkbox" id="psi_enable" checked> Then run AltAnalyze splicing (PSI) on the BEDs (the analysis stage, after BAM&rarr;BED)</label>
-          <div class="hint">Runs one AltAnalyze job over all the BEDs once BAM&rarr;BED finishes &mdash; a per-sample PSI table, plus a differential (dPSI) comparison when a 2-group split exists. AltAnalyze is found on the cluster (default the lab install) or uploaded only if it isn't there.</div>
+          <div class="hint">Runs one AltAnalyze job over all the BEDs once BAM&rarr;BED finishes &mdash; a per-sample PSI table, plus a differential (dPSI) comparison when a 2-group split exists. AltAnalyze is found on the cluster, else uploaded under PIPELINE_ROOT/altanalyze_home only if it isn't there.</div>
           <details class="adv" style="margin-top:8px"><summary>AltAnalyze (PSI) options</summary>
             <div class="row" style="margin-top:8px">
-              <input type="text" id="psi_home" placeholder="AltAnalyze home on cluster (blank = /data/salomonis2/software/AltAnalyze-91/AltAnalyze)" autocomplete="off">
+              <input type="text" id="psi_home" placeholder="AltAnalyze home on cluster (blank = auto: found on cluster, else uploaded under PIPELINE_ROOT/altanalyze_home)" autocomplete="off">
               <input type="text" id="psi_db" placeholder="AltDatabase path (blank = inside AltAnalyze home)" autocomplete="off">
             </div>
             <div class="row" style="margin-top:8px">
@@ -1182,8 +1604,16 @@ PAGE = r"""<!DOCTYPE html>
             <div class="row" style="margin-top:8px">
               <input type="text" id="psi_expname" placeholder="experiment name (blank = cell line)" autocomplete="off">
               <input type="number" id="psi_mem" placeholder="mem MB (128000)" min="1000">
-              <input type="text" id="psi_wall" placeholder="wall (10:00)">
+              <input type="text" id="psi_wall" placeholder="wall — blank = queue max">
             </div>
+            <label class="fld" style="margin-top:8px"><span class="lbl">When the AltAnalyze step finishes, compress remaining data</span>
+              <select id="psi_compress">
+                <option value="gzip">gzip &mdash; fast, widely readable (default)</option>
+                <option value="xz">LZMA2 (xz) &mdash; smaller, slower</option>
+                <option value="off">off &mdash; leave everything uncompressed</option>
+              </select>
+              <span class="hint">Compresses kept, still-uncompressed data (BEDs + AltAnalyze text outputs) to reclaim space once the run is done. Already-compressed files and BAMs are skipped.</span>
+            </label>
             <label class="sel" style="display:block;margin-top:8px"><input type="checkbox" id="psi_goelite"> Also run GO-Elite enrichment (needs the GO-Elite DB + R; only when a comparison runs)</label>
             <div class="hint">AltAnalyze runs as Python 2.7 + samtools + R on the cluster. Comparison groups default to the run table's treated-vs-control split.</div>
           </details>
@@ -1191,6 +1621,25 @@ PAGE = r"""<!DOCTYPE html>
             <div class="hint">Leave empty to auto-compare <b>drug-treated vs control</b> from the run-table metadata. To compare your OWN categories, add 2+ groups: a name, optional match keywords (comma-separated), and mark one as the control/baseline. Each sample is sorted by those keywords first, then the AI handles the rest from the full metadata row; samples that match no group are dropped from the comparison (the per-sample PSI table still covers everyone).</div>
             <div id="psigroups" style="margin-top:8px"></div>
             <button type="button" id="psi_addgroup" style="margin-top:6px;padding:4px 10px;cursor:pointer">+ Add group</button>
+          </details>
+          <label class="sel" style="display:block;margin-top:10px"><input type="checkbox" id="conc_enable" checked> Then score the drug PSI signatures against a cancer atlas (drug&ndash;cancer splicing concordance, after PSI)</label>
+          <details class="adv" style="margin-top:8px"><summary>Drug concordance options</summary>
+            <div class="hint">After AltAnalyze PSI, each drug's splicing signature is scored against a cancer-subtype atlas. Concordance <b>1</b> = the drug mimics the cancer subtype (bad), <b>0</b> = it reverses it (therapeutic); candidates fall below the threshold, ranked by overlapping splicing events and the subtype's patient count.</div>
+            <label class="fld" style="margin-top:8px"><span class="lbl">Cancer atlas</span>
+              <select id="conc_atlas">
+                <option value="auto">auto &mdash; from the cell line (MDS-L &rarr; AML/MDS, A549 &rarr; lung)</option>
+                <option value="aml_mds">AML/MDS (Leucegene OncoSplice subtypes)</option>
+                <option value="lung">Lung (TCGA LUAD + LUSC OncoSplice subtypes)</option>
+              </select>
+              <span class="hint">Auto-selected from the cell line via cancer_atlas_registry.json; pick one to override.</span>
+            </label>
+            <div style="margin-top:8px">
+              <input type="text" id="conc_dpsi" placeholder="dPSI cutoff (0.1)" autocomplete="off">
+              <input type="text" id="conc_rawp" placeholder="rawp cutoff (0.05)" autocomplete="off">
+              <input type="text" id="conc_thresh" placeholder="concordance threshold for candidates (0.3)" autocomplete="off">
+            </div>
+            <label class="sel" style="display:block;margin-top:8px"><input type="checkbox" id="conc_removeir"> Drop intron-retention events when scoring (&minus;&minus;removeIR)</label>
+            <div class="hint">Reuses the AltAnalyze install the PSI stage resolved (only its export/UI/unique modules). Results land in &lt;run&gt;/concordance/results/&lt;atlas&gt;/ranked_concordance_summary.txt.</div>
           </details>
           <div style="margin-top:12px">
             <div class="lbl" style="margin-bottom:4px">Disk cleanup</div>
@@ -1231,6 +1680,11 @@ PAGE = r"""<!DOCTYPE html>
               <input type="text" id="sshkey" placeholder="private key file (optional — else SSH agent/default)" autocomplete="off">
               <input type="password" id="sshpass" placeholder="password (optional; key/agent preferred)" autocomplete="off">
             </div>
+            <div class="row" style="margin-top:10px;align-items:center;gap:8px">
+              <input type="email" id="alertemail" placeholder="Alert email — get notified if a cluster stage STALLS (optional)" autocomplete="off" style="flex:1">
+              <button type="button" class="ghost" id="alerttest" style="white-space:nowrap">Send test</button>
+            </div>
+            <div class="hint">If a download/STAR/BED/PSI stage stalls, SpliceScout emails you (it polls every ~20&nbsp;min while running). Sent via the cluster&#39;s own <code>mail</code> — check spam on the first one. Blank = off.</div>
           </div>
           <details class="adv" style="margin-top:12px">
             <summary>Advanced cluster settings (config.sh)</summary>
@@ -1243,12 +1697,17 @@ PAGE = r"""<!DOCTYPE html>
               <input type="text" id="claspera" placeholder="aspera module (aspera/3.9.1)" autocomplete="off">
             </div>
             <div class="row" style="margin-top:10px">
-              <input type="number" id="clthreads" placeholder="THREADS (6)">
+              <input type="number" id="clthreads" placeholder="THREADS (5)">
               <input type="number" id="clmem" placeholder="MEM_MB (32000)">
-              <input type="text" id="clwall" placeholder="WALL (50:00)">
+              <input type="text" id="clwall" placeholder="WALL — blank = queue max">
               <input type="number" id="clpfmem" placeholder="PREFETCH_MEM_MB (132000)">
               <input type="text" id="cljob" value="__INSTANCE_TAG__" placeholder="JOB_TAG (auto per instance)" title="LSF job-name prefix. Defaults to this instance's name (the one you chose at launch, or an auto sra1/sra2/... if you left it blank) so concurrent projects' cluster jobs never collide. Edit if you want a different tag." autocomplete="off">
             </div>
+            <div class="row" style="margin-top:10px">
+              <input type="text" id="clmodelpath" placeholder="Diagnose-AI model .gguf (optional cluster path)" title="Optional: full path on the cluster to a specific GGUF model for the CPU diagnostic AI. Leave blank to use the shared install's model (auto-cached into each pipeline dir on first need)." autocomplete="off" style="flex:2">
+              <input type="text" id="clmodeldir" placeholder="model cache dir (optional)" title="Optional: a directory to cache the diagnose-AI model in so future runs reuse it. Blank = per-pipeline <PIPELINE_ROOT>/.splicescout_ai/models, auto-populated from the shared install." autocomplete="off" style="flex:1">
+            </div>
+            <div class="hint">Diagnose-AI model (optional). Blank uses the shared install's model and caches a copy into the pipeline dir so future runs reuse it. Set a path to point at a specific <code>.gguf</code>, or a cache dir to share one copy across stages.</div>
           </details>
         </div>
       </label>
@@ -1269,6 +1728,7 @@ PAGE = r"""<!DOCTYPE html>
 
       <div class="hint" style="margin-bottom:12px">Your entries (including API keys &amp; cluster info) are saved locally on this machine (<code>~/.geo_pipeline_settings.json</code>) so they auto-fill next time.</div>
       <button type="submit" class="primary" id="start">Start pipeline</button>
+      <button type="button" class="ghost" id="resume" title="Continue this instance's most recent run from where it stopped (finished stages are skipped). Use after a server restart, or to retry a stalled stage. Tip: if the AI proxy is down, switch the provider above (e.g. to Ollama) or tick Skip AI first, then Resume.">Resume last run</button>
       <div class="err" id="formErr" hidden></div>
     </form>
       </div><!-- /setupmain -->
@@ -1306,6 +1766,17 @@ PAGE = r"""<!DOCTYPE html>
   <!-- PLOTS -->
   <section id="plots" class="card" hidden>
     <div id="plotsbody"><div class="hint">Loading…</div></div>
+  </section>
+
+  <!-- ASSISTANT (chat) -->
+  <section id="chat" class="card" hidden>
+    <div id="chatlog" style="min-height:300px;max-height:60vh;overflow:auto;padding:4px 2px"></div>
+    <div id="chatwork" class="hint" hidden style="padding:4px 8px">the assistant is working…</div>
+    <div style="display:flex;gap:8px;margin-top:8px;align-items:flex-end">
+      <textarea id="chatbox" rows="2" placeholder="Ask me to set up a run, write a GEO query, chart your data, or check the cluster…" style="flex:1;resize:vertical;font-size:13.5px;padding:8px 10px;border-radius:10px;border:1px solid var(--line)"></textarea>
+      <button id="chatsend" class="primary" type="button">Send</button>
+    </div>
+    <div class="hint" style="margin-top:6px">I can fill the form, generate &amp; test the GEO query, run SQL/charts, and read local + cluster logs — but I never launch anything; you review the form and press Start. (Local Ollama is slow here; a cloud provider is much snappier for the assistant.)</div>
   </section>
 
   <footer class="pagefoot">
@@ -1365,22 +1836,91 @@ const LLM = __LLM_CONFIG__;
 const STAGE_DOCS = __STAGE_DOCS__;
 const INSTANCE_TAG = "__INSTANCE_TAG__";   // this server instance's cluster JOB_TAG (name chosen at launch, else sra1/sra2/...)
 const providerEl=$('#provider'), modelEl=$('#model'), keyhintEl=$('#keyhint');
+const baseurlEl=$('#baseurl'), modelMenuEl=$('#modelmenu'), modelDropEl=$('#modeldrop'), maxtokensEl=$('#maxtokens');
 let savedKeys = {};
-function rebuildModels(p){
-  const opts = (LLM.models[p]||[]);
-  $('#modellist').innerHTML = opts.map(m=>'<option value="'+m+'"></option>').join('');
+let modelHistory = {};   // {provider: [model ids, most-recent-first]} — editable, persisted, ✕-deletable
+let baseUrls = {};       // {provider: custom OpenAI-compatible base URL} — persisted per provider
+let modelTokens = {};    // {model id: max output tokens} — per-model AI output cap, persisted
+
+function syncMaxTokens(){ if(maxtokensEl) maxtokensEl.value = modelTokens[(modelEl.value||'').trim()] || ''; }
+function histFor(p){ if(!Array.isArray(modelHistory[p])) modelHistory[p]=[]; return modelHistory[p]; }
+function defaultModelFor(p){ return histFor(p)[0] || (LLM.models[p]||[])[0] || ''; }
+function addModelToHistory(p, m){
+  m=(m||'').trim(); if(!m) return;
+  const h=histFor(p); const i=h.indexOf(m); if(i>=0) h.splice(i,1);   // move-to-front (dedupe)
+  h.unshift(m); if(h.length>25) h.length=25;                          // cap the remembered list
 }
+function deleteModelFromHistory(p, m){
+  const h=histFor(p), i=h.indexOf(m);
+  if(i>=0){ h.splice(i,1); renderModelMenu(); persistModelMemory(); }
+}
+function commitModel(){ addModelToHistory(providerEl.value, modelEl.value); persistModelMemory(); syncMaxTokens(); }
+function _esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;'); }
+function renderModelMenu(){
+  const p=providerEl.value, h=histFor(p), sug=(LLM.models[p]||[]).filter(m=>h.indexOf(m)<0);
+  let html='';
+  if(h.length){
+    html += '<div style="font-size:11px;color:var(--mut);padding:3px 7px 4px">Used with '+_esc(LLM.labels[p]||p)+'</div>';
+    h.forEach(m=>{ html += '<div class="mrow" style="display:flex;align-items:center;gap:6px;padding:6px 7px;border-radius:7px">'
+      + '<span class="mpick" data-m="'+_esc(m)+'" style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer">'+_esc(m)+'</span>'
+      + '<span class="mdel" data-m="'+_esc(m)+'" title="Remove from history" style="color:var(--mut);cursor:pointer;padding:0 5px;border-radius:5px;font-weight:700">&#10005;</span></div>'; });
+  }
+  if(sug.length){
+    html += '<div style="font-size:11px;color:var(--mut);padding:6px 7px 4px;'+(h.length?'border-top:1px solid var(--line);margin-top:4px':'')+'">Suggested</div>';
+    sug.forEach(m=>{ html += '<div class="mpick mrow" data-m="'+_esc(m)+'" style="padding:6px 7px;border-radius:7px;cursor:pointer">'+_esc(m)+'</div>'; });
+  }
+  if(!html) html='<div style="font-size:12px;color:var(--mut);padding:7px">No models yet — type one above.</div>';
+  modelMenuEl.innerHTML=html;
+}
+function openModelMenu(){ renderModelMenu(); modelMenuEl.style.display='block'; }
+function closeModelMenu(){ modelMenuEl.style.display='none'; }
+modelDropEl.addEventListener('click', e=>{ e.preventDefault(); e.stopPropagation();
+  (modelMenuEl.style.display==='block') ? closeModelMenu() : openModelMenu(); });
+modelMenuEl.addEventListener('click', e=>{
+  const del=e.target.closest('.mdel');
+  if(del){ e.stopPropagation(); deleteModelFromHistory(providerEl.value, del.getAttribute('data-m')); return; }
+  const pick=e.target.closest('.mpick');
+  if(pick){ modelEl.value=pick.getAttribute('data-m'); commitModel(); closeModelMenu(); modelEl.focus(); }
+});
+modelMenuEl.addEventListener('mouseover', e=>{ const r=e.target.closest('.mrow'); if(r) r.style.background='var(--panel)'; });
+modelMenuEl.addEventListener('mouseout', e=>{ const r=e.target.closest('.mrow'); if(r) r.style.background=''; });
+document.addEventListener('click', e=>{ if(!e.target.closest('#modelcombo')) closeModelMenu(); });
+modelEl.addEventListener('change', commitModel);   // typed a model + Enter/blur -> remember it for this provider
 function syncProvider(){
   const p = providerEl.value;
-  rebuildModels(p);
-  modelEl.value = (LLM.models[p]||[''])[0] || '';   // default to the provider's first model (editable)
+  modelEl.value = defaultModelFor(p);                 // restore the last model used with this provider
+  syncMaxTokens();                                    // restore this model's saved max-tokens
+  if(baseurlEl) baseurlEl.value = baseUrls[p] || '';   // restore this provider's saved base URL
   akeyEl.value = savedKeys[p] || '';
   akeyEl.placeholder = LLM.keyHint[p] || 'API key';
   keyhintEl.textContent = 'Used for the AI cleaning passes. ' + (LLM.keyHint[p]||'');
-  const br=$('#baseurlrow'); if(br) br.style.display = (p==='openai') ? '' : 'none';  // custom endpoint = openai-format
+  const br=$('#baseurlrow'); if(br) br.style.display = (p==='openai') ? '' : 'none';  // base_url = OpenAI custom-endpoint only; Ollama is always local (localhost / OLLAMA_HOST)
+  closeModelMenu();
 }
 providerEl.addEventListener('change', syncProvider);
 akeyEl.addEventListener('input', ()=>{ savedKeys[providerEl.value] = akeyEl.value; });
+if(baseurlEl) baseurlEl.addEventListener('input', ()=>{ baseUrls[providerEl.value] = baseurlEl.value; });
+if(maxtokensEl) maxtokensEl.addEventListener('input', ()=>{
+  const m=(modelEl.value||'').trim(), v=maxtokensEl.value.trim();
+  if(!m) return;
+  if(v) modelTokens[m]=v; else delete modelTokens[m];   // blank -> fall back to the default
+});
+{ // alert email: persist on change + a "Send test" button (stall alerts are sent via the cluster's mail)
+  const ae=$('#alertemail');
+  if(ae) ae.addEventListener('change', ()=>{ try{ fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({alert_email:ae.value})}); }catch(ex){} });
+  const at=$('#alerttest');
+  if(at) at.onclick=async ()=>{ at.disabled=true; const old=at.textContent; at.textContent='Sending…';
+    try{ const r=await (await fetch('/api/alert_test',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({alert_email:(ae?ae.value:''), ssh_password:(($('#sshpass')||{}).value||'')})})).json();
+      alert(r.ok ? ('Test alert queued to '+r.email+'.\n'+(r.note||'')) : ('Could not send: '+(r.error||r.note||'unknown'))); }
+    catch(e){ alert('Send failed: '+e.message); }
+    finally{ at.disabled=false; at.textContent=old; } };
+}
+function persistModelMemory(){
+  try{ fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({provider:providerEl.value, model:modelEl.value, model_history:modelHistory,
+      base_urls:baseUrls, base_url:(baseurlEl?baseurlEl.value:''), model_max_tokens:modelTokens})}); }catch(ex){}
+}
 syncProvider();
 
 function syncPick(){
@@ -1493,6 +2033,7 @@ $('#form').addEventListener('submit', async e=>{
   e.preventDefault();
   const btn=$('#start'), err=$('#formErr');
   btn.disabled=true; err.hidden=true;
+  addModelToHistory(providerEl.value, modelEl.value);   // remember the model being launched for this provider
   const body={
     query: $('#query').value,
     scope: $('input[name=scope]:checked').value,
@@ -1503,9 +2044,15 @@ $('#form').addEventListener('submit', async e=>{
     api_keys: savedKeys,
     ncbi_key: $('#ncbi').value,
     model: modelEl.value,
-    base_url: (($('#baseurl')||{}).value || ''),
+    model_history: modelHistory,                 // persist per-provider model history across launches
+    base_urls: baseUrls,                         // persist per-provider base URLs across launches
+    model_max_tokens: modelTokens,               // per-model max output tokens for the AI cleaning calls
+    base_url: ((($('#provider')||{}).value==='openai') ? (($('#baseurl')||{}).value||'') : ''),  // base_url = the OpenAI custom-endpoint ONLY (Ollama is local; Gemini fixed)
     disable_reasoning: (($('#noreason')||{}).checked || false),
     concurrency: $('#conc').value,
+    alert_email: (($('#alertemail')||{}).value || ''),   // email on a cluster STALL (via the cluster's mail)
+    diagnose_model_path: (($('#clmodelpath')||{}).value || ''),  // optional .gguf path for the cluster CPU diagnostic AI
+    diagnose_model_dir: (($('#clmodeldir')||{}).value || ''),    // optional shared model-cache dir for the diagnostic AI
     deep_dive: true,
     start_stage: ((CHECKPOINTS[startIdx]||{}).stage || 'fetch'),
     end_stage: ((CHECKPOINTS[endIdx]||{}).end_stage || 'psi_submit'),
@@ -1525,7 +2072,12 @@ $('#form').addEventListener('submit', async e=>{
            ALTANALYZE_HOME:(($('#psi_home')||{}).value||''), ALTANALYZE_DB:(($('#psi_db')||{}).value||''),
            ALTANALYZE_LOCAL:(($('#psi_local')||{}).value||''), SPECIES:(($('#psi_species')||{}).value||''),
            EXPNAME:(($('#psi_expname')||{}).value||''), MEM_MB:(($('#psi_mem')||{}).value||''),
-           WALL:(($('#psi_wall')||{}).value||''), RUN_GOELITE:((($('#psi_goelite')||{}).checked)?'1':'0') },
+           WALL:(($('#psi_wall')||{}).value||''), RUN_GOELITE:((($('#psi_goelite')||{}).checked)?'1':'0'),
+           COMPRESS_WHEN_DONE:(($('#psi_compress')||{}).value||'gzip') },
+    concordance: { enabled:((($('#conc_enable')||{}).checked)?'1':'0'),
+           CANCER_ATLAS:(($('#conc_atlas')||{}).value||'auto'), DPSI:(($('#conc_dpsi')||{}).value||''),
+           RAWP:(($('#conc_rawp')||{}).value||''), CONC_THRESHOLD:(($('#conc_thresh')||{}).value||''),
+           REMOVE_IR:((($('#conc_removeir')||{}).checked)?'1':'0') },
     groups: { groups: (typeof collectGroups==='function'?collectGroups():[]) },
     cluster_mode: document.querySelector('input[name=clmode]:checked').value,
     cluster: {
@@ -1547,6 +2099,29 @@ $('#form').addEventListener('submit', async e=>{
     $('#results').hidden=true; $('#newrun').hidden=true; $('#banner').innerHTML='';
     startPolling();
   }catch(ex){ err.textContent=ex.message; err.hidden=false; btn.disabled=false; }
+});
+
+$('#resume').addEventListener('click', async ()=>{
+  const rb=$('#resume'), err=$('#formErr');
+  rb.disabled=true; err.hidden=true;
+  // pass the current AI settings as OVERRIDES so a resume can switch provider (e.g. proxy down -> Ollama),
+  // toggle Skip AI, or supply a fresh SSH password; everything else comes from the run's saved config.json.
+  const body={
+    provider: (($('#provider')||{}).value||''),
+    model: (($('#model')||{}).value||''),
+    base_url: (((($('#provider')||{}).value)==='openai') ? (($('#baseurl')||{}).value||'') : ''),
+    disable_reasoning: (($('#noreason')||{}).checked||false),
+    skip_ai: (($('#skip')||{}).checked||false),
+    ssh_password: (($('#sshpass')||{}).value||''),
+  };
+  try{
+    const r=await fetch('/api/resume',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const j=await r.json();
+    if(!r.ok) throw new Error(j.error||'Could not resume.');
+    $('#setup').hidden=true; $('#run').hidden=false;
+    $('#results').hidden=true; $('#newrun').hidden=true; $('#banner').innerHTML='';
+    startPolling();
+  }catch(ex){ err.textContent=ex.message; err.hidden=false; rb.disabled=false; }
 });
 
 $('#newrun').addEventListener('click', ()=>{
@@ -1767,14 +2342,17 @@ function renderAiFix(s){
   if(box.dataset.built==='1') return;          // don't clobber what the user is typing each poll
   const d=s.ai_prompt.diagnosis||{}, c=s.ai_prompt.current||{};
   box.innerHTML =
-      '<div class="banner err">AI cleaning can\'t start — '+esc(d.title||'unknown')+'</div>'
+      '<div class="banner err">AI cleaning paused — '+esc(d.title||'unknown')+'</div>'
     + '<div class="hint" style="margin:-6px 0 14px">'+esc(d.detail||'')
-    + ' Fix the details below and retry, or turn AI off to run the deterministic pipeline.</div>'
+    + ' Fix the details below and retry (a mid-run outage resumes from where it stopped — only the '
+    + 'unanswered batches re-run), or turn AI off to finish deterministically.</div>'
     + '<label class="fld" style="margin-bottom:10px"><span class="lbl" style="font-size:13px">Provider</span>'
     + '<select id="af_prov"><option value="anthropic">Anthropic (Claude)</option>'
-    + '<option value="openai">OpenAI (ChatGPT)</option><option value="gemini">Google Gemini</option></select></label>'
+    + '<option value="openai">OpenAI (ChatGPT)</option><option value="gemini">Google Gemini</option><option value="ollama">Ollama (local)</option></select></label>'
     + '<label class="fld" style="margin-bottom:10px"><span class="lbl" style="font-size:13px">Model</span>'
     + '<input id="af_model" type="text" value="'+esc(c.model||'')+'" autocomplete="off"></label>'
+    + '<label class="fld" id="af_baseurlrow" style="margin-bottom:10px"><span class="lbl" style="font-size:13px">Base URL (OpenAI-compatible endpoint — blank = api.openai.com)</span>'
+    + '<input id="af_baseurl" type="text" value="'+esc(c.base_url||'')+'" placeholder="https://openrouter.ai/api/v1" autocomplete="off"></label>'
     + '<label class="fld" style="margin-bottom:10px"><span class="lbl" style="font-size:13px">API key (blank = keep current)</span>'
     + '<input id="af_key" type="password" value="" autocomplete="off"></label>'
     + '<div style="display:flex;gap:10px;margin-top:4px">'
@@ -1782,13 +2360,43 @@ function renderAiFix(s){
     + '<button class="ghost" id="afSkip">Turn off AI — run without it</button></div>';
   box.hidden=false; box.dataset.built='1';
   const sel=$('#af_prov'); if(sel && c.provider) sel.value=c.provider;
+  syncAfProvider(true);                       // toggle the base-URL row + prefill it from per-provider memory
+  if(sel) sel.addEventListener('change', ()=>syncAfProvider(false));
   $('#afRetry').onclick=()=>postAiRetry(false);
   $('#afSkip').onclick=()=>postAiRetry(true);
 }
+// Base URL is the OpenAI custom-endpoint (honored for OpenAI; ignored by local Ollama, which uses OLLAMA_HOST) -> show it for OpenAI only.
+function syncAfProvider(initial){
+  const p=$('#af_prov').value, row=$('#af_baseurlrow'); if(!row) return;
+  row.style.display=(p==='openai')?'':'none';
+  if(!initial){                               // user switched provider -> load that provider's remembered model + base URL
+    $('#af_model').value   = defaultModelFor(p);
+    $('#af_baseurl').value = baseUrls[p] || '';
+  }else if(p==='openai' && !$('#af_baseurl').value && baseUrls[p]){
+    $('#af_baseurl').value = baseUrls[p];      // first render with no run base_url -> show a remembered endpoint
+  }
+}
 async function postAiRetry(skip){
   const box=$('#aifix');
-  const body = skip ? {action:'skip_ai'}
-    : {provider:$('#af_prov').value, model:$('#af_model').value, api_key:$('#af_key').value};
+  let body;
+  if(skip){
+    body={action:'skip_ai'};
+  }else{
+    const prov=$('#af_prov').value, model=$('#af_model').value.trim(),
+          key=$('#af_key').value, bu=($('#af_baseurl')?$('#af_baseurl').value.trim():'');
+    body={provider:prov, model:model, api_key:key, base_url:bu};
+    // remember what was entered in the SAME per-provider store the launch form uses, then persist it
+    if(model) addModelToHistory(prov, model);
+    baseUrls[prov]=bu;
+    if(key) savedKeys[prov]=key;                          // blank key = keep the current one (don't overwrite)
+    providerEl.value=prov; modelEl.value=model||defaultModelFor(prov);   // reflect the fix on the launch form too
+    if(baseurlEl) baseurlEl.value=bu;
+    const br=$('#baseurlrow'); if(br) br.style.display=(prov==='openai')?'':'none';
+    const persist={provider:prov, model:model||defaultModelFor(prov),
+      model_history:modelHistory, base_urls:baseUrls, base_url:bu, model_max_tokens:modelTokens};
+    if(key) persist.api_keys=savedKeys;                   // only persist keys when one was entered (avoid wiping on a key-stripped bind)
+    try{ fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(persist)}); }catch(ex){}
+  }
   box.innerHTML='<div class="banner pick">'+(skip?'Turning off AI…':'Retrying AI…')+'</div>';
   box.dataset.built='1';
   try{ await fetch('/api/ai_retry',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); }catch(e){}
@@ -1807,10 +2415,12 @@ function closeDoc(){ $('#docmodal').hidden=true; }
 
 // ---- tabs (Run | Plots) ----
 function showTab(t){
-  $('#runtab').hidden = (t==='plots');
+  $('#runtab').hidden = (t!=='run');
   $('#plots').hidden  = (t!=='plots');
-  $('#tabRun').classList.toggle('on', t!=='plots');
+  $('#chat').hidden   = (t!=='chat');
+  $('#tabRun').classList.toggle('on', t==='run');
   $('#tabPlots').classList.toggle('on', t==='plots');
+  $('#tabAssistant').classList.toggle('on', t==='chat');
   if(t==='plots') openPlots();
 }
 function maybeRevealPlots(s){
@@ -1818,6 +2428,102 @@ function maybeRevealPlots(s){
     || (s.stages||[]).some(st=>(st.key==='cellline_match'||st.key==='runtable_annotate') && st.status==='done'));
   if(ready) $('#tabPlots').hidden=false;
 }
+
+// ============================ Assistant (chat) ============================
+let CHAT=[]; let CHAT_BUSY=false;
+try{ CHAT = JSON.parse(sessionStorage.getItem('ss_chat')||'[]')||[]; }catch(e){ CHAT=[]; }
+function chatSave(){ try{ sessionStorage.setItem('ss_chat', JSON.stringify(CHAT)); }catch(e){} }
+function fmtSQL(s){
+  return (s||'').replace(/\b(select|from|where|group by|order by|having|inner join|left join|right join|join|on|and|or|as|limit|offset|count|sum|avg|min|max|distinct|with|case|when|then|else|end|desc|asc|like|in|not|null|is|union|all|between)\b/gi, m=>m.toUpperCase());
+}
+function codeBlock(lang, code){
+  let body=code;
+  if(lang==='json'){ try{ body=JSON.stringify(JSON.parse(code), null, 2); }catch(e){} }
+  else if(lang==='sql'){ body=fmtSQL(code.trim()); }
+  const id='cb'+Math.random().toString(36).slice(2);
+  return '<div style="position:relative;margin:8px 0">'
+    +'<div style="font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:var(--mut);margin-bottom:2px">'+esc(lang||'code')+'</div>'
+    +'<button type="button" class="copybtn ghost" data-cb="'+id+'" style="position:absolute;top:16px;right:6px;font-size:10px;padding:1px 7px">copy</button>'
+    +'<pre style="margin:0;background:var(--panel,#f6f6f4);border:1px solid var(--line);border-radius:8px;padding:10px 12px;overflow:auto;font-size:12.5px"><code id="'+id+'">'+esc(body)+'</code></pre></div>';
+}
+function mdInline(s){
+  return esc(s)
+    .replace(/`([^`]+)`/g,'<code style="background:var(--line);padding:1px 4px;border-radius:4px;font-size:12.5px">$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g,'<b>$1</b>')
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g,'<a href="$2" target="_blank">$1</a>');
+}
+function mdToHtml(text){
+  const parts=(text||'').replace(/\r/g,'').split('```'); let html='';
+  for(let i=0;i<parts.length;i++){
+    if(i%2===1){
+      const seg=parts[i], nl=seg.indexOf('\n');
+      const lang=(nl>=0?seg.slice(0,nl):'').trim().toLowerCase();
+      html+=codeBlock(lang, (nl>=0?seg.slice(nl+1):seg).replace(/\n$/,''));
+    } else {
+      const lines=parts[i].split('\n'); let inList=false, buf='';
+      for(const ln of lines){
+        if(/^\s*[-*]\s+/.test(ln)){ if(!inList){buf+='<ul style="margin:4px 0 4px 18px;padding:0">';inList=true;} buf+='<li style="margin:2px 0">'+mdInline(ln.replace(/^\s*[-*]\s+/,''))+'</li>'; }
+        else { if(inList){buf+='</ul>';inList=false;} if(ln.trim()) buf+='<div style="margin:3px 0">'+mdInline(ln)+'</div>'; }
+      }
+      if(inList) buf+='</ul>';
+      html+=buf;
+    }
+  }
+  return html;
+}
+function chatBubble(role, inner){
+  const me=role==='user';
+  return '<div style="display:flex;justify-content:'+(me?'flex-end':'flex-start')+';margin:8px 0">'
+    +'<div style="max-width:88%;padding:9px 12px;border-radius:12px;font-size:13.5px;line-height:1.5;'
+    +(me?'background:var(--accent,#534ab7);color:#fff':'background:var(--panel,#f6f6f4);border:1px solid var(--line)')+'">'
+    +inner+'</div></div>';
+}
+function renderChat(){
+  const log=$('#chatlog'); if(!log) return;
+  if(!CHAT.length){ log.innerHTML='<div class="hint" style="text-align:center;padding:24px 10px">Hi! Tell me what you want to study and I\'ll set up the run, write &amp; test the GEO query, answer questions, chart your data, or read the cluster logs.<br><br><i>e.g. "Find human RNA-seq drug-treatment studies and set it up."</i></div>'; return; }
+  let html='';
+  CHAT.forEach((m,i)=>{
+    if(m.role==='user'){ html+=chatBubble('user', esc(m.content)); return; }
+    let inner=mdToHtml(m.content);
+    if(m._figs&&m._figs.length) inner+='<div id="cc'+i+'"></div>';
+    if(m._tools&&m._tools.length) inner+='<div style="margin-top:6px;font-size:11px;color:var(--mut)">used: '+m._tools.map(esc).join(', ')+'</div>';
+    html+=chatBubble('assistant', inner);
+  });
+  log.innerHTML=html;
+  CHAT.forEach((m,i)=>{ if(m._figs&&m._figs.length){ ensurePlotly().then(()=>{
+    const host=document.getElementById('cc'+i); if(!host) return; host.innerHTML='';
+    m._figs.forEach(fig=>{ const d=document.createElement('div'); d.style.margin='8px 0'; host.appendChild(d);
+      try{ Plotly.newPlot(d, fig.data||[], Object.assign({autosize:true,margin:{t:36,r:12,b:48,l:52}}, fig.layout||{}), {displayModeBar:false,responsive:true}); }catch(e){} });
+  }).catch(()=>{}); } });
+  log.scrollTop=log.scrollHeight;
+}
+async function sendChat(){
+  const box=$('#chatbox'); if(!box) return; const text=box.value.trim();
+  if(!text||CHAT_BUSY) return;
+  CHAT.push({role:'user',content:text}); box.value=''; chatSave(); renderChat();
+  CHAT_BUSY=true; $('#chatwork').hidden=false; $('#chatsend').disabled=true;
+  try{
+    const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({messages:CHAT.map(m=>({role:m.role,content:m.content}))})});
+    const d=await r.json();
+    const msg={role:'assistant',content:d.reply||d.error||'(no reply)'};
+    if(d.charts&&d.charts.length) msg._figs=d.charts;
+    if(d.trace&&d.trace.length) msg._tools=d.trace.map(t=>t.tool);
+    CHAT.push(msg); chatSave(); renderChat();
+    if(d.settings_changed&&Object.keys(d.settings_changed).length){
+      try{ applySettings(await (await fetch('/api/settings')).json()); }catch(e){}
+      const log=$('#chatlog');
+      log.insertAdjacentHTML('beforeend','<div style="text-align:center;margin:6px 0"><span style="border:1px solid var(--line);color:var(--mut);font-size:11px;padding:3px 10px;border-radius:10px">&#10003; updated the form: '+esc(Object.keys(d.settings_changed).join(', '))+'</span></div>');
+      log.scrollTop=log.scrollHeight;
+    }
+  }catch(ex){ CHAT.push({role:'assistant',content:'Sorry — the request failed: '+(ex&&ex.message||String(ex))}); chatSave(); renderChat(); }
+  finally{ CHAT_BUSY=false; $('#chatwork').hidden=true; $('#chatsend').disabled=false; }
+}
+document.addEventListener('click', e=>{
+  const b = e.target.closest && e.target.closest('.copybtn'); if(!b) return;
+  const el=document.getElementById(b.getAttribute('data-cb'));
+  if(el&&navigator.clipboard){ navigator.clipboard.writeText(el.textContent); b.textContent='copied'; setTimeout(()=>{b.textContent='copy';},1200); }
+});
 
 // ---- Plots tab (Plotly, vendored at /plotly.js; loaded lazily on first open) ----
 let PLOTDATA=null, _plotlyStarted=false;
@@ -1879,15 +2585,15 @@ function plotLayout(title, extra){
     paper_bgcolor:'rgba(0,0,0,0)', plot_bgcolor:'rgba(0,0,0,0)', font:{color:'#9aa6c0'},
     autosize:true, height:360, margin:{l:90,r:20,t:42,b:46},
     legend:{font:{color:'#9aa6c0'},orientation:'h',y:-0.18},
-    xaxis:{gridcolor:'#2b3450',zerolinecolor:'#2b3450',automargin:true},
-    yaxis:{gridcolor:'#2b3450',zerolinecolor:'#2b3450',automargin:true} }, extra||{});
+    xaxis:{gridcolor:'#2b2b31',zerolinecolor:'#2b2b31',automargin:true},
+    yaxis:{gridcolor:'#2b2b31',zerolinecolor:'#2b2b31',automargin:true} }, extra||{});
 }
 function iqrBox(id, vals, labels, title){
   if(!vals.filter(v=>v!=null).length){ $('#'+id).innerHTML='<div class="hint">No data.</div>'; return; }
   Plotly.newPlot(id, [{ x:vals, type:'box', boxpoints:'all', jitter:0.5, pointpos:0, orientation:'h',
-    marker:{color:'#5b8cff',size:5,opacity:.55}, line:{color:'#7c5bff'}, fillcolor:'rgba(91,140,255,.12)',
+    marker:{color:'#5fb6c0',size:5,opacity:.6}, line:{color:'#5fb6c0'}, fillcolor:'rgba(95,182,192,.12)',
     text:labels, hovertemplate:'%{text}<br>%{x}<extra></extra>', name:'' }],
-    plotLayout(title,{height:210,yaxis:{showticklabels:false,gridcolor:'#2b3450',zerolinecolor:'#2b3450'}}), PCONF);
+    plotLayout(title,{height:210,yaxis:{showticklabels:false,gridcolor:'#2b2b31',zerolinecolor:'#2b2b31'}}), PCONF);
 }
 function renderStudyCharts(gse){
   const rows=(PLOTDATA.samples||[]).filter(s=>s.study===gse);
@@ -2031,7 +2737,14 @@ function renderClusterStatus(d, panelId){
   const host=$('#'+panelId), ov=d.overall||{};
   const hist=clstatRecord(d), eta=clstatEta(d, hist);   // refine the ETA from every check
   const tag = d.job_tag ? ' ('+esc(d.job_tag)+')' : '';
-  let h='<div class="banner '+(d.complete?'ok':(d.stalled?'err':'pick'))+'">'
+  let h='';
+  if(d.alerts && d.alerts.length){   // cross-stage STALL alert (surfaces a silent downstream stall RED)
+    h += '<div class="err" style="font-weight:600;padding:8px 10px;border-radius:8px;margin-bottom:8px">⚠ '
+       + d.alerts.length+' stage'+(d.alerts.length>1?'s':'')+' STALLED / failed — needs attention:'
+       + d.alerts.map(a=>'<div style="font-weight:400;font-size:12.5px;margin-top:3px">• <b>'+esc(a.stage)+'</b> '+esc(a.kind)+' <span style="color:var(--mut)">('+esc(a.when)+')</span></div>').join('')
+       + '<div style="font-weight:400;font-size:11.5px;margin-top:5px;color:var(--mut)">A stalled stage does NOT auto-advance — fix + re-arm it (or ask the Assistant: &ldquo;is anything stuck?&rdquo;).</div></div>';
+  }
+  h+='<div class="banner '+(d.complete?'ok':(d.stalled?'err':'pick'))+'">'
     + (d.complete?'✓ Cluster pipeline complete':(d.stalled?'⚠ Watchdog stopped (stalled)':'Cluster progress'))+tag
     + (ov.exp!=null?' &mdash; '+ov.converted+' converted &middot; '+ov.downloaded+' downloaded / '+ov.exp+' runs ('+ov.pct+'%)':'')
     + (d.live_jobs!=null?' &middot; '+d.live_jobs+' active jobs':'')
@@ -2058,6 +2771,25 @@ function renderClusterStatus(d, panelId){
        + bphase + (bo.exp?' &mdash; '+bo.done+' / '+bo.exp+' BED pairs ('+bo.pct+'%)':'')
        + (b.live_jobs!=null?' &middot; '+b.live_jobs+' jobs':'')
        + (b.eta_seconds!=null&&!b.complete?' &middot; ~'+fmtDur(b.eta_seconds)+' left':'') + '</div>';
+  }
+  if(d.psi){
+    const p=d.psi;
+    const pphase = p.complete ? '✓ AltAnalyze PSI complete'
+      : p.stalled ? '⚠ AltAnalyze PSI stalled'
+      : p.launch_pending ? 'AltAnalyze PSI queued — waiting for BAM&rarr;BED'
+      : p.job_running ? 'AltAnalyze PSI running' : 'AltAnalyze PSI';
+    h += '<div class="banner '+(p.complete?'ok':(p.stalled?'err':'pick'))+'" style="margin-top:6px">'
+       + pphase + (p.live_jobs!=null?' &middot; '+p.live_jobs+' jobs':'') + '</div>';
+  }
+  if(d.concordance){
+    const c=d.concordance;
+    const cphase = c.complete ? '✓ Drug concordance complete'
+      : c.stalled ? '⚠ Drug concordance stalled'
+      : c.launch_pending ? 'Drug concordance queued — waiting for PSI'
+      : c.job_running ? 'Drug concordance scoring' : 'Drug concordance';
+    h += '<div class="banner '+(c.complete?'ok':(c.stalled?'err':'pick'))+'" style="margin-top:6px">'
+       + cphase + (c.n_atlases!=null&&c.n_atlases>0?' &mdash; '+c.n_atlases+' atlas result(s)':'')
+       + (c.live_jobs!=null?' &middot; '+c.live_jobs+' jobs':'') + '</div>';
   }
   if(ov.exp){ h+='<div class="obar" title="solid = converted, faint = downloaded" style="margin-bottom:4px;position:relative">'
     + '<span style="width:'+(ov.dl_pct||0)+'%;opacity:.30"></span>'
@@ -2094,11 +2826,15 @@ function applySettings(s){
   if(s.skip_ai!=null){ skipEl.checked=!!s.skip_ai; akeyEl.disabled=skipEl.checked; akeyEl.style.opacity=skipEl.checked?.5:1; }
   if(s.provider){ providerEl.value = s.provider; }
   savedKeys = Object.assign({}, s.api_keys || {});
-  syncProvider();   // rebuild model suggestions + fill the key for the chosen provider
-  if(s.model) modelEl.value = s.model;   // restore any saved model (editable — custom strings too)
-  setVal('baseurl', s.base_url);         // restore a saved custom OpenAI-compatible endpoint
+  modelHistory = Object.assign({}, s.model_history || {});
+  baseUrls = Object.assign({}, s.base_urls || {});
+  modelTokens = Object.assign({}, s.model_max_tokens || {});
+  if(s.provider && s.model){ const h=histFor(s.provider); if(h.indexOf(s.model)<0) h.unshift(s.model); }  // back-compat: seed from the legacy single model
+  if(s.provider && s.base_url && baseUrls[s.provider]==null) baseUrls[s.provider]=s.base_url;             // and the legacy single base_url
+  syncProvider();   // restores model + base_url + key for the chosen provider from the per-provider memory
   if(s.disable_reasoning!=null && $('#noreason')) $('#noreason').checked = !!s.disable_reasoning;
-  setVal('ncbi', s.ncbi_key); setVal('conc', s.concurrency);
+  setVal('ncbi', s.ncbi_key); setVal('conc', s.concurrency); setVal('alertemail', s.alert_email);
+  setVal('clmodelpath', s.diagnose_model_path); setVal('clmodeldir', s.diagnose_model_dir);
   if(s.pick_mode){ const r=document.querySelector('input[name=pick][value="'+s.pick_mode+'"]'); if(r) r.checked=true; }
   if(s.module){ const r=document.querySelector('input[name=module][value="'+s.module+'"]'); if(r) r.checked=true; }
   if(s.cluster_mode){ const r=document.querySelector('input[name=clmode][value="'+s.cluster_mode+'"]'); if(r) r.checked=true; }
@@ -2125,6 +2861,12 @@ function applySettings(s){
   setVal('psi_species', ps.SPECIES); setVal('psi_expname', ps.EXPNAME); setVal('psi_mem', ps.MEM_MB); setVal('psi_wall', ps.WALL);
   if($('#psi_enable') && ps.enabled!=null) $('#psi_enable').checked = (String(ps.enabled)!=='0');
   if($('#psi_goelite') && ps.RUN_GOELITE!=null) $('#psi_goelite').checked = (String(ps.RUN_GOELITE)==='1');
+  if($('#psi_compress') && ps.COMPRESS_WHEN_DONE) $('#psi_compress').value = ps.COMPRESS_WHEN_DONE;
+  const cc=s.concordance||{};
+  setVal('conc_dpsi', cc.DPSI); setVal('conc_rawp', cc.RAWP); setVal('conc_thresh', cc.CONC_THRESHOLD);
+  if($('#conc_atlas') && cc.CANCER_ATLAS) $('#conc_atlas').value = cc.CANCER_ATLAS;
+  if($('#conc_enable') && cc.enabled!=null) $('#conc_enable').checked = (String(cc.enabled)!=='0');
+  if($('#conc_removeir') && cc.REMOVE_IR!=null) $('#conc_removeir').checked = (String(cc.REMOVE_IR)==='1');
   const pg=(s.groups&&s.groups.groups)||[];
   if(pg.length && $('#psigroups') && typeof addGroupRow==='function'){ $('#psigroups').innerHTML='';
     pg.forEach(g=>addGroupRow(g.name||'', (g.keywords||[]).join(', '), g.control)); }
@@ -2138,8 +2880,23 @@ function applySettings(s){
 }
 
 // resume an in-flight (or finished) run if the page is reloaded
+function shutdownServer(){
+  if(!confirm('Shut down the SpliceScout server? This closes the local web UI. Any cluster runs you already launched keep going on their own (they are self-driving).')) return;
+  var b=document.getElementById('shutdownBtn'); if(b){ b.disabled=true; b.textContent='Shutting down...'; }
+  fetch('/api/shutdown',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})
+    .then(function(){ setTimeout(_stopped,400); }).catch(function(){ setTimeout(_stopped,400); });
+  function _stopped(){
+    document.body.innerHTML='<div style="max-width:680px;margin:18vh auto;text-align:center;font:16px/1.6 system-ui,Segoe UI,Arial,sans-serif;color:#e7ecf5"><h1 style="font-size:22px">SpliceScout server stopped</h1><p style="color:#9aa6c0">You can close this tab. Cluster runs you launched keep going on their own. Relaunch SpliceScout to use the UI again.</p></div>';
+  }
+}
+(function(){var b=document.getElementById('shutdownBtn'); if(b) b.addEventListener('click', shutdownServer);})();
+
 (async function init(){
   $('#tabRun').onclick=()=>showTab('run'); $('#tabPlots').onclick=()=>showTab('plots');
+  $('#tabAssistant').onclick=()=>showTab('chat');
+  $('#chatsend').onclick=sendChat;
+  $('#chatbox').addEventListener('keydown',e=>{ if(e.key==='Enter'&&!e.shiftKey){ e.preventDefault(); sendChat(); } });
+  renderChat();
   $('#clCheckBtn').onclick=()=>fetchClusterStatus('clusterstatus2');
   $('#docClose').onclick=closeDoc;
   $('#docmodal').onclick=(e)=>{ if(e.target.id==='docmodal') closeDoc(); };
@@ -2153,6 +2910,59 @@ function applySettings(s){
       if(s.state==='running') startPolling();
     }
   }catch(ex){}
+})();
+</script>
+<script>
+/* DNA background: floating helix glyphs that drift + spin and react to the mouse (repel, brighten, spin). */
+(function(){
+  var cv=document.getElementById('dnafx'); if(!cv||!cv.getContext) return;
+  var ctx=cv.getContext('2d'), W=0,H=0, DPR=Math.min(window.devicePixelRatio||1,2);
+  var DNA=String.fromCodePoint(0x1F9EC);  /* the dna emoji U+1F9EC, built from its code point (pure ASCII) */
+  var parts=[], mouse={x:-1e4,y:-1e4}, raf=0;
+  function rnd(a,b){return a+Math.random()*(b-a);}
+  function mk(){return {x:rnd(0,Math.max(W,1)),y:rnd(0,Math.max(H,1)),
+    vx:rnd(-0.25,0.25),vy:rnd(-0.25,0.25),sz:rnd(16,40),
+    rot:rnd(0,6.283),vr:rnd(-0.01,0.01),op:rnd(0.04,0.12)};}
+  function resize(){
+    W=window.innerWidth; H=window.innerHeight;
+    cv.width=Math.floor(W*DPR); cv.height=Math.floor(H*DPR);
+    cv.style.width=W+'px'; cv.style.height=H+'px';
+    ctx.setTransform(DPR,0,0,DPR,0,0);
+    var n=Math.max(14,Math.min(64,Math.round(W*H/24000)));  /* density scales with screen area */
+    while(parts.length<n) parts.push(mk());
+    if(parts.length>n) parts.length=n;
+  }
+  function frame(){
+    ctx.clearRect(0,0,W,H);
+    var R=180, R2=R*R, mx=1.9;
+    for(var i=0;i<parts.length;i++){
+      var p=parts[i], dx=p.x-mouse.x, dy=p.y-mouse.y, d2=dx*dx+dy*dy, near=d2<R2;
+      if(near){ var d=Math.sqrt(d2)||1, f=(1-d/R)*0.9;
+        p.vx+=(dx/d)*f; p.vy+=(dy/d)*f; p.vr+=(dx>0?1:-1)*0.004*f; }    /* repel + extra spin near cursor */
+      p.vx+=rnd(-0.012,0.012); p.vy+=rnd(-0.012,0.012);                 /* ambient drift */
+      p.vx*=0.95; p.vy*=0.95;                                           /* friction -> settle back to a float */
+      p.vx=Math.max(-mx,Math.min(mx,p.vx)); p.vy=Math.max(-mx,Math.min(mx,p.vy));
+      p.x+=p.vx; p.y+=p.vy; p.rot+=p.vr; p.vr*=0.99;
+      var m=p.sz;
+      if(p.x<-m)p.x=W+m; else if(p.x>W+m)p.x=-m;
+      if(p.y<-m)p.y=H+m; else if(p.y>H+m)p.y=-m;
+      var op=p.op; if(near) op=Math.min(0.30,p.op+(1-Math.sqrt(d2)/R)*0.26);  /* brighten slightly near cursor */
+      ctx.save(); ctx.translate(p.x,p.y); ctx.rotate(p.rot); ctx.globalAlpha=op;
+      ctx.filter='grayscale(1) brightness(1.7)';   /* matte: desaturate the emoji to a faint monochrome texture */
+      ctx.font=p.sz+'px "Segoe UI Emoji","Apple Color Emoji","Noto Color Emoji",system-ui,sans-serif';
+      ctx.textAlign='center'; ctx.textBaseline='middle';
+      ctx.fillText(DNA,0,0); ctx.restore();
+    }
+    ctx.globalAlpha=1; raf=requestAnimationFrame(frame);
+  }
+  window.addEventListener('resize',resize,{passive:true});
+  window.addEventListener('mousemove',function(e){mouse.x=e.clientX;mouse.y=e.clientY;},{passive:true});
+  window.addEventListener('mouseout',function(){mouse.x=-1e4;mouse.y=-1e4;},{passive:true});
+  document.addEventListener('visibilitychange',function(){           /* don't burn CPU on a hidden tab */
+    if(document.hidden){ if(raf) cancelAnimationFrame(raf); raf=0; }
+    else if(!raf){ raf=requestAnimationFrame(frame); }
+  });
+  resize(); frame();
 })();
 </script>
 </body>

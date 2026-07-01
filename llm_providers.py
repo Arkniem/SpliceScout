@@ -2,38 +2,56 @@
 """
 Provider-agnostic structured LLM calls for the AI cleaning passes + the cell-line matcher.
 
-Three providers behind one async `classify()`:
+Four providers behind one async `classify()`:
   - anthropic : AsyncAnthropic, forced tool-use (+ prompt caching)
   - openai    : AsyncOpenAI chat.completions, forced function-call
   - gemini    : the SAME AsyncOpenAI SDK pointed at Google's OpenAI-compatible endpoint
+  - ollama    : the SAME AsyncOpenAI SDK pointed at a LOCAL Ollama server (no API key; default
+                http://localhost:11434/v1, override via the OLLAMA_HOST env var). Use a tool-capable
+                model (llama3.1 / llama3.2 / qwen2.5 / mistral-nemo / ...) for the structured passes.
 
 Each call takes a `tool` = {name, description, input_schema} whose input_schema is an object with a
 `results` array, and returns (results_list, usage_dict). The OpenAI/Gemini path defensively falls
 back to parsing JSON from the message content if a model returns the object inline instead of as a
 tool call.
 
-API keys (env): ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY (or GOOGLE_API_KEY).
+API keys (env): ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY (or GOOGLE_API_KEY). Ollama needs
+none (set OLLAMA_API_KEY only if you put Ollama behind an authenticated proxy).
 """
 import json
 import os
 import re
 
-GEMINI_OPENAI_BASE = "https://generativelanguage.googleapis.com/v1beta/openai/"
+try:                                  # httpx ships with the openai SDK; used by the Ollama native path
+    import httpx
+except Exception:                     # pragma: no cover - degrade with a clear runtime error if absent
+    httpx = None
 
-# OpenAI-compatible switch to turn OFF a reasoning model's chain-of-thought (e.g. Xiaomi MiMo, whose
-# "thinking" can consume the whole max_tokens budget and truncate the tool call -> empty results).
-# Sent via extra_body ONLY when the user opts into "disable reasoning" — standard OpenAI/Gemini reject
-# unknown body fields with a 400. Both forms are accepted by MiMo's hosted API and a self-hosted vLLM
-# (--reasoning-parser mimo), so we send both for portability across reasoning-model hosts.
-NO_REASONING_BODY = {"thinking": {"type": "disabled"},
+GEMINI_OPENAI_BASE = "https://generativelanguage.googleapis.com/v1beta/openai/"
+# Ollama serves an OpenAI-compatible API locally and needs NO key. It IGNORES the shared base_url (that
+# field is the OpenAI custom-endpoint); point Ollama elsewhere with the standard OLLAMA_HOST env var.
+OLLAMA_OPENAI_BASE = "http://localhost:11434/v1"
+
+# OpenAI-compatible switch to turn OFF a reasoning model's chain-of-thought (e.g. gpt-oss or Xiaomi MiMo,
+# whose "thinking" can eat most of the max_tokens budget -> slow at a fixed tok/s, and can truncate the
+# tool call -> empty results). Sent via extra_body ONLY when the caller opts into "disable reasoning".
+# Hosts obey DIFFERENT knobs, so we send all three and let each host ignore the rest:
+#   reasoning_effort -> OpenAI o-series + gpt-oss (these IGNORE thinking/enable_thinking, so without this
+#                       line "disable reasoning" was a silent no-op for gpt-oss);
+#   thinking         -> Anthropic-style hosts;
+#   enable_thinking  -> MiMo / self-hosted vLLM (--reasoning-parser) chat-template hosts.
+# Unknown fields are dropped by LiteLLM/most proxies; a host that hard-400s makes the caller revert.
+NO_REASONING_BODY = {"reasoning_effort": "low",
+                     "thinking": {"type": "disabled"},
                      "chat_template_kwargs": {"enable_thinking": False}}
 
-PROVIDERS = ("anthropic", "openai", "gemini")
+PROVIDERS = ("anthropic", "openai", "gemini", "ollama")
 PROVIDER_LABEL = {"anthropic": "Anthropic (Claude)", "openai": "OpenAI (ChatGPT)",
-                  "gemini": "Google Gemini"}
-KEY_ENV = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY", "gemini": "GEMINI_API_KEY"}
+                  "gemini": "Google Gemini", "ollama": "Ollama (local)"}
+KEY_ENV = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY", "gemini": "GEMINI_API_KEY",
+           "ollama": "OLLAMA_API_KEY"}
 DEFAULT_MODEL = {"anthropic": "claude-haiku-4-5", "openai": "gpt-5.4-nano",
-                 "gemini": "gemma-4-31b-it"}
+                 "gemini": "gemma-4-31b-it", "ollama": "llama3.1"}
 # suggested models per provider (the UI model box is EDITABLE — these are just autocomplete hints;
 # type any exact model id your account has access to). First entry is the per-provider default.
 MODELS = {
@@ -41,6 +59,8 @@ MODELS = {
     "openai": ["gpt-5.4-nano", "gpt-4.1-mini", "gpt-4.1", "gpt-4o", "gpt-4o-mini"],
     "gemini": ["gemma-4-31b-it", "gemini-2.5-flash", "gemini-3.5-flash", "gemini-2.5-pro",
                "gemma-3-27b-it"],
+    # Ollama models must be pulled locally first (`ollama pull <model>`); use tool-capable ones.
+    "ollama": ["llama3.1", "llama3.2", "qwen2.5", "mistral-nemo", "firefunction-v2", "command-r"],
 }
 
 
@@ -58,9 +78,15 @@ def resolve_model(provider, model):
 
 
 def api_key(provider):
+    # Always .strip(): a key pasted with a stray leading/trailing space or TAB otherwise reaches the gateway
+    # as `Bearer \tsk-…`, which fails auth (e.g. LiteLLM master-key mismatch -> the misleading "No connected db").
     if provider == "gemini":
-        return os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
-    return os.environ.get(KEY_ENV.get(provider, ""), "") or ""
+        return (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or "").strip()
+    if provider == "ollama":
+        # Ollama is local and needs no key, but the OpenAI SDK requires a non-empty value -> placeholder.
+        # Set OLLAMA_API_KEY only for an authenticated Ollama proxy.
+        return (os.environ.get("OLLAMA_API_KEY", "") or "ollama").strip()
+    return (os.environ.get(KEY_ENV.get(provider, ""), "") or "").strip()
 
 
 def have_key(provider):
@@ -82,14 +108,28 @@ def make_client(provider, max_retries=8, timeout=None, base_url=None):
         from anthropic import AsyncAnthropic
         if base_url:
             extra["base_url"] = base_url
-        return AsyncAnthropic(max_retries=max_retries, **extra)
+        return AsyncAnthropic(api_key=api_key("anthropic") or None, max_retries=max_retries, **extra)
     from openai import AsyncOpenAI
     if provider == "gemini":
         return AsyncOpenAI(api_key=api_key("gemini"), base_url=base_url or GEMINI_OPENAI_BASE,
                            max_retries=max_retries, **extra)
+    if provider == "ollama":
+        # Ollama is LOCAL by design: IGNORE the passed base_url (that's the OpenAI custom-endpoint, e.g.
+        # MiMo) so selecting Ollama can never accidentally hit a cloud host with the placeholder key
+        # (which 401s as "API key rejected"). Default to localhost; honor the standard OLLAMA_HOST env
+        # var for a custom local port / LAN box.
+        oh = (os.environ.get("OLLAMA_HOST") or "").strip()
+        if oh:
+            if not oh.startswith(("http://", "https://")):
+                oh = "http://" + oh
+            oh = oh.rstrip("/")
+            ob = oh if oh.endswith("/v1") else oh + "/v1"
+        else:
+            ob = OLLAMA_OPENAI_BASE
+        return AsyncOpenAI(api_key=api_key("ollama"), base_url=ob, max_retries=max_retries, **extra)
     if base_url:                                  # custom OpenAI-compatible host (MiMo etc.)
         extra["base_url"] = base_url
-    return AsyncOpenAI(max_retries=max_retries, **extra)   # OPENAI_API_KEY from env
+    return AsyncOpenAI(api_key=api_key("openai") or None, max_retries=max_retries, **extra)  # stripped key (env)
 
 
 async def close_client(client):
@@ -113,6 +153,73 @@ def _extract_results(text):
     if isinstance(obj, dict):
         return obj.get("results", [])
     return obj if isinstance(obj, list) else []
+
+
+def _ollama_native_url():
+    """Native /api/chat URL. The OpenAI-compat /v1 path can't grammar-constrain output (`format`) nor
+    disable a thinking model's chain-of-thought, so the ollama path uses the native API. Host
+    resolution mirrors make_client: OLLAMA_HOST env (with/without scheme or /v1) else localhost."""
+    oh = (os.environ.get("OLLAMA_HOST") or "").strip()
+    if oh:
+        if not oh.startswith(("http://", "https://")):
+            oh = "http://" + oh
+        oh = oh.rstrip("/")
+        if oh.endswith("/v1"):
+            oh = oh[:-3].rstrip("/")
+        return oh + "/api/chat"
+    return "http://localhost:11434/api/chat"
+
+
+async def _classify_ollama_native(model, system_text, user_content, tool, max_tokens,
+                                  disable_reasoning):
+    """Ollama via the NATIVE /api/chat with grammar-constrained structured output (`format`=schema)
+    plus `think:false`. `format` forces the reply to BE the {results:[...]} object, so the model can't
+    spend the budget on a chain-of-thought before a tool call — the OpenAI-compat tool path let gemma
+    emit ~200 think-tokens/item; this is ~40 (the actual JSON). No tool-calling (more reliable for
+    small local models). Raises on HTTP error so the caller's retry/diagnose path handles it."""
+    if httpx is None:
+        raise RuntimeError("httpx is not installed but is required for the Ollama provider (it ships "
+                           "with the openai package). Run `pip install httpx`, or pick a cloud provider.")
+    sys_txt = system_text + ('\nReturn ONLY a JSON object {"results":[...]} containing exactly one '
+                             "element per input string, preserving each exact raw value. Do not "
+                             "call any tool; output only the JSON object.")
+    body = {
+        "model": model, "stream": False,
+        "format": tool["input_schema"],                 # JSON-schema grammar -> output IS the object
+        "options": {"num_predict": max_tokens, "temperature": 0},
+        "messages": [{"role": "system", "content": sys_txt},
+                     {"role": "user", "content": user_content}],
+    }
+    if disable_reasoning:
+        body["think"] = False
+    url = _ollama_native_url()
+    timeout = httpx.Timeout(900.0, connect=10.0)         # CPU-local models are slow; don't cut a batch off
+    async with httpx.AsyncClient(timeout=timeout) as hc:
+        try:
+            r = await hc.post(url, json=body)
+            r.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            body_txt = ""
+            try:
+                body_txt = (e.response.text or "").lower()
+            except Exception:
+                pass
+            if "think" in body and "think" in body_txt:  # model doesn't accept think -> retry without
+                body.pop("think", None)
+                r = await hc.post(url, json=body)
+                r.raise_for_status()
+            else:
+                raise
+        try:
+            resp = r.json()
+        except Exception as je:        # invalid/empty body -> treat as a (retryable) network error
+            raise RuntimeError("Ollama network error: invalid/empty JSON from /api/chat (%s)" % je)
+    content = (resp.get("message") or {}).get("content", "") or ""
+    results = _extract_results(content)
+    usage = {"input_tokens": resp.get("prompt_eval_count", 0) or 0,
+             "output_tokens": resp.get("eval_count", 0) or 0,
+             "cache_read": 0, "cache_creation": 0}
+    return results, usage
 
 
 async def classify(client, provider, model, system_text, user_obj, tool, max_tokens=8000,
@@ -142,6 +249,10 @@ async def classify(client, provider, model, system_text, user_obj, tool, max_tok
                  "cache_creation": getattr(u, "cache_creation_input_tokens", 0)}
         return results, usage
 
+    if provider == "ollama":            # local: native structured-output path (see _classify_ollama_native)
+        return await _classify_ollama_native(
+            model, system_text, user_content, tool, max_tokens, disable_reasoning)
+
     # ---- openai / gemini (OpenAI-compatible) ----
     func = {"type": "function", "function": {
         "name": name, "description": tool.get("description", ""),
@@ -151,8 +262,9 @@ async def classify(client, provider, model, system_text, user_obj, tool, max_tok
         messages=[{"role": "system", "content": system_text},
                   {"role": "user", "content": user_content}],
         tools=[func],
-        tool_choice=({"type": "function", "function": {"name": name}}
-                     if provider == "openai" else "required"),
+        # openai: force the exact function. gemini: "required". (ollama uses the native path above.)
+        tool_choice=({"type": "function", "function": {"name": name}} if provider == "openai"
+                     else "required"),
     )
     if disable_reasoning:
         kwargs["extra_body"] = NO_REASONING_BODY
@@ -177,6 +289,117 @@ async def classify(client, provider, model, system_text, user_obj, tool, max_tok
     return results, usage
 
 
+# ===================== general agentic chat-with-tools (the Assistant panel) =====================
+# Unlike classify() (one forced structured tool call), chat() is a multi-turn loop where the MODEL
+# decides which tools to call. The caller (chat_assist) keeps a PROVIDER-NEUTRAL history and we convert
+# it to each provider's native shape here, so the orchestrator never sees provider details.
+#
+# Neutral history entries (list of dicts):
+#   {"role":"user","content": str}
+#   {"role":"assistant","content": str, "tool_calls":[{"id","name","input":dict}]}   (tool_calls optional)
+#   {"role":"tool","tool_call_id": str, "content": str}
+# Tools: list of {name, description, input_schema}  (Anthropic-native shape; converted for OpenAI).
+
+def _to_anthropic_messages(messages):
+    """Neutral history -> Anthropic messages (consecutive tool results coalesce into ONE user msg)."""
+    out, i, n = [], 0, len(messages)
+    while i < n:
+        m = messages[i]
+        role = m.get("role")
+        if role == "assistant":
+            blocks = []
+            if m.get("content"):
+                blocks.append({"type": "text", "text": m["content"]})
+            for tc in m.get("tool_calls") or []:
+                blocks.append({"type": "tool_use", "id": tc["id"], "name": tc["name"],
+                               "input": tc.get("input") or {}})
+            out.append({"role": "assistant", "content": blocks or m.get("content", "")})
+            i += 1
+        elif role == "tool":
+            results = []
+            while i < n and messages[i].get("role") == "tool":      # Anthropic wants all tool_results together
+                t = messages[i]
+                results.append({"type": "tool_result", "tool_use_id": t.get("tool_call_id"),
+                                "content": t.get("content", "")})
+                i += 1
+            out.append({"role": "user", "content": results})
+        else:                                                       # user (or unknown -> treat as user text)
+            out.append({"role": "user", "content": m.get("content", "")})
+            i += 1
+    return out
+
+
+def _to_openai_messages(messages, system):
+    out = [{"role": "system", "content": system}] if system else []
+    for m in messages:
+        role = m.get("role")
+        if role == "assistant":
+            a = {"role": "assistant", "content": m.get("content") or None}
+            if m.get("tool_calls"):
+                a["tool_calls"] = [{"id": tc["id"], "type": "function",
+                                    "function": {"name": tc["name"],
+                                                 "arguments": json.dumps(tc.get("input") or {})}}
+                                   for tc in m["tool_calls"]]
+            out.append(a)
+        elif role == "tool":
+            out.append({"role": "tool", "tool_call_id": m.get("tool_call_id"),
+                        "content": m.get("content", "")})
+        else:
+            out.append({"role": "user", "content": m.get("content", "")})
+    return out
+
+
+async def chat(client, provider, model, messages, tools=None, system="", max_tokens=4096,
+               disable_reasoning=False):
+    """One model round with optional tool-calling. Returns a normalized turn:
+       {"text": str, "tool_calls": [{"id","name","input"(dict)}], "stop_reason": str, "usage": {...}}.
+    The caller appends the assistant turn + each tool result to `messages` and calls again until
+    `tool_calls` is empty (the model produced its final answer)."""
+    if provider == "anthropic":
+        kwargs = dict(model=model, max_tokens=max_tokens, messages=_to_anthropic_messages(messages))
+        if system:
+            kwargs["system"] = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
+        if tools:
+            kwargs["tools"] = list(tools)
+            kwargs["tool_choice"] = {"type": "auto"}
+        msg = await client.messages.create(**kwargs)
+        text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
+        tcs = [{"id": b.id, "name": b.name, "input": b.input}
+               for b in msg.content if getattr(b, "type", "") == "tool_use"]
+        u = msg.usage
+        usage = {"input_tokens": getattr(u, "input_tokens", 0), "output_tokens": getattr(u, "output_tokens", 0),
+                 "cache_read": getattr(u, "cache_read_input_tokens", 0),
+                 "cache_creation": getattr(u, "cache_creation_input_tokens", 0)}
+        return {"text": text, "tool_calls": tcs, "stop_reason": getattr(msg, "stop_reason", ""),
+                "usage": usage}
+
+    # ---- openai / gemini / ollama (OpenAI-compatible /v1 tool-calling) ----
+    kwargs = dict(model=model, max_tokens=max_tokens, messages=_to_openai_messages(messages, system))
+    if tools:
+        kwargs["tools"] = [{"type": "function",
+                            "function": {"name": t["name"], "description": t.get("description", ""),
+                                         "parameters": t["input_schema"]}} for t in tools]
+        kwargs["tool_choice"] = "auto"
+    if disable_reasoning:
+        kwargs["extra_body"] = NO_REASONING_BODY
+    resp = await client.chat.completions.create(**kwargs)
+    choice = resp.choices[0].message
+    text = getattr(choice, "content", None) or ""
+    tcs = []
+    for tc in (getattr(choice, "tool_calls", None) or []):
+        try:
+            args = json.loads(tc.function.arguments or "{}")
+        except Exception:
+            args = {}
+        tcs.append({"id": tc.id, "name": tc.function.name, "input": args})
+    u = getattr(resp, "usage", None)
+    usage = {"input_tokens": getattr(u, "prompt_tokens", 0) if u else 0,
+             "output_tokens": getattr(u, "completion_tokens", 0) if u else 0,
+             "cache_read": 0, "cache_creation": 0}
+    return {"text": text, "tool_calls": tcs,
+            "stop_reason": getattr(resp.choices[0], "finish_reason", ""), "usage": usage}
+
+
 def classify_ai_error(exc):
     """Turn an AI-provider exception into an actionable diagnosis {category, title, detail}.
     Categories: auth | model | perm | rate | network | unknown. Used to tell the user whether to fix
@@ -188,6 +411,13 @@ def classify_ai_error(exc):
 
     def D(category, title, detail):
         return {"category": category, "title": title, "detail": detail}
+
+    # httpx transport errors (the local-Ollama native path) carry no HTTP status code, and their str()
+    # is often empty -> classify by TYPE as network so a transient/local-down blip retries (not "auth").
+    if httpx is not None and isinstance(exc, httpx.HTTPError) and not isinstance(exc, httpx.HTTPStatusError):
+        return D("network", "Couldn't reach the provider",
+                 "Network/transport error contacting the AI provider (e.g. local Ollama is down, "
+                 "updating, or unreachable). Check it's running, switch provider, or turn off AI cleaning.")
 
     if status == 401 or any(s in low for s in ("api key", "api_key", "unauthorized", "authenticat",
                                                "invalid x-api-key", "no auth credentials",
@@ -204,6 +434,15 @@ def classify_ai_error(exc):
         return D("perm", "Access denied for this model",
                  "Your account can't access this model. Use a different model/provider, or turn off "
                  "AI cleaning.")
+    # OpenAI-compatible PROXY (LiteLLM / vLLM / a local gateway) that is reachable but has no model or
+    # database backend connected right now — typically returned as a 400 with one of these phrases. This
+    # is NOT a bad request from us: the proxy needs its model/DB reconnected (or restarting).
+    if any(s in low for s in ("no connected db", "no_db_connection", "no healthy deployment",
+                              "no deployments available", "no model deployed", "no available deployment")):
+        return D("network", "AI proxy/endpoint not ready",
+                 "The OpenAI-compatible endpoint at your base URL (e.g. a local LiteLLM/vLLM proxy) is "
+                 "reachable but has no model/database backend connected right now. Restart or reconnect "
+                 "the proxy (and its model), switch provider, or turn off AI cleaning.")
     if status == 429 or any(s in low for s in ("rate limit", "ratelimit", "quota",
                                                "resource_exhausted", "too many requests")):
         return D("rate", "Rate limit / quota exceeded",

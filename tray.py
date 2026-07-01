@@ -26,14 +26,31 @@ def _start_server():
 
 
 def _icon_image():
-    from PIL import Image, ImageDraw
-    img = Image.new("RGBA", (64, 64), (15, 20, 32, 255))
+    from PIL import Image, ImageDraw, ImageFont
+    N = 128                                            # render large; the tray downsamples -> crisp
+    img = Image.new("RGBA", (N, N), (0, 0, 0, 0))      # transparent bg -> just the rounded square shows
     d = ImageDraw.Draw(img)
+    m = 10
     try:
-        d.rounded_rectangle([8, 8, 56, 56], radius=12, fill=(91, 140, 255, 255))
+        d.rounded_rectangle([m, m, N - m, N - m], radius=26, fill=(91, 140, 255, 255))
     except Exception:
-        d.rectangle([8, 8, 56, 56], fill=(91, 140, 255, 255))
-    d.text((24, 18), "S", fill=(255, 255, 255, 255))
+        d.rectangle([m, m, N - m, N - m], fill=(91, 140, 255, 255))
+    # A LARGE, centered "S". The PIL default font is ~6px and renders as a dot at tray size, so load a
+    # real TrueType (try a few common Windows/Linux bold faces; fall back to the bitmap font only if none).
+    font = None
+    for name in ("segoeuib.ttf", "arialbd.ttf", "DejaVuSans-Bold.ttf", "segoeui.ttf", "arial.ttf"):
+        try:
+            font = ImageFont.truetype(name, 84)
+            break
+        except Exception:
+            continue
+    if font is None:
+        font = ImageFont.load_default()
+    try:                                               # center the glyph by its bounding box
+        l, t, r, b = d.textbbox((0, 0), "S", font=font)
+        d.text(((N - (r - l)) / 2 - l, (N - (b - t)) / 2 - t), "S", fill=(255, 255, 255, 255), font=font)
+    except Exception:
+        d.text((N / 2 - 22, N / 2 - 44), "S", fill=(255, 255, 255, 255), font=font)
     return img
 
 
@@ -48,7 +65,18 @@ def main():
 
     import pystray
     server, httpd, url, tag = _start_server()
-    webbrowser.open(url)
+    # Hand the URL to the launcher (launch_Win.bat) by writing it next to this script. Under pythonw the
+    # in-process webbrowser.open() returns True but silently fails to surface a tab on some Windows setups,
+    # so the .bat reads this file and opens the browser from its reliable console context. When this script
+    # is run DIRECTLY (not via the launcher), we still open the browser ourselves.
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "_last_url.txt"),
+                  "w", encoding="utf-8") as uf:
+            uf.write(url)
+    except Exception:
+        pass
+    if not os.environ.get("SPLICESCOUT_OPENED_BY_LAUNCHER"):
+        webbrowser.open(url)
 
     def do_open(icon=None, item=None):
         webbrowser.open(url)

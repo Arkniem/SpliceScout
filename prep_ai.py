@@ -34,9 +34,8 @@ def chunk_write(folder, prefix, items, per):
     os.makedirs(folder, exist_ok=True)
     n = 0
     for i in range(0, len(items), per):
-        json.dump(items[i:i + per],
-                  open(os.path.join(folder, f"{prefix}_{n:03d}.json"), "w", encoding="utf-8"),
-                  ensure_ascii=False)
+        with open(os.path.join(folder, f"{prefix}_{n:03d}.json"), "w", encoding="utf-8") as f:
+            json.dump(items[i:i + per], f, ensure_ascii=False)
         n += 1
     return n
 
@@ -44,9 +43,40 @@ def chunk_write(folder, prefix, items, per):
 def build_batches(P, reporter=NULL):
     """Build compound + sample batch inputs and sample_index.json."""
     reporter.set_detail("building AI batches…")
-    struct = [json.loads(l) for l in open(P.samples_jsonl, encoding="utf-8") if l.strip()]
+
+    if not os.path.exists(P.raw_json):
+        raise FileNotFoundError(
+            f"PREP: raw metadata JSON missing: {P.raw_json} "
+            f"(produced by the FETCH stage)")
+    if not os.path.exists(P.samples_jsonl):
+        raise FileNotFoundError(
+            f"PREP: structured samples JSONL missing: {P.samples_jsonl} "
+            f"(produced by the EXTRACT stage)")
+
+    try:
+        with open(P.raw_json, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (ValueError, OSError) as e:
+        raise ValueError(
+            f"PREP: corrupt raw metadata JSON: {P.raw_json} "
+            f"(produced by the FETCH stage) — {e}")
+    result = raw.get("result")
+    if not isinstance(result, dict):
+        raise ValueError(
+            f"PREP: raw metadata JSON has no usable 'result': {P.raw_json} "
+            f"(produced by the FETCH stage)")
+
+    struct = []
+    with open(P.samples_jsonl, encoding="utf-8") as f:
+        for l in f:
+            if not l.strip():
+                continue
+            try:
+                struct.append(json.loads(l))
+            except ValueError:
+                # Skip a malformed/torn (e.g. trailing) line rather than crash the stage.
+                continue
     struct_by_gsm = {r["gsm"]: r for r in struct if r.get("gsm")}
-    result = json.load(open(P.raw_json, encoding="utf-8"))["result"]
 
     # ---- Pass 1: distinct cleaned compounds ----
     compounds = set()
@@ -60,8 +90,8 @@ def build_batches(P, reporter=NULL):
     # ---- Pass 2: cell descriptors needing AI ----
     cell_values = set()          # raw structured cell-line tag values to canonicalize
     title_groups = {}            # title_key -> [raw titles]
-    for u in result["uids"]:
-        for s in result[u].get("samples", []):
+    for u in result.get("uids", []):
+        for s in (result.get(u) or {}).get("samples", []):
             gsm = s.get("accession", "")
             title = s.get("title", "")
             sd = struct_by_gsm.get(gsm)
@@ -85,7 +115,16 @@ def build_batches(P, reporter=NULL):
         descriptors.append(rep)
 
     descriptors = sorted(set(descriptors))
-    json.dump(sample_index, open(P.sample_index, "w", encoding="utf-8"), ensure_ascii=False)
+
+    if not compounds and not descriptors:
+        raise ValueError(
+            f"PREP: no compounds and no sample descriptors built from "
+            f"{P.samples_jsonl} / {P.raw_json} "
+            f"(structured-samples={len(struct)}, result-uids={len(result.get('uids', []))}) "
+            f"— refusing to write 0 batches, which would make the AI/MERGE stages a no-op")
+
+    with open(P.sample_index, "w", encoding="utf-8") as f:
+        json.dump(sample_index, f, ensure_ascii=False)
     n_samp = chunk_write(P.sample_batches, "samp", descriptors, SAMP_PER)
 
     print(f"  PREP: compounds={len(compounds)} ({n_cmpd} batches) | "

@@ -80,6 +80,11 @@ class Paths:
         self.psi_bundle_zip = os.path.join(self.runtable_dir, "psi_bundle.zip")
         self.psi_status = os.path.join(self.runtable_dir, "psi_submit.json")  # what the PSI upload did
 
+        # stages 21-22: splicing concordance handoff (drug PSI vs cancer atlas; auto-chained after PSI)
+        self.concordance_dir = os.path.join(self.runtable_dir, "concordance")             # concordance bundle root
+        self.concordance_bundle_zip = os.path.join(self.runtable_dir, "concordance_bundle.zip")
+        self.concordance_status = os.path.join(self.runtable_dir, "concordance_submit.json")  # what the upload did
+
     def runtable_filtered_csv(self, slug):
         return os.path.join(self.runtable_dir, f"SraRunTable_{slug}.csv")
 
@@ -93,6 +98,9 @@ class Paths:
         for d in (self.run_dir, self.work_dir, self.compound_batches,
                   self.compound_results, self.sample_batches, self.sample_results,
                   self.tables_dir, self.runtable_dir, self.xml_cache_dir, self.cluster_dir,
-                  self.star_dir, self.bed_dir, self.psi_dir):
-            os.makedirs(d, exist_ok=True)
+                  self.star_dir, self.bed_dir, self.psi_dir, self.concordance_dir):
+            try:
+                os.makedirs(d, exist_ok=True)
+            except OSError as e:
+                raise RuntimeError(f"could not create run directory {d!r}: {e}") from e
         return self

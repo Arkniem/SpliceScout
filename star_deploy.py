@@ -38,7 +38,7 @@ STAR_CONFIG_DEFAULTS = {
     "STAR_EXTRA_ARGS": "",
     "MEM_MB": 64000,
     "MEM_RUSAGE": 10000,
-    "WALL": "24:00",
+    "WALL": "1108:00",   # default -W: queue MAX (66480 min) so jobs never die to walltime
     "LSF_QUEUE": "",
     "JOB_TAG": "star",
     "WATCHDOG_INTERVAL_MIN": 30,
@@ -53,7 +53,7 @@ STAR_CONFIG_DEFAULTS = {
     "BUILD_THREADS": 16,
     "BUILD_MEM_MB": 64000,
     "BUILD_MEM_RUSAGE": 4000,
-    "BUILD_WALL": "8:00",
+    "BUILD_WALL": "1108:00",   # genomeGenerate -W: queue MAX (66480 min)
 }
 STAR_NUMERIC = {"SJDB_OVERHANG", "THREADS", "SORT_RAM", "MEM_MB", "MEM_RUSAGE",
                 "WATCHDOG_INTERVAL_MIN", "MAX_STALL_PASSES",
@@ -168,7 +168,7 @@ def _star_launch_sh(download_root, star_tag, check_min=30, max_wait_hours=336):
         "# download not done yet, OR a launch attempt just failed -> reschedule THIS launcher (+CHECK_MIN), then exit\n"
         "when=$(date -d \"+$CHECK_MIN min\" '+%Y:%m:%d:%H:%M' 2>/dev/null) || "
         "when=$(date -v+\"${CHECK_MIN}\"M '+%Y:%m:%d:%H:%M' 2>/dev/null)\n"
-        'bsub -L /bin/bash -n 1 -M 1000 -W 120 -b "$when" -J "${JT}_launch" \\\n'
+        'bsub -L /bin/bash -n 1 -M 1000 -W 66480 -b "$when" -J "${JT}_launch" \\\n'
         '     -o "$DL_ROOT/star/launch.out" -e "$DL_ROOT/star/launch.err" \\\n'
         '     "$HERE/star_launch.sh" >/dev/null 2>&1\n'
         'echo "[star_launch] not done / will retry -> next check scheduled for $when"\n'
@@ -245,14 +245,26 @@ def build_star_bundle(P, sel, download_root, star_cfg, download_job_tag="sra", r
         vals["RUNTABLE"] = ""
         print("  STAR BUNDLE: no filtered run table found -> RUNTABLE empty (one BAM per run)")
 
-    template = open(os.path.join(STAR_TEMPLATE_DIR, "config.sh"), encoding="utf-8").read()
+    cfg_template = os.path.join(STAR_TEMPLATE_DIR, "config.sh")
+    if not os.path.isfile(cfg_template):
+        raise RuntimeError(f"STAR bundle: template config.sh missing at {cfg_template} -- "
+                           "cannot build the bundle (reinstall/restore star_template/config.sh)")
+    try:
+        template = open(cfg_template, encoding="utf-8").read()
+    except OSError as e:
+        raise RuntimeError(f"STAR bundle: cannot read template config.sh ({cfg_template}): {e}")
+    vals["ALERT_EMAIL"] = vals.get("ALERT_EMAIL") or cluster_deploy._alert_email()   # cluster-side email
+    cluster_deploy.bake_diagnose_model(vals)                                         # optional diagnose-AI model path / cache dir
     with open(os.path.join(P.star_dir, "config.sh"), "w", encoding="utf-8", newline="\n") as f:
         f.write(cluster_deploy.fill_config(template, vals, numeric=STAR_NUMERIC, defaults=STAR_CONFIG_DEFAULTS))
     with open(os.path.join(P.star_dir, "star_launch.sh"), "w", encoding="utf-8", newline="\n") as f:
         f.write(_star_launch_sh(download_root, vals["JOB_TAG"]))
 
     _write_star_instructions(P, vals, download_root)
-    cluster_deploy._zip_dir(P.star_dir, P.star_bundle_zip)
+    try:
+        cluster_deploy._zip_dir(P.star_dir, P.star_bundle_zip)
+    except OSError as e:
+        raise RuntimeError(f"STAR bundle: failed to write bundle zip {P.star_bundle_zip}: {e}")
     print(f"  STAR BUNDLE: organism={organism!r} index={vals.get('GENOME_DIR') or '(resolve/build)'} "
           f"-> {os.path.basename(P.star_bundle_zip)}")
     reporter.set_detail(f"STAR bundle ready (organism {organism})")
@@ -288,9 +300,16 @@ def submit_star_over_ssh(P, cluster_cfg, secrets, download_root, reporter=NULL, 
     # until the download writes PIPELINE_COMPLETE.txt, then launches STAR). It runs immediately, sees the
     # download isn't done yet, and arms the reschedule chain — so SpliceScout can be CLOSED after this.
     shq = cluster_deploy.shq
+    # DETACH the launcher bsub (setsid + redirected fds, backgrounded inside a subshell so ONLY the bsub is
+    # async — not the preceding tar/chmod) so the deploy ssh returns IMMEDIATELY. Under a saturated per-user
+    # pending-job quota (a concurrent heavy run) this bsub BLOCKS on "Pending job threshold reached. Retrying
+    # in 60s"; inline that hangs the deploy ssh until it times out ("stuck on launch star alignment"). setsid
+    # keeps it retrying in the background after the ssh closes (plain nohup does NOT persist on this cluster).
+    _lo = shq(star_root + '/launch.out')
     launch = (
-        f"bsub -L /bin/bash -n 1 -M 1000 -W 120 -J {shq(star_tag + '_launch')} "
-        f"-o {shq(star_root + '/launch.out')} -e {shq(star_root + '/launch.err')} {shq(star_root + '/star_launch.sh')}"
+        f"( setsid bsub -L /bin/bash -n 1 -M 1000 -W 66480 -J {shq(star_tag + '_launch')} "
+        f"-o {_lo} -e {shq(star_root + '/launch.err')} {shq(star_root + '/star_launch.sh')} "
+        f"</dev/null >>{_lo} 2>&1 & )"
     )
     if prior_skipped:
         # START at STAR (download skipped): the launcher polls <download_root>/PIPELINE_COMPLETE.txt,
@@ -311,6 +330,14 @@ def submit_star_over_ssh(P, cluster_cfg, secrets, download_root, reporter=NULL, 
         else:
             res = cluster_deploy._submit_systemssh(P, host, port, user, keyfile, star_root,
                                                    reporter, src_dir=P.star_dir, launch_cmd=launch)
+        # WS3: only treat this as submitted on a CONFIRMED launch (the helper sets submitted=True
+        # only after the bsub command returns success). A missing/falsey flag means NOT submitted,
+        # so the orchestrator leaves it unmarked rather than skipping a never-armed launcher.
+        if not (isinstance(res, dict) and res.get("submitted")):
+            reason = (res or {}).get("reason", "submit not confirmed") if isinstance(res, dict) else "submit not confirmed"
+            print(f"  STAR SUBMIT: launch not confirmed ({reason}) -> leaving unmarked")
+            return {"submitted": False, "reason": reason,
+                    "diagnosis": cluster_deploy.diagnose_failure("", reason)}
         print(f"  STAR SUBMIT: self-rescheduling launcher armed on {host} — STAR starts on the cluster "
               "when the download finishes (safe to close SpliceScout now)")
         return res

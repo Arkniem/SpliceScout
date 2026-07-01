@@ -138,12 +138,13 @@ def assign(P, cfg, sel, reporter=NULL):
     Returns (None, None) if there is no usable group config / run table (caller falls back to default)."""
     groups = _norm_groups(getattr(cfg, "group_cfg", None))
     if len(groups) < 2:
-        return None, None
+        raise ValueError(f"group_assign: need >=2 comparison groups for AltAnalyze (dPSI needs a baseline + at least one test group), got {len(groups)}")
     slug = _slug((sel or {}).get("canonical", "cellline")) if sel else ""
     src = _find_filtered_csv(P, slug)
     if not src:
         return None, None
-    rows = list(csv.DictReader(open(src, encoding="utf-8")))
+    with open(src, encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
     if not rows:
         return None, None
 
@@ -179,7 +180,10 @@ def assign(P, cfg, sel, reporter=NULL):
                 n_ai += 1
 
     if not decided:
-        print("  GROUPS: no samples could be assigned (fixed + AI) -> default treated-vs-control")
+        print("  ************************************************************")
+        print("  GROUPS WARNING: 0 of %d samples could be assigned to ANY user group (fixed + AI)!" % len(rows))
+        print("  GROUPS WARNING: check your group keywords -> falling back to default treated-vs-control")
+        print("  ************************************************************")
         return None, None
 
     # 3) write the `group` column back into the run table (additive) + an audit
@@ -202,8 +206,8 @@ def assign(P, cfg, sel, reporter=NULL):
                 g = decided.get(i, "")
                 method = "" if not g else ("ai" if i in ai_idx else "fixed")
                 w.writerow([i, g or "Unassigned", method])
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  GROUPS: WARNING could not write group_assignment_audit.csv ({e})")
 
     # 4) labelmap: control group -> 1 (baseline); others -> 2..N (UI order). Keys = group NAMES.
     labelmap = {}
