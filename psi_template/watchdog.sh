@@ -12,6 +12,9 @@
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/config.sh"
 source "$HERE/lib_psi.sh"
+# shared error-log + email (cluster jobs email the user directly). Fallback to no-ops if missing (old deploy).
+if [ -f "$HERE/lib_notify.sh" ]; then source "$HERE/lib_notify.sh"; else
+  log_event(){ :; }; notify_error(){ :; }; notify_update(){ :; }; fi
 set -u; shopt -s nullglob
 
 LOG="$PIPELINE_ROOT/watchdog.log"
@@ -28,10 +31,15 @@ reschedule() {
   when=$(date -d "+$WATCHDOG_INTERVAL_MIN min" '+%Y:%m:%d:%H:%M' 2>/dev/null) ||
   when=$(date -v+"${WATCHDOG_INTERVAL_MIN}"M '+%Y:%m:%d:%H:%M' 2>/dev/null)
   psi_qopt
-  out=$(bsub -L /bin/bash -n 1 -M 1000 -W 20 -b "$when" -J "${JOB_TAG}_watchdog" \
+  # GUARD: if both `date` variants failed/returned empty, never pass an empty value to `bsub -b`
+  # (empty -b is a hard bsub error that kills the chain) -- omit -b and let LSF dispatch ASAP.
+  local _bopt=()
+  [ -n "$when" ] && _bopt=(-b "$when")
+  out=$(bsub -L /bin/bash -n 1 -M 1000 -W 20 "${_bopt[@]+"${_bopt[@]}"}" -J "${JOB_TAG}_watchdog" \
        -o "$LOG_DIR/watchdog.out" -e "$LOG_DIR/watchdog.err" \
        ${QOPT[@]+"${QOPT[@]}"} "$SCRIPTS_DIR/watchdog.sh" 2>&1)
   RESCHED_RC=$?
+  [ -n "$when" ] || when="ASAP (date unavailable -> -b omitted)"
   WATCHDOG_NEXT_JID=$(printf '%s' "$out" | psi_jobid)
   say "next pass scheduled for $when (job ${WATCHDOG_NEXT_JID:-?}, rc=$RESCHED_RC)"
 }
@@ -40,10 +48,12 @@ finalize() {                            # $1 = COMPLETE | STALLED
   local status="$1"
   local rep="$PIPELINE_ROOT/PIPELINE_${status}.txt"   # SEPARATE line (bash 4.2 + set -u)
   psi_finalize_once || { say "finalize already claimed by a concurrent pass -> skip"; return 0; }
-  # cancel ALL queued watchdog successors except THIS job
-  local _self _wj
+  # cancel ALL queued watchdog successors except THIS job. GUARD bjobs with `timeout 60` so a hung/wedged
+  # bjobs cannot block finalize; an empty result just means "nothing to cancel" (NOT "all done").
+  local _self _wj _bjout
   _self="${LSB_JOBID:-}"
-  for _wj in $(bjobs -noheader -o jobid -J "${JOB_TAG}_watchdog" 2>/dev/null); do
+  _bjout=$(timeout 60 bjobs -noheader -o jobid -J "${JOB_TAG}_watchdog" 2>/dev/null) || _bjout=""
+  for _wj in $_bjout; do
     [ "$_wj" = "$_self" ] && continue
     bkill "$_wj" >/dev/null 2>&1
   done
@@ -78,6 +88,26 @@ finalize() {                            # $1 = COMPLETE | STALLED
                             && say "cleanup: removed uploaded AltAnalyze home $ALTANALYZE_HOME (kept PSI results)" ;;
       *) say "cleanup: ALTANALYZE_HOME is external ($ALTANALYZE_HOME) -> left untouched" ;;
     esac
+  fi
+  # After a clean COMPLETE, optionally compress the kept uncompressed data (BEDs + PSI text outputs) to
+  # reclaim space. Runs as its OWN LSF job (can be long) so it never blocks finalize; "off" => skip.
+  if [ "$status" = "COMPLETE" ] && [ "$partial" = "0" ] \
+     && [ "${COMPRESS_WHEN_DONE:-off}" != "off" ] && [ ! -f "$PIPELINE_ROOT/COMPRESSION_COMPLETE.txt" ]; then
+    psi_qopt
+    if bsub -L /bin/bash -n "${COMPRESS_THREADS:-8}" -W 1108:00 -M 8000 -R "span[hosts=1]" \
+            -J "${JOB_TAG}_compress" -o "$LOG_DIR/compress.out" -e "$LOG_DIR/compress.err" \
+            ${QOPT[@]+"${QOPT[@]}"} "$SCRIPTS_DIR/compress_done.sh" >/dev/null 2>&1; then
+      say "submitted post-completion compression job (${JOB_TAG}_compress, mode=${COMPRESS_WHEN_DONE})"
+    else
+      say "WARNING: failed to submit the compression job (bsub error) -- run is COMPLETE but data left uncompressed"
+    fi
+  fi
+  # EMAIL the user: error on STALLED (needs attention), a progress note on COMPLETE.
+  if [ "$status" = "STALLED" ]; then
+    notify_error "PSI stage STALLED" "$(head -20 "$rep" 2>/dev/null)" "psi-stalled"
+    notify_diagnose "$JOB_TAG" "$PIPELINE_ROOT" "$SCRIPTS_DIR" "$LOG_DIR"
+  else
+    notify_update "PSI stage COMPLETE" "$(head -10 "$rep" 2>/dev/null)"
   fi
   say "FINALIZED ($status; partial=$partial) -> $rep  (watchdog stopping)"
 }
@@ -134,9 +164,57 @@ if [ "$done" -eq 0 ] && [ "$nlive" -eq 0 ] && ! psi_job_is_live; then
   beds=("$BED_INPUT_DIR"/*__junction.bed)
   if [ "${#beds[@]}" -eq 0 ]; then
     say "no junction BEDs present yet -- waiting (no resubmit)"
-  elif psi_submit_job >/dev/null; then
-    nresub=$((nresub+1)); echo "$nresub" > "$STATE.resub"
-    say "resubmitted the AltAnalyze job (attempt $nresub/${MAX_RESUBMITS:-2})"
+  else
+    # WALLTIME / MEM SELF-HEAL: if the dead job hit an LSF limit, escalate BEFORE resubmitting so the retry
+    # can actually finish (else the same -W/-M just kills it again). Reads the LAST termination reason from
+    # the job's accumulated -o log (awk, not grep -c -> reliable on compute nodes). WALL -> queue max on a
+    # walltime kill; MEM -> +50% per memory kill. (config.sh is re-sourced each pass, so this re-derives
+    # from the persistent log every time and converges.)
+    _jo="$LOG_DIR/psi_job.out"
+    _term=$(awk 'match($0,/TERM_(RUNLIMIT|MEMLIMIT)/){m=substr($0,RSTART,RLENGTH)} END{print m}' "$_jo" 2>/dev/null)
+    _nmem=$(awk '/TERM_MEMLIMIT/{n++} END{print n+0}' "$_jo" 2>/dev/null); _nmem=${_nmem:-0}
+    [ "$_term" = "TERM_RUNLIMIT" ] && { WALL="1108:00"; export WALL; say "previous job hit the WALLTIME limit -> resubmitting at the queue max (-W $WALL)"; }
+    [ "${_nmem:-0}" -gt 0 ] && { MEM_MB=$(( MEM_MB + MEM_MB * _nmem / 2 )); export MEM_MB; say "previous job hit the MEM limit x$_nmem -> bumped -M to $MEM_MB"; }
+    if psi_submit_job >/dev/null; then
+      nresub=$((nresub+1)); echo "$nresub" > "$STATE.resub"
+      say "resubmitted the AltAnalyze job (attempt $nresub/${MAX_RESUBMITS:-2})"
+    fi
+  fi
+fi
+
+# 2b) RUN-but-FROZEN deadlock self-heal. The checks above only act when nlive==0; a job that LSF still calls
+# RUN but is DEADLOCKED (e.g. AltAnalyze's import parent hung on a dead multiprocessing worker -- the 14h A549
+# freeze) is otherwise invisible until the 14-day backstop, and writes NO marker so the PC poller never
+# emails. Detect it by cpu_used NOT advancing: a busy job (even a legitimately long, quiet AltAnalyze phase)
+# always burns cpu, so frozen cpu_used over IDLE_STALL_PASSES passes == a true deadlock -> bkill + resubmit
+# (counts toward MAX_RESUBMITS; the BED preflight quarantines the usual corrupt-bed cause) + EMAIL.
+if [ "$done" -eq 0 ] && [ "$nlive" -ge 1 ]; then
+  _ji=$(timeout 30 bjobs -noheader -o 'stat cpu_used' -J "${JOB_TAG}_job" 2>/dev/null | head -1)
+  _jstat=$(printf '%s' "$_ji" | awk '{print $1}')
+  _cpu=$(printf '%s' "$_ji" | awk '{print $2}')
+  if [ "$_jstat" = "RUN" ] && [ -n "$_cpu" ]; then
+    if [ "$_cpu" = "$(cat "$STATE.cpu" 2>/dev/null || echo '')" ]; then
+      _idle=$(( $(cat "$STATE.idle" 2>/dev/null || echo 0) + 1 ))
+    else
+      _idle=0
+    fi
+    echo "$_idle" > "$STATE.idle"; echo "$_cpu" > "$STATE.cpu"
+    say "liveness: job RUN cpu_used='$_cpu' idle_passes=$_idle/${IDLE_STALL_PASSES:-3}"
+    if [ "$_idle" -ge "${IDLE_STALL_PASSES:-3}" ]; then
+      nresub=$(cat "$STATE.resub" 2>/dev/null || echo 0)
+      if [ "$nresub" -ge "${MAX_RESUBMITS:-2}" ]; then
+        say "FROZEN: cpu_used stuck at '$_cpu' for $_idle passes AND resubmit budget exhausted -> STALLED"
+        notify_error "PSI job DEADLOCKED (frozen)" "The AltAnalyze PSI job ran but FROZE (cpu_used stuck at $_cpu) for $_idle watchdog passes; resubmit budget (${MAX_RESUBMITS:-2}) exhausted -> STALLED. Inspect $LOG_DIR/psi_job.err and the BED inputs." "psi-frozen-stall"
+        finalize "STALLED"; exit 0
+      fi
+      say "FROZEN: cpu_used stuck at '$_cpu' for $_idle passes -> killing + resubmitting (self-heal)"
+      notify_error "PSI job DEADLOCKED -> auto-restarting" "The AltAnalyze PSI job was RUNNING but FROZEN (cpu_used stuck at $_cpu) for $_idle passes. Killing it and resubmitting (attempt $((nresub+1))/${MAX_RESUBMITS:-2}); the BED preflight quarantines the usual cause (a corrupt intron bed)." "psi-frozen-kill"
+      for _j in $(timeout 30 bjobs -noheader -o jobid -J "${JOB_TAG}_job" 2>/dev/null); do bkill "$_j" >/dev/null 2>&1; done
+      echo 0 > "$STATE.idle"; rm -f "$STATE.cpu" 2>/dev/null
+      if psi_submit_job >/dev/null; then nresub=$((nresub+1)); echo "$nresub" > "$STATE.resub"; say "resubmitted after freeze (attempt $nresub/${MAX_RESUBMITS:-2})"; fi
+    fi
+  else
+    echo 0 > "$STATE.idle"   # PEND/UNKNOWN -> not a freeze; reset the idle counter
   fi
 fi
 
@@ -148,6 +226,7 @@ if [ "${RESCHED_RC:-0}" -ne 0 ] && [ -z "${WATCHDOG_NEXT_JID:-}" ]; then
     { echo "PSI watchdog could not reschedule at $(ts): bsub failed twice (likely the LSF pending-job cap)."
       echo "Re-arm manually:  bsub -L /bin/bash -n 1 -M 1000 -W 20 -J ${JOB_TAG}_watchdog $SCRIPTS_DIR/watchdog.sh"
     } > "$PIPELINE_ROOT/PIPELINE_ORPHANED.txt"
+    notify_error "PSI watchdog ORPHANED" "The PSI watchdog could not queue a successor twice (likely the LSF pending-job cap), so the self-driving chain may stop. Re-arm: bsub -L /bin/bash -n 1 -M 1000 -W 20 -J ${JOB_TAG}_watchdog $SCRIPTS_DIR/watchdog.sh" "psi-orphaned"
   fi
 fi
 say "pass end -> next pass queued (job ${WATCHDOG_NEXT_JID:-?})"

@@ -37,11 +37,19 @@ psi_job_is_live() { bjobs -noheader -o stat -J "$(psi_jobname)" 2>/dev/null | gr
 # EMPTY count (see lib_bed.sh) which would wedge the watchdog's integer gate.
 psi_done() {
   shopt -s nullglob
-  local a
+  local a f
+  # require a NON-EMPTY table with >1 line (header + >=1 event), not mere existence: a truncated/header-only
+  # EventAnnotation from a crashed/killed AltAnalyze run would otherwise count as DONE -> a false COMPLETE
+  # (and the watchdog would never resubmit). (awk END{NR}, not grep -c -- reliable on compute nodes.)
   a=("$PSI_OUT"/AltResults/AlternativeOutput/*EventAnnotation*)
-  [ "${#a[@]}" -gt 0 ] && return 0
-  a=("$PSI_OUT"/AltResults/AlternativeOutput/*PSI*.txt)   # fallback: any PSI table emitted
-  [ "${#a[@]}" -gt 0 ]
+  for f in "${a[@]}"; do
+    [ -s "$f" ] && [ "$(awk 'END{print NR+0}' "$f" 2>/dev/null)" -gt 1 ] && return 0
+  done
+  a=("$PSI_OUT"/AltResults/AlternativeOutput/*PSI*.txt)   # fallback: any non-trivial PSI table emitted
+  for f in "${a[@]}"; do
+    [ -s "$f" ] && [ "$(awk 'END{print NR+0}' "$f" 2>/dev/null)" -gt 1 ] && return 0
+  done
+  return 1
 }
 
 # Count ${JOB_TAG}_job WORK-job names in a bjobs snapshot string ($1) with a PURE-BASH loop -- NOT
@@ -92,4 +100,69 @@ psi_nudge_watchdog() {
        ${QOPT[@]+"${QOPT[@]}"} "$SCRIPTS_DIR/watchdog.sh" >/dev/null 2>&1
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] nudge: '$who' finished -> watchdog queued on ended(${LSB_JOBID:-?})" \
        >> "$PIPELINE_ROOT/watchdog.log" 2>/dev/null || true
+}
+
+# ---- BED integrity pre-flight (consumer-side guard) -------------------------------------------------
+# AltAnalyze's RNASeq importer has a BROKEN bad-line handler (it raises an undefined name
+# 'force_exception'), so ONE truncated bed makes a worker die and the whole import wedge -- CPU spinning,
+# zero output -- until walltime. This guard runs BEFORE AltAnalyze and moves any truncated/corrupt bed out
+# of the way so the run completes on the good samples instead of hanging for hours. A bed "looks intact" if
+# it is non-empty, ENDS IN A NEWLINE (not cut mid-line by a kill / NFS stall), and its last row parses as a
+# bed line (>=6 tab fields, numeric start/end). Same test the BAM->BED stage uses (lib_bed.sh bed_file_ok),
+# reproduced here so the PSI stage stays self-contained. (Exon line-count is NOT used: the exon.bed count is
+# constant per species but NOT equal to the reference's line count, so it isn't portably derivable.)
+psi_bed_file_ok() {
+  local f="$1"
+  [ -s "$f" ] || return 1
+  [ -z "$(tail -c1 "$f" 2>/dev/null)" ] || return 1                 # last byte must be a newline
+  tail -n 1 "$f" 2>/dev/null | awk -F'\t' 'NF>=6 && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ {ok=1} END{exit ok?0:1}'
+}
+
+# DEEP full-file integrity scan for a junction/intronJunction BED (BED12). EVERY data line must be 12
+# tab-separated columns with integer chromStart/chromEnd; track/browser/# header lines are skipped.
+# Early-exits on the FIRST bad line, so a corrupt file is cheap while a clean one is read fully (the cost
+# of certifying it). Unlike psi_bed_file_ok (which checks only the LAST line), this catches MID-FILE
+# interleaved/garbled/NUL-byte corruption -- the kind a tail check is blind to, and the kind that wedges
+# AltAnalyze's RNASeq.py importBEDFile: its bad-line handler is `print t; force_exception` (an UNDEFINED
+# name) -> NameError -> the multiprocessing import worker dies -> the parent DEADLOCKS for the whole
+# walltime with no output (observed LIVE: a 14h-frozen A549 PSI job on a corrupt __intronJunction.bed).
+psi_bed_scan_ok() {
+  local f="$1"
+  [ -s "$f" ] || return 1
+  [ -z "$(tail -c1 "$f" 2>/dev/null)" ] || return 1
+  LC_ALL=C awk -F'\t' '/^(track|browser|#)/{next} (NF!=12 || $2!~/^[0-9]+$/ || $3!~/^[0-9]+$/){exit 1}' "$f"
+}
+
+# Move every sample whose junction OR exon bed is not intact (ALL its bed types) into a quarantine dir
+# OUTSIDE the bedDir (so AltAnalyze's --bedDir glob never sees them), log each to BED_QUARANTINE.txt, and
+# echo the count quarantined. Idempotent; safe to run on every attempt. mv on a symlinked bed moves the
+# symlink (the real bed is untouched).
+psi_check_beds() {
+  shopt -s nullglob
+  local q=0 qd="$PIPELINE_ROOT/quarantined_beds" rep="$PIPELINE_ROOT/BED_QUARANTINE.txt"
+  local j s suf ok
+  for j in "$BED_INPUT_DIR"/*__junction.bed; do
+    s="$(basename "$j" __junction.bed)"
+    ok=1
+    # junction + intronJunction are BOTH fed to AltAnalyze (the PSI inputs) -> FULL-SCAN both. The
+    # intronJunction bed was previously UNCHECKED, which is exactly how a corrupt one slipped through and
+    # deadlocked the live A549 PSI for 14h. (exon bed, if any reached the bedDir, keeps the cheap last-line
+    # check -- it is a different 10-col format and is excluded from the PSI input anyway.)
+    psi_bed_scan_ok "$j" || ok=0
+    if [ "$ok" = "1" ] && [ -e "$BED_INPUT_DIR/${s}__intronJunction.bed" ]; then
+      psi_bed_scan_ok "$BED_INPUT_DIR/${s}__intronJunction.bed" || ok=0
+    fi
+    if [ "$ok" = "1" ] && [ -e "$BED_INPUT_DIR/${s}__exon.bed" ]; then
+      psi_bed_file_ok "$BED_INPUT_DIR/${s}__exon.bed" || ok=0
+    fi
+    [ "$ok" = "1" ] && continue
+    mkdir -p "$qd" 2>/dev/null
+    for suf in __junction.bed __exon.bed __intronJunction.bed; do
+      [ -e "$BED_INPUT_DIR/${s}${suf}" ] && mv -f "$BED_INPUT_DIR/${s}${suf}" "$qd/" 2>/dev/null
+    done
+    q=$((q+1))
+    echo "$(date '+%Y-%m-%d %H:%M:%S')  $s  (truncated/corrupt junction/intronJunction/exon BED)" >> "$rep"
+  done
+  [ "$q" -gt 0 ] && echo "[psi] PREFLIGHT: quarantined $q sample(s) with truncated BEDs -> $qd (see $(basename "$rep"))" >&2
+  echo "$q"
 }

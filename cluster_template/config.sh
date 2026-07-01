@@ -32,21 +32,33 @@ ASPERA_MODULE="aspera/3.9.1"
 
 # 5) SCHEDULER (LSF). Tune to your cluster's limits.
 LSF_QUEUE=""            # "" = cluster default queue; else e.g. "normal","long"
-THREADS=6               # threads per conversion (also the job's slot request).
+THREADS=5               # threads per conversion (also the job's slot request).
                         # IMPORTANT: under a per-user SLOT CAP, FEWER threads =
                         # MORE concurrent conversions = higher throughput
                         # (fasterq-dump is I/O-bound, ~flat above 6-8 threads).
                         # Find your cap with:  busers $USER   (MAX column).
 MEM_MB=32000            # memory (-M) per conversion job
-WALL="50:00"            # wall clock (-W) per job (HH:MM)
+WALL="1108:00"          # -W per job (HH:MM) — normal-queue MAX (66480 min) so jobs never hit walltime
 PREFETCH_MEM_MB=132000  # memory (-M) per prefetch (download) job
 
 # 6) AUTOMATION.
-WATCHDOG_INTERVAL_MIN=30   # how often the self-driving watchdog re-checks
+WATCHDOG_INTERVAL_MIN=30   # how often the self-driving watchdog re-checks. The watchdog WALLTIME is
+                           # DERIVED as (this - 5) min, so it is ALWAYS < this interval (dead-man's-
+                           # switch: a hung pass is killed ~5 min before its successor starts, so the
+                           # chain can never overlap). A very large run whose passes legitimately need
+                           # more time should RAISE this (e.g. 65 -> ~60-min passes); the walltime
+                           # follows automatically. Keep >= 15.
 ABSOLUTE_MAX_PASSES=960    # HARD backstop: STALL after this many watchdog passes no matter what
 MAX_WALL_HOURS=336         # HARD backstop: STALL after this many wall-clock hours (generous; ~14 days)
 JOB_TAG="sra"              # short prefix that namespaces this project's LSF job
                            # names (set something unique if you run >1 project).
+ALERT_EMAIL=""             # baked at deploy from the PC settings -> cluster jobs email the user on error/milestone ('' = off)
+DIAGNOSE_ON_STALL=1        # on a STALL, ask the cluster CPU LLM (if installed) for a diagnosis + email it
+DIAGNOSE_AUTOFIX=0         # 1 = also let the AI APPLY a SAFE whitelisted fix (quarantine bed / re-arm), budget-capped
+DIAGNOSE_MAX_REARMS=2      # cap on AI auto re-arms before it stops and leaves the stall for a human
+DIAGNOSE_AI_HOME="/data/salomonis-archive/LabFiles/SpliceScout_AI"   # self-contained CPU LLM (conda env + GGUF model)
+DIAGNOSE_MODEL_PATH=""     # optional: full path to a specific .gguf to use (overrides the model search)
+DIAGNOSE_MODEL_DIR=""      # optional: dir to CACHE the model so future runs reuse it ('' = <PIPELINE_ROOT>/.splicescout_ai/models)
 CLEANUP_ON_COMPLETE="yes"  # after a SUCCESSFUL run, delete transient clutter:
                            # per-job .err/.out logs, generated .lsf scripts,
                            # *_missing lists, empty accession subdirs, state files.

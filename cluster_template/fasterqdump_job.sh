@@ -66,7 +66,7 @@ cp -p "$LOCAL/${SAMPLE}"*.fastq.gz "$SDIR/"
 ok=1
 for g in "$LOCAL/${SAMPLE}"*.fastq.gz; do
   bn=$(basename "$g")
-  if [ ! -f "$SDIR/$bn" ] || [ "$(stat -c%s "$g")" != "$(stat -c%s "$SDIR/$bn")" ]; then ok=0; fi
+  if [ ! -f "$SDIR/$bn" ] || [ "$(wc -c < "$g")" != "$(wc -c < "$SDIR/$bn")" ]; then ok=0; fi
 done
 if [ "$ok" -eq 1 ]; then
   echo "[fqd] $SAMPLE: ${#GZ[@]} .fastq.gz published to archive OK -> deleting source"

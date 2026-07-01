@@ -25,13 +25,29 @@ for S in */; do
   missing=()
   while read -r acc; do
     acc=$(echo "$acc" | tr -d '\r'); [ -z "$acc" ] && continue
+    sra_is_dropped "$acc" && continue                    # already gave up on this accession
     gz=("$sdir/$acc"*.fastq.gz)
-    if [ ${#gz[@]} -eq 0 ] && [ ! -e "$sdir/$acc.sra" ]; then missing+=("$acc"); fi
+    if [ ${#gz[@]} -eq 0 ] && [ ! -e "$sdir/$acc.sra" ]; then
+      # still missing AND this study has no live re-fetch (checked above) = the last download FAILED ->
+      # count it, and DROP after MAX_FAILS so an undeliverable accession can't be re-fetched forever.
+      _n=$(sra_bump_attempt "$acc")
+      if [ "$_n" -gt "${MAX_FAILS:-3}" ]; then
+        sra_drop_acc "$acc" "$sdir" download
+        echo "  dropped $acc after $((_n - 1)) failed downloads -> logged to dropped_accessions.txt"
+        continue
+      fi
+      missing+=("$acc")
+    fi
   done < "$S/SraAccList.txt"
   [ ${#missing[@]} -eq 0 ] && continue
 
   printf '%s\n' "${missing[@]}" > "$sdir/SraAccList_missing.txt"
-  PF=$(sra_submit_prefetch        "$sdir" "SraAccList_missing.txt")
+  # FAIL-FAST: if the queue is full the helper returns 124 -> STOP this pass (don't hang on each blocked bsub).
+  # The final count line still prints; the next watchdog pass resumes the re-fetch where this left off.
+  PF=$(sra_submit_prefetch "$sdir" "SraAccList_missing.txt"); _pfrc=$?
+  if [ "$_pfrc" -eq 124 ] || [ -z "$PF" ]; then
+    echo "  submit blocked (queue full) -> stopping fetch_missing this pass"; break
+  fi
   CS=$(sra_submit_convert_study   "$sdir" "SraAccList_missing.txt" "$PF")
   echo "$name: re-fetch ${#missing[@]} missing  prefetch=$PF convert=$CS"
   total=$((total+${#missing[@]}))

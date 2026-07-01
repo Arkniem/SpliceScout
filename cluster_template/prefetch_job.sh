@@ -12,4 +12,6 @@ sra_load_modules
 # Each accession lands in <SDIR>/<ACC>/<ACC>.sra (or .sralite). Non-zero exit on a
 # single failed accession is fine: the convert step runs on whatever downloaded
 # (ended() dependency) and the watchdog re-fetches anything still missing.
-prefetch -O "$SDIR" --option-file "$LIST"
+# Bound the whole network call with a timeout so a hung connection can't pin the job for its full walltime;
+# on timeout prefetch exits non-zero, which is handled exactly like a failed accession (watchdog re-fetches).
+timeout "${PREFETCH_TIMEOUT_SEC:-7200}" prefetch -O "$SDIR" --option-file "$LIST"

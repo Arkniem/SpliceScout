@@ -20,6 +20,9 @@ for S in */; do
   # idempotent skips
   nacc=$(sra_count_nonblank "$S/SraAccList.txt")   # pure-bash count (grep -c empty on compute nodes)
   ngz=$(sra_done_count "$sdir")
+  # Anchor the glob to the ABSOLUTE study dir; bail if $sdir is empty so it can never expand to
+  # "/*.sra" and scan the filesystem root (an unintended path).
+  [ -n "$sdir" ] && [ -d "$sdir" ] || { echo "skip $name (study dir missing: $sdir)"; continue; }
   nsra=$(ls "$sdir"/*.sra 2>/dev/null | wc -l)
   if [ "$ngz" -ge "$nacc" ] && [ "$nsra" -eq 0 ]; then
     echo "skip $name (complete: $ngz/$nacc)"; continue
@@ -28,7 +31,12 @@ for S in */; do
     echo "skip $name (already in progress)"; continue
   fi
 
-  PF=$(sra_submit_prefetch "$sdir" "SraAccList.txt")
+  PF=$(sra_submit_prefetch "$sdir" "SraAccList.txt"); _pfrc=$?
+  # FAIL-FAST: queue full -> the helper returns 124. STOP here (don't time out on every remaining study); the
+  # watchdog's fetch_missing + the launcher's heal/re-run submit the rest as the queue drains.
+  if [ "$_pfrc" -eq 124 ] || [ -z "$PF" ]; then
+    echo "run_all: submit blocked (queue full) after $launched -> stopping; watchdog re-fetch submits the rest"; break
+  fi
   CS=$(sra_submit_convert_study "$sdir" "" "$PF")
   echo "launched $name : prefetch=$PF convert=$CS"
   launched=$((launched+1))

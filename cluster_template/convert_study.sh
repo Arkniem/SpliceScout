@@ -55,7 +55,13 @@ for acc in ${ACCS[@]+"${ACCS[@]}"}; do
   [ -e "$acc.sra" ] || continue
   # 4) skip if a conversion job for it is already live (idempotent)
   sra_has_live "${JOB_TAG}_fqd_${acc}" "$LIVE" && continue
-  sra_submit_conversion "$acc" "$SDIR" >/dev/null
+  # FAIL-FAST: if the submit is blocked (queue full) the helper returns 124 -> EXIT now + free this run slot.
+  # Holding the slot while bsub spins on "Pending job threshold reached" is the 119-cs-jobs deadlock. The
+  # watchdog re-runs this study idempotently (already-submitted/converted accessions are skipped) once it frees.
+  if ! sra_submit_conversion "$acc" "$SDIR" >/dev/null; then
+    echo "convert_study: $(basename "$SDIR") submit blocked (queue full) -> exiting after $n submitted; watchdog will retry the rest"
+    exit 0
+  fi
   n=$((n+1))
 done
 echo "convert_study: $(basename "$SDIR") submitted $n conversion job(s)"

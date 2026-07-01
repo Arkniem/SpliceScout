@@ -30,8 +30,9 @@ PIPELINE_ROOT="/data/CHANGE_ME/psi"
 
 # 2) AltAnalyze install on the cluster. AltAnalyze.py lives at $ALTANALYZE_HOME; its
 #    species database is $ALTANALYZE_HOME/AltDatabase unless ALTANALYZE_DB overrides it.
-#    (The deployer fills this with a found-on-cluster path or an uploaded copy.)
-ALTANALYZE_HOME="/data/salomonis2/software/AltAnalyze-91/AltAnalyze"
+#    BLANK => $PIPELINE_ROOT/altanalyze_home (the portable default, where the deployer uploads a
+#    copy when none is found on the cluster). Point it at an existing cluster install to reuse that.
+ALTANALYZE_HOME=""
 ALTANALYZE_DB=""                  # "" => $ALTANALYZE_HOME/AltDatabase ; else an external
                                   #       AltDatabase path (setup.sh symlinks it into HOME)
 
@@ -53,17 +54,33 @@ GROUP_KEY_SUFFIX=".bed"           # how a sample is keyed in groups.txt (AltAnal
 # 6) RESOURCES. AltAnalyze is ONE multi-process job (not per-sample).
 THREADS=4                         # -n (LSF slots; AltAnalyze --multiProcessing yes)
 MEM_MB=128000                     # -M
-WALL="10:00"                      # -W (HH:MM)
+WALL="1108:00"                    # -W (HH:MM) — queue MAX (66480 min) so the job never hits walltime
 LSF_QUEUE=""                      # "" = cluster default queue
 
 # 7) AUTOMATION.
 JOB_TAG="psi"                     # namespaces this run's LSF job names (make it unique per run)
+ALERT_EMAIL=""                    # baked at deploy from the PC settings -> cluster jobs email the user on error/milestone ('' = off)
+DIAGNOSE_ON_STALL=1               # on a STALL, ask the cluster CPU LLM (if installed) for a diagnosis + email it
+DIAGNOSE_AUTOFIX=0                # 1 = also let the AI APPLY a SAFE whitelisted fix (quarantine bed / re-arm), budget-capped
+DIAGNOSE_MAX_REARMS=2             # cap on AI auto re-arms before it stops and leaves the stall for a human
+DIAGNOSE_AI_HOME="/data/salomonis-archive/LabFiles/SpliceScout_AI"   # self-contained CPU LLM (conda env + GGUF model)
+DIAGNOSE_MODEL_PATH=""            # optional: full path to a specific .gguf to use (overrides the model search)
+DIAGNOSE_MODEL_DIR=""             # optional: dir to CACHE the model so future runs reuse it ('' = <PIPELINE_ROOT>/.splicescout_ai/models)
 WATCHDOG_INTERVAL_MIN=30          # how often the self-driving watchdog re-checks
 MAX_RESUBMITS=2                   # resubmit the single AltAnalyze job at most this many times -> STALLED
+IDLE_STALL_PASSES=3               # a RUN job whose cpu_used is frozen this many passes = DEADLOCKED -> kill+resubmit+email
 ABSOLUTE_MAX_PASSES=960           # HARD backstop: STALL after this many watchdog passes no matter what
 MAX_WALL_HOURS=336                # HARD backstop: STALL after this many wall-clock hours (~14d)
 CLEANUP_TOOLS_WHEN_DONE=0         # remove an UPLOADED altanalyze_home on COMPLETE (default OFF; never
                                   # touches a found-on-cluster ALTANALYZE_HOME)
+
+# 7b) COMPRESS REMAINING DATA once the PSI stage COMPLETEs (reclaim space -- the archive fills up fast).
+#     Compresses kept, still-uncompressed files (BEDs + AltAnalyze text outputs) under COMPRESS_DIR.
+#     Already-compressed files and BAM/BAI/CRAM are SKIPPED (re-compressing them costs time for ~no gain).
+COMPRESS_WHEN_DONE="gzip"         # gzip | xz | off   (xz = LZMA2: smaller but slower). off = leave as-is.
+COMPRESS_DIR=""                   # "" => parent of PIPELINE_ROOT (the whole project: BEDs + PSI output)
+COMPRESS_MIN_MB=1                 # only compress files at least this big (skips tiny markers/scripts/logs)
+COMPRESS_THREADS=8                # parallelism for pigz / xz
 
 # 8) SOFTWARE MODULES (match the lab's AltAnalyze.sh: python2 + samtools + R).
 PYTHON_MODULE="python/2.7.5"
@@ -82,9 +99,13 @@ BED_INPUT_DIR="${BED_INPUT_DIR%/}"
 PIPELINE_ROOT="${PIPELINE_ROOT%/}"
 LOG_DIR="$PIPELINE_ROOT/logs"
 SAMPLE_GROUPS="$SCRIPTS_DIR/sample_groups.tsv"     # shipped: BioSample<TAB>group_num<TAB>group_label
-GROUPS_FILE="$PIPELINE_ROOT/groups.txt"            # built cluster-side (sample_groups ∩ present BEDs)
-COMPS_FILE="$PIPELINE_ROOT/comps.txt"
 [ -n "$PSI_OUT" ] || PSI_OUT="$PIPELINE_ROOT/output"
+[ -n "$COMPRESS_DIR" ] || COMPRESS_DIR="$(dirname "$PIPELINE_ROOT")"   # default compress scope: the whole project tree
+# AltAnalyze is NOT groupless-capable: its RNASeq workflow looks for groups.<expname>.txt + comps.<expname>.txt
+# under <output>/ExpressionInput/ and EXITS the splicing step if they are absent. Build them at exactly that
+# path/name so --groupdir/--compdir (and AltAnalyze's own default lookup) both resolve them.
+GROUPS_FILE="$PSI_OUT/ExpressionInput/groups.$EXPNAME.txt"   # built cluster-side (sample_groups ∩ present BEDs)
+COMPS_FILE="$PSI_OUT/ExpressionInput/comps.$EXPNAME.txt"
 
 # ORGANISM (NCBI scientific name) -> AltAnalyze species code. Default Hs.
 psi_species_from_organism() {
@@ -101,13 +122,15 @@ psi_species_from_organism() {
   esac
 }
 # Declared on SEPARATE statements (bash 4.2 + set -u can't see a var set earlier in the SAME line).
-[ -n "$SPECIES" ]       || SPECIES="$(psi_species_from_organism "$ORGANISM")"
-[ -n "$ALTANALYZE_DB" ] || ALTANALYZE_DB="$ALTANALYZE_HOME/AltDatabase"
+[ -n "$SPECIES" ]         || SPECIES="$(psi_species_from_organism "$ORGANISM")"
+[ -n "$ALTANALYZE_HOME" ] || ALTANALYZE_HOME="$PIPELINE_ROOT/altanalyze_home"   # portable default: under PIPELINE_ROOT
+[ -n "$ALTANALYZE_DB" ]   || ALTANALYZE_DB="$ALTANALYZE_HOME/AltDatabase"
 
 export BED_INPUT_DIR PIPELINE_ROOT ALTANALYZE_HOME ALTANALYZE_DB ORGANISM SPECIES PSI_OUT EXPNAME \
        RUN_GOELITE GROUP_KEY_SUFFIX THREADS MEM_MB WALL LSF_QUEUE JOB_TAG WATCHDOG_INTERVAL_MIN \
        MAX_RESUBMITS ABSOLUTE_MAX_PASSES MAX_WALL_HOURS CLEANUP_TOOLS_WHEN_DONE \
-       PYTHON_MODULE SAMTOOLS_MODULE R_MODULE SCRIPTS_DIR LOG_DIR SAMPLE_GROUPS GROUPS_FILE COMPS_FILE
+       PYTHON_MODULE SAMTOOLS_MODULE R_MODULE SCRIPTS_DIR LOG_DIR SAMPLE_GROUPS GROUPS_FILE COMPS_FILE \
+       COMPRESS_WHEN_DONE COMPRESS_DIR COMPRESS_MIN_MB COMPRESS_THREADS
 
 # Make the 'module' command available even in a non-login job shell.
 psi_init_modules() {
