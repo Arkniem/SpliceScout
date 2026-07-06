@@ -1,3 +1,5 @@
+this project was created by https://github.com/Arkniem
+
 # SpliceScout
 
 **Submit an NCBI GEO search query -> get cleaned, splicing-amenable, cell-line-grouped compound
